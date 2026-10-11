@@ -171,6 +171,11 @@ export interface PocketHost {
     readonly repoWatches: Pick<RepoWatches, "task">;
     /** Lessons Pi keeps across sessions (`memory.ts`): the memory tool saves them, and its section lists them. */
     readonly memory: Pick<Memory, "project" | "applying" | "inForce" | "add" | "change">;
+    /**
+     * Tools whose calls only read for some arguments, by tool name: plan mode lets those calls through. An extension
+     * sets its tools here when it loads; a reload sets them again.
+     */
+    readonly readOnlyCalls: Map<string, (args: Record<string, unknown>) => boolean>;
 }
 
 /** The shape of every module in `src/server/extensions/`: a default export building one or more extensions. */

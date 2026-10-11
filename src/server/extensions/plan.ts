@@ -9,7 +9,7 @@ import { defineExtension, hook, section, ToolTask } from "@earendil-works/pi-dur
 import { PlanDoc } from "../docs.ts";
 import type { PocketHost } from "../host.ts";
 
-const PLANNING = `Plan mode is on. Read and explore, then propose a plan; change nothing yet. You can use read, artifact, the browser to look at pages (not to click, type, or run scripts in them), and bash for simple read-only commands such as ls, cat, grep, find, and git status/log/diff/show, without redirects, globs, variables, or command substitution. Writing, editing, other commands, and subagents are blocked until a person approves the plan. End your answer with the plan as a short numbered list.`;
+const PLANNING = `Plan mode is on. Read and explore, then propose a plan; change nothing yet. You can use read, artifact, the browser to look at pages (not to click, type, or run scripts in them), and bash for simple read-only commands such as ls, cat, grep, find, and git status/log/diff/show/branch (also with -C <folder>), without redirects other than to /dev/null, globs, variables, or command substitution, and the calls other tools mark as read-only (listing or reading a board, say). Writing, editing, other commands, and subagents are blocked until a person approves the plan. End your answer with the plan as a short numbered list.`;
 
 /** Tools that change nothing, or whose own calls are checked one by one (codemode). */
 const ALWAYS_ALLOWED = new Set(["read", "artifact", "codemode"]);
@@ -62,12 +62,34 @@ const GIT_READS = new Set([
     "grep",
 ]);
 
-/** Git commands that only read, without options that write a file or run a program (a pager, an external diff). */
+/** What `git branch` may be given in plan mode: options that only list. A name would create a branch. */
+const BRANCH_LISTS = new Set([
+    "-a",
+    "--all",
+    "-r",
+    "--remotes",
+    "-l",
+    "--list",
+    "-v",
+    "-vv",
+    "--verbose",
+    "--show-current",
+    "--no-color",
+]);
+
+/**
+ * Git commands that only read, without options that write a file or run a program (a pager, an external diff). Before
+ * the command, `--no-pager` and `-C <folder>` may come in any order; `-c` may not, as it can set a pager.
+ */
 const gitReads: ArgsCheck = (args) => {
     let at = 0;
 
-    while (args[at] === "--no-pager") {
-        at++;
+    while (args[at] === "--no-pager" || (args[at] === "-C" && args[at + 1] !== undefined)) {
+        at += args[at] === "-C" ? 2 : 1;
+    }
+
+    if (args[at] === "branch") {
+        return args.slice(at + 1).every((arg) => BRANCH_LISTS.has(arg));
     }
 
     if (!GIT_READS.has(args[at] ?? "")) {
@@ -142,10 +164,14 @@ const READERS: Readonly<Record<string, ArgsCheck>> = {
     whoami: anyArgs,
 };
 
+/** Redirects that write nothing: output thrown away, or errors sent where the output goes. */
+const DISCARDS = /^(?:[12]?>\s*\/dev\/null|2>&1)(?=$|[\s;|&])/;
+
 /**
  * The simple commands of a command line, as words: split at `|`, `||`, `&&`, `;`, and new lines, with quotes and
- * backslashes resolved the way bash does. Undefined for anything that is more than plain words: redirects,
- * substitutions, variables, globs, subshells, background jobs, line continuations, or an unfinished quote.
+ * backslashes resolved the way bash does. Redirects to /dev/null and `2>&1` are dropped, as they write nothing.
+ * Undefined for anything that is more than plain words: other redirects, substitutions, variables, globs, subshells,
+ * background jobs, line continuations, or an unfinished quote.
  */
 export function commandWords(command: string): string[][] | undefined {
     const commands: string[][] = [[]];
@@ -195,6 +221,8 @@ export function commandWords(command: string): string[][] | undefined {
             } else {
                 add(char);
             }
+        } else if (word === undefined && DISCARDS.test(command.slice(at))) {
+            at += DISCARDS.exec(command.slice(at))![0].length - 1;
         } else if (char === "'" || char === '"') {
             quote = char;
             add("");
@@ -248,9 +276,20 @@ export function readOnlyCommand(command: string): boolean {
     );
 }
 
-/** Why a call may not run in plan mode, or undefined when it may. */
-export function blockedInPlanMode(tool: string, args: Record<string, unknown>): string | undefined {
+/**
+ * Why a call may not run in plan mode, or undefined when it may. `reads`: tools from extensions that say which of their
+ * calls only read (`PocketHost.readOnlyCalls`).
+ */
+export function blockedInPlanMode(
+    tool: string,
+    args: Record<string, unknown>,
+    reads?: ReadonlyMap<string, (args: Record<string, unknown>) => boolean>,
+): string | undefined {
     if (ALWAYS_ALLOWED.has(tool)) {
+        return undefined;
+    }
+
+    if (reads?.get(tool)?.(args) === true) {
         return undefined;
     }
 
@@ -283,7 +322,7 @@ export function blockedInPlanMode(tool: string, args: Record<string, unknown>): 
     return `Plan mode is on: ${what}, so it is blocked. Keep exploring with read and read-only commands, then propose your plan; a person approves it before anything changes.`;
 }
 
-export default function createPlan(_host: PocketHost) {
+export default function createPlan(host: PocketHost) {
     return defineExtension({
         name: "pocket-plan",
         sections: [
@@ -303,6 +342,7 @@ export default function createPlan(_host: PocketHost) {
                     const reason = blockedInPlanMode(
                         call.name,
                         call.arguments as Record<string, unknown>,
+                        host.readOnlyCalls,
                     );
 
                     return reason === undefined ? undefined : { block: reason };

@@ -403,6 +403,7 @@ export class PocketApp {
             watches: this.watches,
             repoWatches: this.repoWatches,
             memory: this.memory,
+            readOnlyCalls: new Map(),
         };
 
         this.host = host;

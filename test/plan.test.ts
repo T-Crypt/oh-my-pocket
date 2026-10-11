@@ -69,6 +69,15 @@ test("only commands that read pass, with arguments that keep them reading", () =
         "sort --check names.txt",
         "printf '%s\\n' a b",
         "test -f package.json",
+        // Seen blocked in a real plan session (2026-10-11).
+        "git -C /home/me/repo status --short",
+        "git -C /home/me/repo log --oneline -25",
+        "git -C a --no-pager -C b diff",
+        "git branch -a",
+        "git branch",
+        "ls ~/handoffs/berth 2>/dev/null; ls ~/handoffs 2>/dev/null | head -20",
+        "rg foo src >/dev/null && echo found",
+        "git log 2>&1 | head",
     ];
 
     for (const command of reads) {
@@ -109,6 +118,17 @@ test("only commands that read pass, with arguments that keep them reading", () =
         "sed -i s/a/b/ f",
         "ls && rm x",
         "",
+        "git branch new-feature",
+        "git branch -D main",
+        "git branch -a -m old new",
+        "git -C repo commit -m x",
+        "git -C",
+        "git -C repo -c core.pager=evil log",
+        "ls 2>err.txt",
+        "ls >/dev/nullx",
+        "ls 2>/dev/null>out",
+        "ls x>/dev/null",
+        "cat 3>/dev/null",
     ];
 
     for (const command of changes) {
@@ -137,6 +157,16 @@ test("in plan mode only reading tools pass", () => {
         /blocked/,
         "tools it does not know are blocked too",
     );
+
+    // A tool an extension marks: only the calls it says read pass.
+    const reads = new Map([["board", (args: Record<string, unknown>) => args.call === "list"]]);
+
+    assert.equal(blockedInPlanMode("board", { call: "list" }, reads), undefined);
+    assert.match(
+        blockedInPlanMode("board", { call: "create" }, reads) ?? "",
+        /The board tool can change things/,
+    );
+    assert.match(blockedInPlanMode("other", { call: "list" }, reads) ?? "", /blocked/);
 });
 
 /** Whether a request carried the plan mode section of the system prompt. */
