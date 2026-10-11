@@ -39,6 +39,11 @@ const ORDER = [
     "memory.ts",
     "pip.ts",
     "triggers.ts",
+    "read-economy.ts",
+    "loop-guard.ts",
+    "pruner.ts",
+    "tool-repair.ts",
+    "today.ts",
 ];
 /** Modules the app cannot work without: always on. */
 const REQUIRED = new Set(["prompt.ts"]);
@@ -57,6 +62,11 @@ const TITLES: Record<string, string> = {
     "memory.ts": "Memory",
     "pip.ts": "PiP",
     "triggers.ts": "Triggers",
+    "read-economy.ts": "Read economy",
+    "loop-guard.ts": "Loop guard",
+    "pruner.ts": "Context pruner",
+    "tool-repair.ts": "Tool repair",
+    "today.ts": "Today",
 };
 
 /**

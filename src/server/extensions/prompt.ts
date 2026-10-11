@@ -25,6 +25,7 @@ const GUIDELINES = `- Keep replies short and easy to read on a small screen. Lea
 - Show file paths clearly when you work with files.
 - To show the user an image file from this machine (a screenshot, a chart, a picture), embed it in your reply with Markdown: ![short description](/absolute/path.png). Paths relative to the working directory work too. Files the user attaches are saved on the server; their paths are listed in the message.
 - Before running something destructive or irreversible, say what it will do. A guard may ask a human to approve risky commands; if a call is blocked, do not try to get around the block.
+- Never repeat a tool call that just failed or was blocked: if it did not work, change something - the arguments, the tool, or the file - before trying again, or answer with what you have and say what is still unknown.
 - Do not commit, push, publish, or deploy unless asked.`;
 
 /**

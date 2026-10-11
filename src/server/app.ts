@@ -77,6 +77,7 @@ import { Hooks } from "./hooks.ts";
 import { Pip, PIP_EXTENSION } from "./pip.ts";
 import { PIP_COMPACT_CHOICES, PipCompaction } from "./pip-compact.ts";
 import { Pruner } from "./pruner.ts";
+import { LoopGuard } from "./loop-guard.ts";
 import { RepoWatches } from "./repo-watches.ts";
 import { snippet } from "./projection.ts";
 import { loadPromptTemplates, type PromptTemplate, type SkillCommand } from "./prompts.ts";
@@ -253,6 +254,8 @@ export class PocketApp {
     readonly pipCompaction = new PipCompaction(this);
     /** Sessions' context pruned before it is summarised, without a model call (`pruner.ts`). */
     readonly pruner = new Pruner(this);
+    /** What a repeated tool call should not run again (`loop-guard.ts`), judged on the turn's own outcomes. */
+    readonly loopGuard = new LoopGuard();
     /** Sessions' watches of their pull requests (`watches.ts`). */
     readonly watches = new Watches(this);
     /** PiP's standing orders on GitHub repositories: what happens there goes to PiP or a session (`repo-watches.ts`). */
@@ -396,6 +399,7 @@ export class PocketApp {
             skills: (cwd) => this.skills(cwd),
             resolveModel: (spec) => resolveModel(this.models, spec),
             requesterOf: (conversationId) => this.attribution.requesterOf(conversationId),
+            loopGuard: this.loopGuard,
             notice: (level, message) => this.notice(level, message),
             heldBack: (conversationId) => this.spend.heldBack(conversationId),
             onLimitsChanged: (listener) => this.spend.onLimitsChanged(listener),

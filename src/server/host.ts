@@ -5,6 +5,7 @@ import type { ConversationId, Extension, ModelRef, TaskId } from "@earendil-work
 import type { Browsers } from "./browser.ts";
 import type { Goals } from "./goals.ts";
 import type { LancetGuard } from "./lancet.ts";
+import type { LoopGuard } from "./loop-guard.ts";
 import type { Memory } from "./memory.ts";
 import type { Pip } from "./pip.ts";
 import type { PipCompaction } from "./pip-compact.ts";
@@ -124,6 +125,8 @@ export interface PocketHost {
     resolveModel(spec: string): ModelRef;
     /** Who Pi works for in a conversation now: whose message led to its current work. */
     requesterOf(conversationId: ConversationId): string | undefined;
+    /** Why a tool call that repeats one that already failed (or a third identical one) should not run. */
+    readonly loopGuard: Pick<LoopGuard, "onRequest" | "noteCall" | "blocked">;
     /** Report something odd to the log and the connected clients. */
     notice(level: "info" | "warning" | "error", message: string): void;
     /**
