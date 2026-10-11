@@ -24,6 +24,7 @@ import {
     section,
     type SubmissionId,
     type SubmissionRecord,
+    type TaskId,
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
@@ -62,19 +63,24 @@ const Anchor = defineTask<null, { phase: "done" }, null>({
         runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context),
 });
 
-/** `requestedBy`: whom the parent worked for when it sent the message, whose work the subagent's then is. */
+/**
+ * `requestedBy`: whom the parent worked for when it sent the message, whose work the subagent's then is. `waiter`: the
+ * parent's tool call that waits for the answer (`wait: true`); the answer is its result instead of a report, unless that
+ * call is gone by then (stopped, or cut off by a restart).
+ */
 type ReporterInput = {
     name: string;
     conversationId: ConversationId;
     message: string;
     followUp: boolean;
     requestedBy?: string;
+    waiter?: TaskId;
 };
 type ReporterState = { phase: "deliver" } | { phase: "report"; report?: string };
 
 /** Delivers one message to a subagent, waits for the answer, and reports it to the parent, through `Courier`. */
 function reporterFor(Courier: CourierTask) {
-    return defineTask<ReporterInput, ReporterState, null>({
+    return defineTask<ReporterInput, ReporterState, string | null>({
         name: "pocket.subagent-reporter",
         version: 1,
         initial: () => ({ phase: "deliver" }),
@@ -185,6 +191,20 @@ function reporterFor(Courier: CourierTask) {
                             runtime.conversationId,
                             `subagent-report:${reporter.id}`,
                         )) !== undefined;
+
+                    // The tool call waiting for it takes the answer as its result, while it still waits.
+                    const waiter = reporter.input.waiter;
+
+                    if (
+                        report !== undefined &&
+                        waiter !== undefined &&
+                        (await tx.task(waiter))?.state.status !== "terminal"
+                    ) {
+                        return {
+                            status: "terminal",
+                            outcome: { status: "completed", result: report },
+                        };
+                    }
 
                     if (report !== undefined && !sentBefore) {
                         const id = runtime.conversationId;
@@ -620,7 +640,9 @@ export default function createSubagents(host: PocketHost) {
             "Manage persistent background subagents. Actions: spawn (name, message; optional agent definition, model as " +
             "provider/modelId, thinking level, and tools to allow), send (name, message; followUp: true queues it after the current answer " +
             "instead of steering), stop (name: aborts its current work), status (one name, or all). Answers come back " +
-            "to you as messages at your next pause; those that arrive together come in one.",
+            "to you as messages at your next pause; those that arrive together come in one. With wait: true, spawn " +
+            "and send return the answer as their result instead, and you take no turn until it comes: use it for a " +
+            "stage you would only wait for anyway.",
         parameters: Type.Object({
             action: Type.Union([
                 Type.Literal("spawn"),
@@ -633,6 +655,12 @@ export default function createSubagents(host: PocketHost) {
             ),
             message: Type.Optional(Type.String()),
             followUp: Type.Optional(Type.Boolean()),
+            wait: Type.Optional(
+                Type.Boolean({
+                    description:
+                        "spawn and send: return the subagent's answer as this call's result, instead of a message later.",
+                }),
+            ),
             agent: Type.Optional(
                 Type.String({
                     description:
@@ -662,7 +690,7 @@ export default function createSubagents(host: PocketHost) {
         // with status.
         replay: "unsafe",
         execute: async (args, api, context) => {
-            const { action, name, message, followUp } = args;
+            const { action, name, message, followUp, wait } = args;
             const reply = (text: string, conversationId?: ConversationId) => ({
                 content: [{ type: "text" as const, text }],
                 ...(conversationId === undefined || name === undefined
@@ -780,6 +808,7 @@ export default function createSubagents(host: PocketHost) {
                 thinking = found === undefined ? wanted : clampThinkingLevel(found, wanted);
             }
 
+            let reporterId: TaskId<string | null> | undefined;
             const result = await api.commit(async (tx) => {
                 const state = await tx.doc(SubagentsDoc, api.conversationId);
 
@@ -821,9 +850,11 @@ export default function createSubagents(host: PocketHost) {
                     message,
                     followUp: action === "send" && followUp === true,
                     ...(requestedBy === undefined ? {} : { requestedBy }),
+                    ...(wait === true ? { waiter: api.taskId } : {}),
                 };
 
-                state.reporters[api.taskId] = await tx.createTask(Reporter, input, BACKGROUND);
+                reporterId = await tx.createTask(Reporter, input, BACKGROUND);
+                state.reporters[api.taskId] = reporterId;
 
                 if (action === "send") {
                     return `Sent to ${name}.`;
@@ -836,6 +867,19 @@ export default function createSubagents(host: PocketHost) {
             const current = (await api.snapshot(SubagentsDoc, api.conversationId, context))?.agents[
                 name
             ];
+
+            // On a local server that answers one request at a time, a turn taken while the subagent works only pushes
+            // its context out of the cache; waiting here takes none.
+            if (wait === true && reporterId !== undefined) {
+                const settled = await api.waitForTask(reporterId, context);
+                const outcome = settled.state.outcome;
+                const answer =
+                    outcome.status === "completed" && typeof outcome.result === "string"
+                        ? outcome.result
+                        : `${result} Its answer comes back as a message.`;
+
+                return reply(answer, current?.conversationId);
+            }
 
             return reply(result, current?.conversationId);
         },

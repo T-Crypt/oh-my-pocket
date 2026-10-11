@@ -69,6 +69,20 @@ const route: FauxResponseStep = (request) => {
         );
     }
 
+    if (text === "orchestrate and wait") {
+        return fauxAssistantMessage(
+            plan.spawn.map((name) =>
+                call("subagent", {
+                    action: "spawn",
+                    name,
+                    message: `Check ${name}, please.`,
+                    wait: true,
+                }),
+            ),
+            { stopReason: "toolUse" },
+        );
+    }
+
     const nudge = /^nudge (\S+)$/.exec(text);
 
     if (nudge !== null) {
@@ -213,6 +227,62 @@ test("a report reaches an idle parent at once, and the parent answers it", async
         .messages;
 
     assert.match(JSON.stringify(messages.at(-1)), /noted/);
+});
+
+/** The text of the parent's tool results, as one text. */
+const toolResults = async (id: ConversationId, on = app) =>
+    JSON.stringify(
+        (await (await on.harness.conversation(id, context))!.context(context)).messages.filter(
+            (message) => message.role === "toolResult",
+        ),
+    );
+
+test("a spawn that waits returns the answer as its result: no report, and no turn of the parent's meanwhile", async () => {
+    slow = { waited: 0.3 };
+    plan = { spawn: ["waited"], rounds: 0, sleep: 0 };
+    rounds = 0;
+    parentCalls = 0;
+    const id = await newSession(app);
+
+    await app.commands.submit(id, owner(app), {
+        text: "orchestrate and wait",
+        requestId: `wait-${id}`,
+    });
+    await until(
+        async () =>
+            !app.isBusy(id) &&
+            /done working/.test(
+                JSON.stringify(
+                    (
+                        await (await app.harness.conversation(id, context))!.context(context)
+                    ).messages.at(-1),
+                ),
+            ),
+        "the parent's answer",
+    );
+
+    assert.match(await toolResults(id), /result of waited/);
+    assert.equal((await delivered(id)).waited, undefined, "no report as a message");
+    assert.equal(parentCalls, 2, "the spawn, then the answer after its result");
+});
+
+test("an answer whose waiting call was stopped still comes back, as a report", async () => {
+    slow = { stranded: 1 };
+    plan = { spawn: ["stranded"], rounds: 0, sleep: 0 };
+    rounds = 0;
+    const id = await newSession(app);
+
+    await app.commands.submit(id, owner(app), {
+        text: "orchestrate and wait",
+        requestId: `strand-${id}`,
+    });
+    await until(
+        async () =>
+            (await app.harness.snapshot(SubagentsDoc, id, context))?.agents.stranded !== undefined,
+        "the spawn",
+    );
+    await (await app.harness.conversation(id, context))!.abort(context);
+    await until(async () => (await delivered(id)).stranded === 1, "the report");
 });
 
 test("a person who withdraws waiting reports does not hold back later ones", async () => {
