@@ -2,6 +2,7 @@ import type { Context } from "@earendil-works/chord";
 import { awaitWithContext } from "@earendil-works/chord/context";
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import type { ConversationId, Extension, ModelRef, TaskId } from "@earendil-works/pi-durable";
+import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import type { Browsers } from "./browser.ts";
 import type { Goals } from "./goals.ts";
 import type { LancetGuard } from "./lancet.ts";
@@ -123,6 +124,8 @@ export interface PocketHost {
     skills(cwd: string): Skill[];
     /** `provider/modelId` (or a bare model id) to an available model, or an error naming the choices. */
     resolveModel(spec: string): ModelRef;
+    /** The file system a conversation works in: its environment, rooted at the conversation's working directory. */
+    envFor(conversationId: ConversationId): ExecutionEnv;
     /** Who Pi works for in a conversation now: whose message led to its current work. */
     requesterOf(conversationId: ConversationId): string | undefined;
     /** Why a tool call that repeats one that already failed (or a third identical one) should not run. */

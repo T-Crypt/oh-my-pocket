@@ -398,6 +398,7 @@ export class PocketApp {
             },
             skills: (cwd) => this.skills(cwd),
             resolveModel: (spec) => resolveModel(this.models, spec),
+            envFor: (conversationId) => this.envFor(conversationId),
             requesterOf: (conversationId) => this.attribution.requesterOf(conversationId),
             loopGuard: this.loopGuard,
             notice: (level, message) => this.notice(level, message),
