@@ -117,10 +117,8 @@ export default function createPrompt(host: PocketHost) {
             section("project_context", (input) => load(cwdOf(input)).context),
             section("skills", (input) => load(cwdOf(input)).skills, { tag: false }),
             section("environment", (input) => {
-                // The date only, so the prompt stays cache-friendly through the day.
-                const today = new Date().toISOString().slice(0, 10);
-
-                return `Working directory: ${cwdOf(input)}\nPlatform: ${process.platform}\nToday: ${today}`;
+                // No date here: the day changes on its own, and the today extension keeps it behind every stable section.
+                return `Working directory: ${cwdOf(input)}\nPlatform: ${process.platform}`;
             }),
         ],
     });

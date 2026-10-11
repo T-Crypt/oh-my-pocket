@@ -656,10 +656,8 @@ export default function createPip(host: PocketHost) {
             section("pip_rules", () => RULES),
             section("pip_github", () => (github ? GITHUB : undefined)),
             section("pip_environment", (input) => {
-                // The date only, so the prompt stays cache-friendly through the day.
-                const today = new Date().toLocaleDateString("en-CA", { timeZone: zone });
-
-                return `Today: ${today}\nTime zone: ${zone}\nPi Pocket's default folder: ${input.agent.cwd ?? "unknown"}`;
+                // The date lives in pip_today, installed last: it is the one line that changes on its own.
+                return `Time zone: ${zone}\nPi Pocket's default folder: ${input.agent.cwd ?? "unknown"}`;
             }),
         ],
     });
