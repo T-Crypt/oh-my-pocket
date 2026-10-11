@@ -65,9 +65,7 @@ const oneLine = (text: string, max = 200): string => {
 const textOf = (content: string | readonly { type: string; text?: string }[]): string =>
     typeof content === "string"
         ? content
-        : content
-              .map((block) => (block.type === "text" ? (block.text ?? "") : ""))
-              .join("\n");
+        : content.map((block) => (block.type === "text" ? (block.text ?? "") : "")).join("\n");
 
 /** The file a read or edit call acts on, for stale-read detection. */
 const pathOf = (call: { name: string; args: unknown }): string | undefined => {
@@ -84,7 +82,13 @@ const pathOf = (call: { name: string; args: unknown }): string | undefined => {
         : undefined;
 };
 
-type PendingCall = { name: string; args: unknown; argsLine: string; signature: string; repeated: boolean };
+type PendingCall = {
+    name: string;
+    args: unknown;
+    argsLine: string;
+    signature: string;
+    repeated: boolean;
+};
 type ResultRef = { message: ToolResultMessage; call: PendingCall };
 
 /** The range's messages as the note reads them: what each side said, and each call one line. */
@@ -114,7 +118,9 @@ export function pruneSummary(
 
             // A model-written summary stays whole; an older prune note is carried on, clipped; a person's words, clipped.
             const carried =
-                text.startsWith(NOTES_HEAD) || text.startsWith(PRUNED_HEAD) ? "Earlier notes" : "Message";
+                text.startsWith(NOTES_HEAD) || text.startsWith(PRUNED_HEAD)
+                    ? "Earlier notes"
+                    : "Message";
             const limit = carried === "Earlier notes" ? EARLIER_NOTES_CHARS : USER_TEXT_CHARS;
 
             items.push({ kind: "line", text: `[${carried}]: ${clip(text, limit)}` });
@@ -127,7 +133,10 @@ export function pruneSummary(
                     const said = block.text.trim();
 
                     if (said !== "") {
-                        items.push({ kind: "line", text: `[Pi]: ${clip(said, ASSISTANT_TEXT_CHARS)}` });
+                        items.push({
+                            kind: "line",
+                            text: `[Pi]: ${clip(said, ASSISTANT_TEXT_CHARS)}`,
+                        });
                     }
                 } else if (block.type === "thinking") {
                     original += block.thinking.length;
@@ -143,9 +152,17 @@ export function pruneSummary(
 
                     items.push({
                         kind: "line",
-                        text: repeated ? `- [Pi called ${block.name} again]` : `- [Pi called ${block.name} ${argsLine}]`,
+                        text: repeated
+                            ? `- [Pi called ${block.name} again]`
+                            : `- [Pi called ${block.name} ${argsLine}]`,
                     });
-                    pending.push({ name: block.name, args: block.arguments, argsLine, signature, repeated });
+                    pending.push({
+                        name: block.name,
+                        args: block.arguments,
+                        argsLine,
+                        signature,
+                        repeated,
+                    });
                 }
             }
         } else if (message.role === "toolResult") {
@@ -244,7 +261,10 @@ export function pruneSummary(
         for (const { result } of keptFull) {
             const { message, call } = result;
 
-            note.push(`[${call.name} ${call.argsLine}]`, clip(textOf(message.content), FULL_KEEP_CHARS));
+            note.push(
+                `[${call.name} ${call.argsLine}]`,
+                clip(textOf(message.content), FULL_KEEP_CHARS),
+            );
         }
     }
 
@@ -344,7 +364,8 @@ export function measuredPromptTokens(view: ContextView): number {
             continue;
         }
 
-        const usage = message.usage as { input?: number; cacheRead?: number; cacheWrite?: number } | undefined;
+        const usage = message.usage as
+            { input?: number; cacheRead?: number; cacheWrite?: number } | undefined;
         const prompt = (usage?.input ?? 0) + (usage?.cacheRead ?? 0) + (usage?.cacheWrite ?? 0);
 
         if (prompt > 0) {
@@ -403,7 +424,10 @@ export class Pruner {
 
         const kept = tokensAfter(view, compaction.firstKept);
         const prompt = measuredPromptTokens(view);
-        const policy = { ...DEFAULT_COMPACTION_POLICY, ...this.#app.settings.getCompactionSettings() };
+        const policy = {
+            ...DEFAULT_COMPACTION_POLICY,
+            ...this.#app.settings.getCompactionSettings(),
+        };
         const window = await this.#window(api.conversationId);
 
         // Still over once the note is in: the LLM summary, which shrinks harder, must run.

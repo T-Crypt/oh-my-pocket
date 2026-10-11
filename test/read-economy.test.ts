@@ -10,16 +10,27 @@ import type { FauxResponseStep, Message } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ContextView, ConversationId } from "@earendil-works/pi-durable";
 import { outlineRegion, READ_ECONOMY_LIMIT, readWindow } from "../src/server/read-economy.ts";
-import { type App, cleanUp, context, newSession, openApp, say, scriptedModel, work } from "./helpers.ts";
+import {
+    type App,
+    cleanUp,
+    context,
+    newSession,
+    openApp,
+    say,
+    scriptedModel,
+    work,
+} from "./helpers.ts";
 
 // --- The window and the outline, pure ----------------------------------------------
 
 test("the window a read reported is read from its own report", () => {
-    assert.deepEqual(
-        readWindow("Showing lines 1-500 of 1200. Use offset=501 to continue."),
-        { end: 500, total: 1200 },
-    );
-    assert.deepEqual(readWindow("700 more lines in file. Use offset=501 to continue."), { end: 500 });
+    assert.deepEqual(readWindow("Showing lines 1-500 of 1200. Use offset=501 to continue."), {
+        end: 500,
+        total: 1200,
+    });
+    assert.deepEqual(readWindow("700 more lines in file. Use offset=501 to continue."), {
+        end: 500,
+    });
     assert.equal(readWindow("plain output"), undefined);
 });
 
@@ -48,27 +59,29 @@ let steps: FauxResponseStep[] = [];
 let stepIndex = 0;
 
 const done: FauxResponseStep = () => fauxAssistantMessage([fauxText("done")]);
+
 const route: FauxResponseStep = (request, options, state, model) => {
     const step = steps[stepIndex++] ?? done;
 
     return typeof step === "function" ? step(request, options, state, model) : step;
 };
 
-const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
-    () => fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
+const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) => () =>
+    fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 
 const textOf = (content: Message["content"]): string =>
     typeof content === "string"
         ? content
-        : content
-              .map((block) => (block.type === "text" ? (block.text ?? "") : ""))
-              .join("\n");
+        : content.map((block) => (block.type === "text" ? (block.text ?? "") : "")).join("\n");
 
 /** The newest tool result of the conversation: its file text, and everything it was shown. */
 const newest = async (id: ConversationId) => {
-    const view = (await (await app.harness.conversation(id, context))!.context(context)) as ContextView;
+    const view = (await (await app.harness.conversation(id, context))!.context(
+        context,
+    )) as ContextView;
     const results = view.messages.filter(
-        (message): message is Extract<Message, { role: "toolResult" }> => message.role === "toolResult",
+        (message): message is Extract<Message, { role: "toolResult" }> =>
+            message.role === "toolResult",
     );
     const message = results.at(-1)!;
     const parts = message.content as Array<{ type: string; text?: string }>;
@@ -94,6 +107,7 @@ const bigFile = () => {
     });
 
     const path = join(work, "big.ts");
+
     writeFileSync(path, lines.join("\n") + "\n");
 
     return path;
@@ -110,7 +124,12 @@ test("a read without a limit stops at the cap and maps the rest of the file", as
 
     assert.match(first, /line 500/);
     assert.doesNotMatch(first, /line 501/);
-    assert.match(all, new RegExp(`\\[The rest of this file, lines ${READ_ECONOMY_LIMIT + 1}–1200: 700 lines, 2 headings, e\\.`));
+    assert.match(
+        all,
+        new RegExp(
+            `\\[The rest of this file, lines ${READ_ECONOMY_LIMIT + 1}–1200: 700 lines, 2 headings, e\\.`,
+        ),
+    );
     assert.match(all, /L600: function mid\(\) \{/);
     assert.match(all, /L900: # Section two/);
     assert.match(all, new RegExp(`offset: ${READ_ECONOMY_LIMIT + 1} and a limit`));
@@ -133,6 +152,7 @@ test("a read that says how much to read keeps its own limit and still maps the r
 test("a file that fits the window is read whole, with no map of what was cut", async () => {
     const id = await newSession(app);
     const path = join(work, "small.ts");
+
     writeFileSync(path, Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join("\n") + "\n");
 
     steps = [tool("read", { path }), done];

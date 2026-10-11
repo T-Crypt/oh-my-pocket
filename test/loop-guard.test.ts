@@ -8,16 +8,21 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { FauxResponseStep, Message } from "@earendil-works/pi-ai";
-import {
-    fauxAssistantMessage,
-    fauxText,
-    fauxToolCall,
-} from "@earendil-works/pi-ai/providers/faux";
+import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai/utils/transcript";
 import type { ContextView, ConversationId } from "@earendil-works/pi-durable";
 import { signatureOf } from "../src/server/loop-guard.ts";
 import { repairToolArguments } from "../src/server/tool-repair.ts";
-import { type App, cleanUp, context, newSession, openApp, say, scriptedModel, work } from "./helpers.ts";
+import {
+    type App,
+    cleanUp,
+    context,
+    newSession,
+    openApp,
+    say,
+    scriptedModel,
+    work,
+} from "./helpers.ts";
 
 // --- The guard's key and the JSON repair, pure ------------------------------------
 
@@ -71,27 +76,31 @@ let steps: FauxResponseStep[] = [];
 let stepIndex = 0;
 
 const done: FauxResponseStep = () => fauxAssistantMessage([fauxText("done")]);
+
 const route: FauxResponseStep = (request, options, state, model) => {
     const step = steps[stepIndex++] ?? done;
 
     return typeof step === "function" ? step(request, options, state, model) : step;
 };
 
-const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
-    () => fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
+const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) => () =>
+    fauxAssistantMessage([fauxToolCall(name, args)], { stopReason: "toolUse" });
 
 const textOf = (content: Message["content"]): string =>
     typeof content === "string"
         ? content
-        : content
-              .map((block) => (block.type === "text" ? (block.text ?? "") : ""))
-              .join("\n");
+        : content.map((block) => (block.type === "text" ? (block.text ?? "") : "")).join("\n");
 
 /** The tool results of the conversation, oldest first, as the model sees them. */
 const resultsOf = async (id: ConversationId) => {
-    const view = (await (await app.harness.conversation(id, context))!.context(context)) as ContextView;
+    const view = (await (await app.harness.conversation(id, context))!.context(
+        context,
+    )) as ContextView;
 
-    return view.messages.filter((message): message is Extract<Message, { role: "toolResult" }> => message.role === "toolResult");
+    return view.messages.filter(
+        (message): message is Extract<Message, { role: "toolResult" }> =>
+            message.role === "toolResult",
+    );
 };
 
 before(async () => {
@@ -119,7 +128,10 @@ test("a third identical call is blocked, and after a failure the block says it f
     assert.ok(!textOf(results[1]!.content).includes("blocked"));
     const blocked = textOf(results[2]!.content);
 
-    assert.match(blocked, /blocked: you already ran bash with exactly these arguments and it failed/);
+    assert.match(
+        blocked,
+        /blocked: you already ran bash with exactly these arguments and it failed/,
+    );
 });
 
 test("a third identical call is blocked even when the earlier ones succeeded", async () => {
@@ -133,7 +145,10 @@ test("a third identical call is blocked even when the earlier ones succeeded", a
     const results = await resultsOf(id);
 
     assert.equal(results.length, 3);
-    assert.match(textOf(results[2]!.content), /blocked: you already ran bash with exactly these arguments 2 times this turn; the result will not change/);
+    assert.match(
+        textOf(results[2]!.content),
+        /blocked: you already ran bash with exactly these arguments 2 times this turn; the result will not change/,
+    );
 });
 
 test("a mutating call clears the repeats of a read, so a retry after the fix is allowed", async () => {
@@ -184,7 +199,10 @@ test("the no-repeat rule is in the prompt the model gets", async () => {
     const system = getCurrentSystemMessage(view.messages);
 
     assert.notEqual(system, undefined);
-    assert.match((system?.sections?.["guidelines"] ?? ""), /Never repeat a tool call that just failed/);
+    assert.match(
+        system?.sections?.["guidelines"] ?? "",
+        /Never repeat a tool call that just failed/,
+    );
 });
 
 test("an object or array sent as a JSON string is repaired before validation, and the call runs", async () => {
@@ -196,7 +214,10 @@ test("an object or array sent as a JSON string is repaired before validation, an
 
     steps = [
         // The arguments are a JSON string, not the object they describe: only the repair can run this call.
-        () => fauxAssistantMessage([fauxToolCall("read", doubleEncoded as never)], { stopReason: "toolUse" }),
+        () =>
+            fauxAssistantMessage([fauxToolCall("read", doubleEncoded as never)], {
+                stopReason: "toolUse",
+            }),
         () => fauxAssistantMessage([fauxText("done")]),
     ];
     stepIndex = 0;

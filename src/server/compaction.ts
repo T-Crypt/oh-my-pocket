@@ -43,9 +43,7 @@ export const PRUNE_KEEP_LAST_MAX = 10;
 export type PruneSettings = { pruneToolOutput: boolean; pruneKeepLast: number };
 
 /** `compaction.pruneToolOutput` and `compaction.pruneKeepLast` from Pi's settings, with the defaults. */
-export function pruneSettings(
-    settings: Pick<SettingsManager, "getSettings">,
-): PruneSettings {
+export function pruneSettings(settings: Pick<SettingsManager, "getSettings">): PruneSettings {
     let compaction: unknown;
 
     try {
@@ -56,7 +54,9 @@ export function pruneSettings(
 
     const block = (compaction ?? {}) as { pruneToolOutput?: unknown; pruneKeepLast?: unknown };
     const enabled =
-        typeof block.pruneToolOutput === "boolean" ? block.pruneToolOutput : PRUNE_DEFAULTS.pruneToolOutput;
+        typeof block.pruneToolOutput === "boolean"
+            ? block.pruneToolOutput
+            : PRUNE_DEFAULTS.pruneToolOutput;
     const keepLast =
         typeof block.pruneKeepLast === "number" &&
         Number.isSafeInteger(block.pruneKeepLast) &&

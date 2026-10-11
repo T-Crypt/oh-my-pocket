@@ -3,7 +3,8 @@
 // only when the note would still leave the context over its limit. PiP writes its own summaries and is left to them.
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";import { after, before, test } from "node:test";
+import { join } from "node:path";
+import { after, before, test } from "node:test";
 import type { Message } from "@earendil-works/pi-ai";
 import {
     fauxAssistantMessage,
@@ -13,34 +14,39 @@ import {
 import { type ContextView, type ConversationId, type HookApi } from "@earendil-works/pi-durable";
 import { pruneSettings } from "../src/server/compaction.ts";
 import { PRUNED_HEAD, pruneSummary, worthPruning } from "../src/server/pruner.ts";
-import { type App, cleanUp, context, newSession, openApp, say, scriptedModel, work } from "./helpers.ts";
+import {
+    type App,
+    cleanUp,
+    context,
+    newSession,
+    openApp,
+    say,
+    scriptedModel,
+    work,
+} from "./helpers.ts";
 
 // --- The note itself -------------------------------------------------------------
 
-const user = (text: string): Message =>
-    ({ role: "user", content: text, timestamp: 0 }) as Message;
+const user = (text: string): Message => ({ role: "user", content: text, timestamp: 0 }) as Message;
 
 const call = (name: string, args: Record<string, unknown>): Message =>
-    (fauxAssistantMessage([fauxToolCall(name, args as never)], { stopReason: "toolUse" }) as unknown) as Message;
+    fauxAssistantMessage([fauxToolCall(name, args as never)], {
+        stopReason: "toolUse",
+    }) as unknown as Message;
 
-const resultOf = (
-    message: Message,
-    name: string,
-    content: string,
-    isError = false,
-): Message => {
+const resultOf = (message: Message, name: string, content: string, isError = false): Message => {
     const toolCall = (message.content as { id: string; name: string; type?: string }[]).findLast(
         (part) => part.type === "toolCall",
     )!;
 
-    return ({
+    return {
         role: "toolResult",
         toolCallId: toolCall.id,
         toolName: name,
         content: [{ type: "text", text: content }],
         isError,
         timestamp: 0,
-    }) as Message;
+    } as Message;
 };
 
 test("a note masks old tool output, keeps the newest in full, and names stale and repeated calls", () => {
@@ -70,7 +76,7 @@ test("a note masks old tool output, keeps the newest in full, and names stale an
     assert.match(pruned.summary, /\[Full output of the newest tool results\][\s\S]*c-content/);
     // Person's words and Pi's calls are carried on.
     assert.ok(pruned.summary.includes("[Message]: look at a, b, and c"));
-    assert.ok(pruned.summary.includes("[Pi called read {\"path\":\"/x/a.ts\"}]"));
+    assert.ok(pruned.summary.includes('[Pi called read {"path":"/x/a.ts"}]'));
     assert.ok(pruned.saved > 0);
 });
 
@@ -79,7 +85,12 @@ test("a read of a file read again goes stale, in the range or in the kept part",
     const second = call("read", { path: "/x/a.ts" });
 
     const pruned = pruneSummary(
-        [first, resultOf(first, "read", "old version"), second, resultOf(second, "read", "new version")],
+        [
+            first,
+            resultOf(first, "read", "old version"),
+            second,
+            resultOf(second, "read", "new version"),
+        ],
         { keepLast: 2 },
     )!;
 
@@ -104,7 +115,14 @@ test("a call repeated in a loop collapses to one line and its results are masked
     const c = call("bash", { command: "make it work" });
 
     const pruned = pruneSummary(
-        [a, resultOf(a, "bash", "first"), b, resultOf(b, "bash", "second"), c, resultOf(c, "bash", "third")],
+        [
+            a,
+            resultOf(a, "bash", "first"),
+            b,
+            resultOf(b, "bash", "second"),
+            c,
+            resultOf(c, "bash", "third"),
+        ],
         { keepLast: 1 },
     )!;
 
@@ -154,7 +172,10 @@ test("prune settings: valid values pass through, invalid ones fall back to the d
         pruneToolOutput: true,
         pruneKeepLast: 2,
     });
-    assert.deepEqual(pruneSettings(settings(undefined)), { pruneToolOutput: true, pruneKeepLast: 2 });
+    assert.deepEqual(pruneSettings(settings(undefined)), {
+        pruneToolOutput: true,
+        pruneKeepLast: 2,
+    });
 });
 
 // --- The hook's decision, end to end ----------------------------------------------
@@ -171,7 +192,9 @@ after(async () => {
 });
 
 const lastEntryId = async (id: ConversationId): Promise<number> => {
-    const view = (await (await app.harness.conversation(id, context))!.context(context)) as ContextView;
+    const view = (await (await app.harness.conversation(id, context))!.context(
+        context,
+    )) as ContextView;
 
     return view.entries[view.entries.length - 1]!.id;
 };
@@ -212,18 +235,21 @@ test("a note that would still leave the context over its limit leaves the summar
     });
     const agentDir = process.env.PI_CODING_AGENT_DIR!;
     const dataDir = join(agentDir, "pruner-small");
+
     mkdirSync(dataDir, { recursive: true });
-    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({
-        compaction: { reserveTokens: 3000, keepRecentTokens: 4000 },
-    }));
+    writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({
+            compaction: { reserveTokens: 3000, keepRecentTokens: 4000 },
+        }),
+    );
 
     const tight = await openApp(small, dataDir);
     const id = await newSession(tight, work);
 
     // A range of mostly people's words: the note keeps them all, so it is still over.
-    const wall = Array.from(
-        { length: 40 },
-        (_, index) => user(`message ${index}: ${"word ".repeat(120)}`),
+    const wall = Array.from({ length: 40 }, (_, index) =>
+        user(`message ${index}: ${"word ".repeat(120)}`),
     );
     const big = call("bash", { command: "cat everything" });
     const firstKept = await lastEntryId(id);

@@ -6,7 +6,15 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import type { ConversationId, PromptSection } from "@earendil-works/pi-durable";
-import { type App, cleanUp, context, newSession, openApp, owner, scriptedModel } from "./helpers.ts";
+import {
+    type App,
+    cleanUp,
+    context,
+    newSession,
+    openApp,
+    owner,
+    scriptedModel,
+} from "./helpers.ts";
 
 let app: App;
 
@@ -19,13 +27,21 @@ after(async () => {
     cleanUp();
 });
 
-const keysOf = (sections: readonly PromptSection[]): string[] => sections.map((section) => section.key);
+const keysOf = (sections: readonly PromptSection[]): string[] =>
+    sections.map((section) => section.key);
 
 /** Sections render with as little as their conversation, for a pin that only asks who renders what. */
-const rendered = (id: ConversationId, agent: { sections: readonly PromptSection[] }, key: string) => {
+const rendered = (
+    id: ConversationId,
+    agent: { sections: readonly PromptSection[] },
+    key: string,
+) => {
     const section = agent.sections.find((each) => each.key === key)!;
 
-    return section.render({ conversationId: id, agent: agent as never, env: undefined, shown: {}, read: {} as never }, context);
+    return section.render(
+        { conversationId: id, agent: agent as never, env: undefined, shown: {}, read: {} as never },
+        context,
+    );
 };
 
 test("the session pack ends with its date, after every stable section", async () => {
@@ -35,11 +51,14 @@ test("the session pack ends with its date, after every stable section", async ()
     const today = keys.indexOf("today");
 
     assert.ok(today >= 0, `the today section is installed: ${keys.join(", ")}`);
-    assert.ok(keys.indexOf("environment") < today, `environment should come before today: ${keys.join(", ")}`);
+    assert.ok(
+        keys.indexOf("environment") < today,
+        `environment should come before today: ${keys.join(", ")}`,
+    );
     // Only the harness's own instructions may sit behind the date.
     assert.ok(today >= keys.length - 2, `today should be last but one: ${keys.join(", ")}`);
 
-    assert.match(await rendered(id, agent, "today") ?? "", /Today: \d{4}-\d{2}-\d{2}/);
+    assert.match((await rendered(id, agent, "today")) ?? "", /Today: \d{4}-\d{2}-\d{2}/);
     assert.equal(await rendered(id, agent, "pip_today"), undefined);
 });
 
@@ -50,9 +69,12 @@ test("the PiP pack ends with its date in its own time zone", async () => {
     const today = keys.indexOf("pip_today");
 
     assert.ok(today >= 0, `the pip today section is installed: ${keys.join(", ")}`);
-    assert.ok(keys.indexOf("pip_environment") < today, `pip_environment should come before pip_today: ${keys.join(", ")}`);
+    assert.ok(
+        keys.indexOf("pip_environment") < today,
+        `pip_environment should come before pip_today: ${keys.join(", ")}`,
+    );
     assert.ok(today >= keys.length - 2, `pip_today should be last but one: ${keys.join(", ")}`);
 
-    assert.match(await rendered(id, agent, "pip_today") ?? "", /Today: \d{4}-\d{2}-\d{2}/);
+    assert.match((await rendered(id, agent, "pip_today")) ?? "", /Today: \d{4}-\d{2}-\d{2}/);
     assert.equal(await rendered(id, agent, "today"), undefined);
 });

@@ -14,19 +14,15 @@ export default function createToday(host: PocketHost) {
     return defineExtension({
         name: "pocket-today",
         sections: [
-            section(
-                "today",
-                (input) =>
-                    host.pip.ownerOf(input.conversationId) === undefined
-                        ? `Today: ${new Date().toISOString().slice(0, 10)}`
-                        : undefined,
+            section("today", (input) =>
+                host.pip.ownerOf(input.conversationId) === undefined
+                    ? `Today: ${new Date().toISOString().slice(0, 10)}`
+                    : undefined,
             ),
-            section(
-                "pip_today",
-                (input) =>
-                    host.pip.ownerOf(input.conversationId) === undefined
-                        ? undefined
-                        : `Today: ${new Date().toLocaleDateString("en-CA", { timeZone: zone })}`,
+            section("pip_today", (input) =>
+                host.pip.ownerOf(input.conversationId) === undefined
+                    ? undefined
+                    : `Today: ${new Date().toLocaleDateString("en-CA", { timeZone: zone })}`,
             ),
         ],
     });

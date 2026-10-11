@@ -19,7 +19,8 @@ export default function createToolRepair(_host: PocketHost) {
                 wrapTool(tool, (each) => ({
                     ...each,
                     // The model's JSON in, its schema-checked arguments out: the harness still validates the repair.
-                    prepareArguments: (args: unknown) => repairToolArguments(args, each.parameters) as never,
+                    prepareArguments: (args: unknown) =>
+                        repairToolArguments(args, each.parameters) as never,
                 })),
             ),
     });

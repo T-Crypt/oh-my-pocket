@@ -31,10 +31,15 @@ const kinds = (schema: Schema): string[] => {
     return typeof types === "string" ? [types] : Array.isArray(types) ? types : [];
 };
 
-const expects = (schema: Schema, kind: string): boolean => members(schema).some((member) => kinds(member).includes(kind));
+const expects = (schema: Schema, kind: string): boolean =>
+    members(schema).some((member) => kinds(member).includes(kind));
 
 const parsedKind = (value: unknown): "object" | "array" | undefined =>
-    Array.isArray(value) ? "array" : value !== null && typeof value === "object" ? "object" : undefined;
+    Array.isArray(value)
+        ? "array"
+        : value !== null && typeof value === "object"
+          ? "object"
+          : undefined;
 
 /** JSON that a model wrote with small errors (broken escapes, control characters); undefined when it is not JSON. */
 function tryParse(text: string): unknown {

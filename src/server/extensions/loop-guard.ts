@@ -14,7 +14,10 @@ export default function createLoopGuard(host: PocketHost) {
         hooks: [
             hook(GenerationTask, {
                 beforeRequest: (request, api) => {
-                    (host as Partial<PocketHost>).loopGuard?.onRequest(request.messages, api.conversationId);
+                    (host as Partial<PocketHost>).loopGuard?.onRequest(
+                        request.messages,
+                        api.conversationId,
+                    );
                 },
             }),
             hook(ToolTask, {
@@ -38,7 +41,9 @@ export default function createLoopGuard(host: PocketHost) {
 
                     guard.noteCall(api.conversationId, call.name, call.arguments, {
                         isError: result.isError === true,
-                        interrupted: (result.diagnostics ?? []).some((each) => each.code === "interrupted"),
+                        interrupted: (result.diagnostics ?? []).some(
+                            (each) => each.code === "interrupted",
+                        ),
                     });
                 },
             }),

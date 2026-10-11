@@ -1403,6 +1403,17 @@ function StatusLine() {
                 ${about}${percent}%
             </button>`,
         );
+
+        parts.push(
+            html`<button
+                type="button"
+                class="link"
+                title=${"Take a baseline of where the context goes; the next /context shows which rows a change moved"}
+                onClick=${() => showContext("baseline")}
+            >
+                baseline
+            </button>`,
+        );
     }
 
     if (stats.cacheRate !== undefined) {

@@ -6,6 +6,7 @@ import { pipeline } from "node:stream/promises";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import type { Attachment, SubmitRequest } from "../commands.ts";
 import { HttpError } from "../errors.ts";
+import { contextDiff } from "../context-meter.ts";
 import { serveImage, TYPES } from "./assets.ts";
 import { type ApiRequest, json, readJson, send } from "./io.ts";
 
@@ -333,8 +334,29 @@ export async function conversationRoutes(
         return serveImage(request, response, app.workspace.conversationFile(user, id, requested));
     }
 
-    if (third === "context" && method === "GET") {
-        return json(response, 200, await app.contextMeter(id));
+    if (third === "context" && method === "GET" && fourth === undefined) {
+        const meter = await app.contextMeter(id);
+        const baseline = await app.contextBaseline(id);
+
+        return json(
+            response,
+            200,
+            baseline === undefined
+                ? { ...meter, baseline: undefined }
+                : { ...meter, baseline, diff: contextDiff(meter.rows, baseline.rows) },
+        );
+    }
+
+    // The owner's reference point for where the context goes: take it before a change, diff the next meter against
+    // it, and clear it when the change is done with.
+    if (third === "context" && fourth === "baseline" && method === "POST") {
+        return json(response, 200, await app.takeContextBaseline(id));
+    }
+
+    if (third === "context" && fourth === "baseline" && method === "DELETE") {
+        await app.clearContextBaseline(id);
+
+        return json(response, 200, { ok: true });
     }
 
     if (third === "entry" && fourth !== undefined && method === "GET") {

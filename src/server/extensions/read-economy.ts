@@ -13,7 +13,8 @@ import { repairToolArguments } from "../tool-repair.ts";
 import type { PocketHost } from "../host.ts";
 
 export default function createReadEconomy(host: PocketHost) {
-    const read = (CodingTools.tools ?? []).find((tool) => tool.name === "read") as ToolRegistration | undefined;
+    const read = (CodingTools.tools ?? []).find((tool) => tool.name === "read") as
+        ToolRegistration | undefined;
 
     if (read === undefined) {
         return defineExtension({ name: "pocket-read-economy" });
@@ -30,13 +31,19 @@ export default function createReadEconomy(host: PocketHost) {
                 prepareArguments: (args: unknown) => {
                     const repaired = repairToolArguments(args, tool.parameters);
 
-                    if (typeof repaired !== "object" || repaired === null || Array.isArray(repaired)) {
+                    if (
+                        typeof repaired !== "object" ||
+                        repaired === null ||
+                        Array.isArray(repaired)
+                    ) {
                         return repaired as never;
                     }
 
                     const { limit, ...rest } = repaired as Record<string, unknown>;
 
-                    return (limit === undefined ? { ...rest, limit: READ_ECONOMY_LIMIT } : repaired) as never;
+                    return (
+                        limit === undefined ? { ...rest, limit: READ_ECONOMY_LIMIT } : repaired
+                    ) as never;
                 },
                 execute: async (args, api, context) => {
                     const input = args as { path: string; offset?: number; limit?: number };
@@ -64,15 +71,20 @@ export default function createReadEconomy(host: PocketHost) {
 
                     if (!counted.ok) {
                         await reader.close(context);
+
                         return result;
                     }
 
                     // A trailing newline ends the last line; the empty stretch after it is not a line.
                     let total = counted.value.newlines + 1;
 
-                    if (counted.value.lastLineStart === counted.value.end && counted.value.lastLineStart > counted.value.start) {
+                    if (
+                        counted.value.lastLineStart === counted.value.end &&
+                        counted.value.lastLineStart > counted.value.start
+                    ) {
                         total--;
                     }
+
                     const start = Math.max(0, (input.offset ?? 1) - 1);
 
                     // How far the read reached: user-limited reads reach as far as their limit, unlimited ones
@@ -86,6 +98,7 @@ export default function createReadEconomy(host: PocketHost) {
 
                     if (end === undefined || end >= total) {
                         await reader.close(context);
+
                         return result;
                     }
 
@@ -93,11 +106,16 @@ export default function createReadEconomy(host: PocketHost) {
 
                     if (!tail.ok) {
                         await reader.close(context);
+
                         return result;
                     }
 
                     const range = tail.value;
-                    const chunk = await reader.read(range.start, Math.max(0, range.end - range.start), context);
+                    const chunk = await reader.read(
+                        range.start,
+                        Math.max(0, range.end - range.start),
+                        context,
+                    );
 
                     await reader.close(context);
 
@@ -105,11 +123,18 @@ export default function createReadEconomy(host: PocketHost) {
                         return result;
                     }
 
-                    const outline = outlineRegion(new TextDecoder().decode(chunk.value), end + 1, total);
+                    const outline = outlineRegion(
+                        new TextDecoder().decode(chunk.value),
+                        end + 1,
+                        total,
+                    );
 
                     return {
                         ...result,
-                        content: [...(result.content ?? []), { type: "text" as const, text: outline }],
+                        content: [
+                            ...(result.content ?? []),
+                            { type: "text" as const, text: outline },
+                        ],
                     };
                 },
             })),

@@ -227,11 +227,38 @@ function showSession() {
     notify("info", parts.join(" · "));
 }
 
-/** Where the context goes: each group's total and its largest rows, measured against the newest answer's prompt. */
-export async function showContext() {
+/** Where the context goes: each group's total and its largest rows, measured against the newest answer's prompt. With a baseline taken, the rows a change moved, before and after. */
+export async function showContext(arg) {
     const id = store.state.view.conversation?.id;
 
     if (id === undefined) {
+        return;
+    }
+
+    if (arg === "baseline") {
+        const taken = await attempt(() =>
+            api(`c/${id}/context/baseline`, undefined, { method: "POST" }),
+        );
+
+        if (taken !== undefined) {
+            notify(
+                "info",
+                `Context baseline taken: ${formatTokens(taken.tokens)} across ${taken.rows.length} rows`,
+            );
+        }
+
+        return;
+    }
+
+    if (arg === "clear") {
+        const cleared = await attempt(() =>
+            api(`c/${id}/context/baseline`, undefined, { method: "DELETE" }),
+        );
+
+        if (cleared !== undefined) {
+            notify("info", "Context baseline cleared");
+        }
+
         return;
     }
 
@@ -256,6 +283,25 @@ export async function showContext() {
                       .join(", ")}${rows.length > 3 ? `, +${rows.length - 3} more` : ""}`,
               ];
     });
+
+    // The rows that moved since the baseline, biggest moves first: where the change landed.
+    if (meter.baseline !== undefined && Array.isArray(meter.diff)) {
+        const moved = meter.diff.filter((row) => row.delta !== 0).slice(0, 8);
+
+        if (moved.length > 0) {
+            const total = moved.reduce((sum, row) => sum + row.delta, 0);
+
+            lines.push(
+                `vs baseline, ${new Date(meter.baseline.takenAt).toLocaleDateString()}: ${total >= 0 ? "+" : "\u2212"}${formatTokens(Math.abs(total))} across ${moved.length} rows`,
+            );
+
+            for (const row of moved) {
+                lines.push(
+                    `  ${row.name} ${formatTokens(row.baseline)} \u2192 ${formatTokens(row.tokens)} (${row.delta >= 0 ? "+" : "\u2212"}${formatTokens(Math.abs(row.delta))})`,
+                );
+            }
+        }
+    }
 
     notify(
         "info",
@@ -398,7 +444,10 @@ const COMMANDS = [
     { name: "session", description: "Show the model, context use, and cost", run: showSession },
     {
         name: "context",
-        description: "Show where the context goes: prompt sections, tools, and history",
+        args: "[baseline | clear]",
+        description:
+            "Show where the context goes: prompt sections, tools, and history; baseline takes a reference point to diff the next view against",
+        run: (arg) => showContext(arg || undefined),
         available: isSession,
         run: showContext,
     },

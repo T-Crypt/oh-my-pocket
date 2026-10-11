@@ -136,3 +136,56 @@ export function contextMeter(messages: readonly Message[]): ContextMeter {
 
     return { rows, tokens: rows.reduce((sum, row) => sum + row.tokens, 0), measured };
 }
+
+/** One row of a meter lined up against the baseline it was taken from. */
+export type ContextDiffRow = {
+    group: ContextRow["group"];
+    name: string;
+    /** Now. */
+    tokens: number;
+    /** In the baseline; zero for a row the baseline did not have. */
+    baseline: number;
+    /** Now minus baseline; negative for a row the baseline had and the meter no longer does. */
+    delta: number;
+};
+
+/**
+ * The meter's rows lined up against a baseline's, by group and name: the rows a change touched, biggest moves first.
+ * Rows only the baseline had keep their place, with what they gave back.
+ */
+export function contextDiff(
+    current: readonly ContextRow[],
+    baseline: readonly ContextRow[],
+): ContextDiffRow[] {
+    const before = new Map<string, { group: ContextRow["group"]; name: string; tokens: number }>();
+
+    for (const row of baseline) {
+        before.set(`${row.group}\u0000${row.name}`, row);
+    }
+
+    const rows: ContextDiffRow[] = current.map((row) => {
+        const was = before.get(`${row.group}\u0000${row.name}`);
+
+        before.delete(`${row.group}\u0000${row.name}`);
+
+        return {
+            group: row.group,
+            name: row.name,
+            tokens: row.tokens,
+            baseline: was?.tokens ?? 0,
+            delta: row.tokens - (was?.tokens ?? 0),
+        };
+    });
+
+    for (const gone of before.values()) {
+        rows.push({
+            group: gone.group,
+            name: gone.name,
+            tokens: 0,
+            baseline: gone.tokens,
+            delta: -gone.tokens,
+        });
+    }
+
+    return rows.sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta));
+}

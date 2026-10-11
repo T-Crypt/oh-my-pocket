@@ -56,6 +56,7 @@ import {
     BrowserDoc,
     ChatDoc,
     type ChatMessage,
+    ContextBaselineDoc,
     DecisionsDoc,
     MemoryDoc,
     type SessionMeta,
@@ -1682,6 +1683,42 @@ export class PocketApp {
     /** Where a conversation's context goes: system prompt by section, tool schemas, and history by kind. */
     async contextMeter(id: ConversationId): Promise<ContextMeter> {
         return contextMeter((await (await this.conversation(id)).context(context)).messages);
+    }
+
+    /** The context baseline the owner took here, if any: what the context measured like before a change. */
+    async contextBaseline(id: ConversationId) {
+        const baseline = await this.harness.snapshot(ContextBaselineDoc, id, context);
+
+        return baseline?.takenAt === 0 ? undefined : baseline;
+    }
+
+    /** Take the conversation's context meter as the baseline the next meter is diffed against. */
+    async takeContextBaseline(id: ConversationId) {
+        const meter = await this.contextMeter(id);
+        const takenAt = Date.now();
+
+        await this.harness.commit(async (tx) => {
+            Object.assign(await tx.doc(ContextBaselineDoc, id), {
+                takenAt,
+                measured: meter.measured,
+                tokens: meter.tokens,
+                rows: meter.rows,
+            });
+        }, context);
+
+        return { takenAt, measured: meter.measured, tokens: meter.tokens, rows: meter.rows };
+    }
+
+    /** Forget the baseline, so the next meter stands on its own. */
+    async clearContextBaseline(id: ConversationId) {
+        await this.harness.commit(async (tx) => {
+            Object.assign(await tx.doc(ContextBaselineDoc, id), {
+                takenAt: 0,
+                measured: false,
+                tokens: 0,
+                rows: [],
+            });
+        }, context);
     }
 
     async conversation(id: ConversationId): Promise<Conversation> {
