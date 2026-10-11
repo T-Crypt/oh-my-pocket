@@ -38,6 +38,11 @@ only then merge into `oh-my-pocket`.
 | Per-role skill catalog (recipe) | A drop-in wraps the `skills` section (Pi Durable's `wrapSection`) and renders it from the session role's own list. Pi otherwise sends its whole catalog on every request.                                                                          | router start context 19,395 to 13,133 tokens                               |
 | Context meter                   | `/context`, a tap on the status-line meter, or `GET /api/c/:id/context`: the context split into prompt sections, tool schemas, and history by kind, scaled to the newest measured prompt. Every A/B reads its own numbers.                         | within 0.1% of the measured prompt; 3 tests                                |
 | Waiting subagents               | `subagent` spawn and send take `wait: true` and return the answer as the call's result. The parent writes nothing while a stage runs, so on a one-slot server the stage keeps its cache. A stopped waiting call still gets its answer as a report. | cached share 60% to 90%; 2 tests                                           |
+| Prune before summarising        | Compaction first replaces its range with a note that costs no model call: old tool output masked to one line each, the newest results kept in full, stale re-reads and loops dropped; the LLM summary runs only when the note would still leave the context over its limit. `compaction.pruneToolOutput` and `pruneKeepLast` in Pi's settings. | 9 tests; no second model call in the common case                           |
+| Loop guard                      | A tool call identical to one that already failed this turn, or repeated a third time, is blocked, and the system prompt says the same in one line; a restart-interrupted call is not a failure, and a fresh person's message re-arms it. Call arguments a model wrote slightly wrong (a JSON string where the object belongs) are repaired before validation. | 10 tests; research measured 30K to 8.9K prompt tokens, under 20% to 100% solve |
+| Read economy                    | A read without an explicit limit returns at most five hundred lines, and the result carries a structural map of the part it did not read: how many lines remain and where the sections sit. To see more, the model reads on with an offset and a limit. | 6 tests; keeps whole-file dumps out of a small model's context             |
+| KV-prefix discipline            | The system prompt is byte-stable and append-friendly: the one line that changes on its own (the day) sits in the last section of each pack, so a cache hit stays a hit through the day instead of re-prefilling the tail. Pinned by test for sessions and PiP. | the date's flip re-prefills one short line, not the pack                   |
+| Context baseline                | `/context baseline` (or a tap on the status line) takes a meter of where the context goes; the next `/context` lines it up against that and names the rows a change touched, before and after, biggest moves first. `/context clear` puts the meter back on its own. | 4 tests; names the row a prompt, tool, or skill change lands on            |
 
 Router start context, the tokens sent before the first word of every request: Pi Pocket with a router prompt 22,726;
 OMP 15,900; Oh-My-Pocket 13,133 (llama-swap `/api/metrics/activity`, probe "Reply with just: ok", 2026-10-11).
@@ -72,9 +77,10 @@ if it holds or improves those numbers without lowering the result.
 
 ### Next
 
-Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: a lower default `read`
-limit with a structural summary; superseding stale reads and dropping useless turns before compaction; trimming
-oversized tool output (head and tail kept) when compaction starts, with no model call when that alone frees enough room.
+Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: hash-anchored `edit`
+(A/B only, never ported blind), LSP diagnostics after an edit, suppression of a file read a second time this turn,
+and subagent handoff hygiene - the child gets file pointers and a typed result schema, nothing else.
+[docs/RESEARCH.md](docs/RESEARCH.md) holds the full survey with its measurements.
 
 ## Quick start
 
