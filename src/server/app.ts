@@ -76,6 +76,7 @@ import { PiSessions } from "./pi-sessions.ts";
 import { Hooks } from "./hooks.ts";
 import { Pip, PIP_EXTENSION } from "./pip.ts";
 import { PIP_COMPACT_CHOICES, PipCompaction } from "./pip-compact.ts";
+import { Pruner } from "./pruner.ts";
 import { RepoWatches } from "./repo-watches.ts";
 import { snippet } from "./projection.ts";
 import { loadPromptTemplates, type PromptTemplate, type SkillCommand } from "./prompts.ts";
@@ -250,6 +251,8 @@ export class PocketApp {
     readonly pip = new Pip(this);
     /** PiP's context kept small: compacted sooner than a session's, with summaries of its own (`pip-compact.ts`). */
     readonly pipCompaction = new PipCompaction(this);
+    /** Sessions' context pruned before it is summarised, without a model call (`pruner.ts`). */
+    readonly pruner = new Pruner(this);
     /** Sessions' watches of their pull requests (`watches.ts`). */
     readonly watches = new Watches(this);
     /** PiP's standing orders on GitHub repositories: what happens there goes to PiP or a session (`repo-watches.ts`). */
@@ -401,6 +404,7 @@ export class PocketApp {
             browsers: this.browsers,
             pip: this.pip,
             pipCompaction: this.pipCompaction,
+            pruner: this.pruner,
             watches: this.watches,
             repoWatches: this.repoWatches,
             memory: this.memory,
