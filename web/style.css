@@ -2572,6 +2572,13 @@ button.chip:hover {
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    /* A button that looks like the rest of the line: tapping it shows where the context goes. */
+    padding: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
 }
 
 .status-line .meter {
@@ -4734,6 +4741,7 @@ button.chip:hover {
     text-align: left;
     font-size: 0.82rem;
     color: var(--text);
+    white-space: pre-line;
     pointer-events: auto;
     animation: notice-in var(--t-in) var(--ease-out);
 }

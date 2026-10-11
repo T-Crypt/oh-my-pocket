@@ -8,6 +8,7 @@ import {
     parseCommand,
     parseTemplate,
     planAvailable,
+    showContext,
     suggestCommands,
 } from "./commands.js";
 import { loadFiles, mentionAt, mentionText, suggestFiles } from "./files.js";
@@ -1394,13 +1395,13 @@ function StatusLine() {
         const title = `${about}${formatTokens(used)} of ${formatTokens(window)} tokens in context`;
 
         parts.push(
-            html`<span class="context" title=${title}>
+            html`<button type="button" class="context" title=${`${title} · tap for where it goes`} onClick=${showContext}>
                 context
                 <span class="meter" aria-hidden="true">
                     <span style=${`width:${percent}%`}></span>
                 </span>
                 ${about}${percent}%
-            </span>`,
+            </button>`,
         );
     }
 

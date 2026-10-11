@@ -333,6 +333,10 @@ export async function conversationRoutes(
         return serveImage(request, response, app.workspace.conversationFile(user, id, requested));
     }
 
+    if (third === "context" && method === "GET") {
+        return json(response, 200, await app.contextMeter(id));
+    }
+
     if (third === "entry" && fourth !== undefined && method === "GET") {
         const entry = await app.transcripts.fullEntry(id, Number(fourth));
 

@@ -47,6 +47,7 @@ import type { BrowserState } from "./browser/page.ts";
 import { Collab, REACTIONS } from "./collab.ts";
 import { Commands } from "./commands.ts";
 import { APP_ROOT, ConfigStore, type User } from "./config.ts";
+import { type ContextMeter, contextMeter } from "./context-meter.ts";
 import {
     ArtifactBodyDoc,
     type ArtifactMeta,
@@ -1669,6 +1670,11 @@ export class PocketApp {
     }
 
     /** A conversation's handle; 404 when it does not exist. */
+    /** Where a conversation's context goes: system prompt by section, tool schemas, and history by kind. */
+    async contextMeter(id: ConversationId): Promise<ContextMeter> {
+        return contextMeter((await (await this.conversation(id)).context(context)).messages);
+    }
+
     async conversation(id: ConversationId): Promise<Conversation> {
         const conversation = await this.harness.conversation(id, context);
 

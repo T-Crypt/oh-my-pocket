@@ -5,7 +5,17 @@ import { branchAvailable } from "./sheets/branch.js";
 import { memoryAvailable, remember } from "./sheets/memory.js";
 import { togglePeeks } from "./peeks.js";
 import { askPip, openPip, pipAvailable } from "./pip.js";
-import { actions, collab, navigate, notify, openSheet, scoped, store } from "./store.js";
+import {
+    actions,
+    api,
+    attempt,
+    collab,
+    navigate,
+    notify,
+    openSheet,
+    scoped,
+    store,
+} from "./store.js";
 import { chooseTheme, THEMES } from "./theme.js";
 import { trustAvailable } from "./trust.js";
 import { copyText, formatTokens, formatWhen, modelLabel, replyText, shortPath } from "./ui.js";
@@ -217,6 +227,42 @@ function showSession() {
     notify("info", parts.join(" · "));
 }
 
+/** Where the context goes: each group's total and its largest rows, measured against the newest answer's prompt. */
+export async function showContext() {
+    const id = store.state.view.conversation?.id;
+
+    if (id === undefined) {
+        return;
+    }
+
+    const meter = await attempt(() => api(`c/${id}/context`));
+
+    if (meter === undefined) {
+        return;
+    }
+
+    const lines = ["system", "tools", "history"].flatMap((group) => {
+        const rows = meter.rows
+            .filter((row) => row.group === group)
+            .sort((a, b) => b.tokens - a.tokens);
+        const total = rows.reduce((sum, row) => sum + row.tokens, 0);
+
+        return total === 0
+            ? []
+            : [
+                  `${group} ${formatTokens(total)}: ${rows
+                      .slice(0, 3)
+                      .map((row) => `${row.name} ${formatTokens(row.tokens)}`)
+                      .join(", ")}${rows.length > 3 ? `, +${rows.length - 3} more` : ""}`,
+              ];
+    });
+
+    notify(
+        "info",
+        `${meter.measured ? "" : "~"}${formatTokens(meter.tokens)} in context\n${lines.join("\n")}`,
+    );
+}
+
 /** `args` in brackets is optional. `available` hides a command where it does not apply. */
 const COMMANDS = [
     {
@@ -350,6 +396,12 @@ const COMMANDS = [
         run: (arg) => openSheet({ type: "find", query: arg }),
     },
     { name: "session", description: "Show the model, context use, and cost", run: showSession },
+    {
+        name: "context",
+        description: "Show where the context goes: prompt sections, tools, and history",
+        available: isSession,
+        run: showContext,
+    },
     {
         name: "export",
         description: "Download this conversation as Markdown",
