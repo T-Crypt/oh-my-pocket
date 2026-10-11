@@ -42,6 +42,7 @@ import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { Alerts } from "./alerts.ts";
 import { Attribution, type Missing } from "./attribution.ts";
 import { Browsers } from "./browser.ts";
+import { compactionSettings } from "./compaction.ts";
 import type { BrowserState } from "./browser/page.ts";
 import { Collab, REACTIONS } from "./collab.ts";
 import { Commands } from "./commands.ts";
@@ -723,7 +724,7 @@ export class PocketApp {
                 return stream();
             },
             get compaction() {
-                return safe(() => settings.getCompactionSettings()) ?? {};
+                return compactionSettings(settings);
             },
             get retry() {
                 return safe(() => settings.getRetrySettings()) ?? {};
