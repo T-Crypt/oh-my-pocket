@@ -8,10 +8,11 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { FauxResponseStep, Message } from "@earendil-works/pi-ai";
+import { Type } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai/utils/transcript";
 import type { ContextView, ConversationId } from "@earendil-works/pi-durable";
-import { signatureOf } from "../src/server/loop-guard.ts";
+import { preparedArguments, signatureOf } from "../src/server/loop-guard.ts";
 import { repairToolArguments } from "../src/server/tool-repair.ts";
 import {
     type App,
@@ -205,6 +206,47 @@ test("the no-repeat rule is in the prompt the model gets", async () => {
     );
 });
 
+// --- What the guard signs, end to end: prepared and validated, in both hooks -----------------
+
+const probeTool = {
+    name: "probe",
+    description: "probe",
+    parameters: Type.Object({ path: Type.String(), limit: Type.Optional(Type.Number()) }),
+    prepareArguments: (args: unknown) =>
+        typeof args === "string" ? (JSON.parse(args) as Record<string, unknown>) : args,
+};
+
+test("a raw call signs with its prepared and validated arguments, like the clean identical call", () => {
+    const call = (args: unknown) =>
+        ({ type: "toolCall", id: "1", name: "probe", arguments: args }) as never;
+
+    // A string where a number belongs, as the model wrote it: validation coerces it the clean call never needed.
+    assert.deepEqual(preparedArguments(call({ path: "/x", limit: "500" }), probeTool as never), {
+        path: "/x",
+        limit: 500,
+    });
+    assert.equal(
+        signatureOf(
+            "probe",
+            preparedArguments(call({ path: "/x", limit: "500" }), probeTool as never),
+        ),
+        signatureOf("probe", { path: "/x", limit: 500 }),
+    );
+
+    // An object sent as a JSON string: the wrapper repairs it to the object the clean call sent.
+    assert.deepEqual(preparedArguments(call('{"path":"/x","limit":500}'), probeTool as never), {
+        path: "/x",
+        limit: 500,
+    });
+    assert.equal(
+        signatureOf(
+            "probe",
+            preparedArguments(call('{"path":"/x","limit":500}'), probeTool as never),
+        ),
+        signatureOf("probe", { path: "/x", limit: 500 }),
+    );
+});
+
 test("an object or array sent as a JSON string is repaired before validation, and the call runs", async () => {
     const id = await newSession(app);
     const file = join(work, "repaired.txt");
@@ -228,4 +270,45 @@ test("an object or array sent as a JSON string is repaired before validation, an
     assert.equal(results.length, 1);
     assert.equal(results[0]!.isError, false);
     assert.ok(textOf(results[0]!.content).includes("the first line"));
+});
+test("a string limit, coerced by validation, is blocked on its third identical run", async () => {
+    const id = await newSession(app);
+    const attempt = tool("read", { path: join(work, "loop-missing.txt"), limit: "500" } as never);
+
+    steps = [attempt, attempt, attempt, () => fauxAssistantMessage([fauxText("done")])];
+    stepIndex = 0;
+    await say(app, id, "read it, three ways of saying five hundred");
+
+    const results = await resultsOf(id);
+
+    assert.equal(results.length, 3);
+    assert.equal(results[0]!.isError, true);
+    assert.ok(!textOf(results[0]!.content).includes("blocked"));
+    assert.ok(!textOf(results[1]!.content).includes("blocked"));
+    assert.match(
+        textOf(results[2]!.content),
+        /blocked: you already ran read with exactly these arguments and it failed/,
+    );
+});
+
+test("arguments sent as a JSON string are blocked on their third identical run", async () => {
+    const id = await newSession(app);
+    const encoded = JSON.stringify({ path: join(work, "loop-missing.txt"), limit: 1 });
+    const attempt = () =>
+        fauxAssistantMessage([fauxToolCall("read", encoded as never)], { stopReason: "toolUse" });
+
+    steps = [attempt, attempt, attempt, () => fauxAssistantMessage([fauxText("done")])];
+    stepIndex = 0;
+    await say(app, id, "read it, three ways of saying one");
+
+    const results = await resultsOf(id);
+
+    assert.equal(results.length, 3);
+    assert.equal(results[0]!.isError, true);
+    assert.ok(!textOf(results[0]!.content).includes("blocked"));
+    assert.ok(!textOf(results[1]!.content).includes("blocked"));
+    assert.match(
+        textOf(results[2]!.content),
+        /blocked: you already ran read with exactly these arguments and it failed/,
+    );
 });

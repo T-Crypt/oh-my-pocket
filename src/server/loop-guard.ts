@@ -8,8 +8,9 @@
  * repeats of read-shaped tools, which can legitimately return something new after it. In memory on purpose: a
  * restart interrupts the loop anyway, and the guard re-arms on the next failure of the resumed run.
  */
-import type { Message } from "@earendil-works/pi-ai";
-import type { ConversationId } from "@earendil-works/pi-durable";
+import type { Message, ToolCall } from "@earendil-works/pi-ai";
+import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
+import type { ConversationId, JsonObject, ToolRegistration } from "@earendil-works/pi-durable";
 
 /** Identical calls allowed in one turn before the next is blocked. */
 const REPEAT_LIMIT = 3;
@@ -41,6 +42,31 @@ export function signatureOf(name: string, args: unknown): string {
             : value;
 
     return `${name}:${JSON.stringify(norm(args))}`;
+}
+
+/**
+ * The arguments the harness will run a raw call with: prepared by the tool's wrapper, then validated and coerced
+ * against its schema. `beforeTool` sees that form, while `afterTool` is given the model's raw call, so the guard
+ * re-derives the form there: a call the model wrote slightly wrong - a JSON string of an object, a string where a
+ * number belongs - signs as the clean identical call, and its repeats reach the limit like any other's.
+ */
+export function preparedArguments(call: ToolCall, tool: ToolRegistration | undefined): unknown {
+    if (tool === undefined) {
+        return call.arguments;
+    }
+
+    // The call already ran, so this re-runs the same pure prepare and validation the harness ran: a throw here is
+    // impossible for a call that settled, and the fallback keeps the guard's old, raw-arguments domain.
+    try {
+        const prepared =
+            tool.prepareArguments === undefined
+                ? call.arguments
+                : tool.prepareArguments(call.arguments);
+
+        return validateToolArguments(tool, { ...call, arguments: prepared as JsonObject });
+    } catch {
+        return call.arguments;
+    }
 }
 
 /** What the guard remembers, by conversation: one guard the app's extensions share. */
