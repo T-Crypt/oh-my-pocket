@@ -1,11 +1,12 @@
 <div align="center">
 
-# Pi Pocket
+# Oh-My-Pocket
 
-**Your Pi coding agent, in your pocket.**
+**Pi Pocket, tuned for local models.**
 
 A durable, multiplayer, mobile-first web app for Pi agents, built on [Pi Durable](https://earendil.com/posts/pi-durable/).<br>
-Runs on your own machine or directly on your phone. No cloud VM.
+Runs on your own machine or directly on your phone. No cloud VM.<br>
+A fork of [TannerMidd/pi-pocket](https://github.com/TannerMidd/pi-pocket) with the context batteries from [oh-my-pi](https://github.com/can1357/oh-my-pi) ported in.
 
 [![Release](https://img.shields.io/github/v/release/TannerMidd/pi-pocket?color=7aa2f7)](https://github.com/TannerMidd/pi-pocket/releases)
 [![Node.js 22.19+](https://img.shields.io/badge/node-%E2%89%A5%2022.19-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org)
@@ -17,13 +18,60 @@ Runs on your own machine or directly on your phone. No cloud VM.
 
 </div>
 
+## What this fork adds
+
+Oh-My-Pocket keeps Pi Pocket whole and adds what a self-hosted model on one GPU needs: a small, stable prompt prefix, no
+surprise model swaps, and a plan mode that can read the project board. Each change ships with tests, and each one that
+touches the prompt is measured against oh-my-pi (OMP) on the same task, model, and server.
+
+Work lands on branch `oh-my-pocket`; `main` mirrors Pi Pocket, whose releases merge in.
+
+### Batteries
+
+| Battery                         | What it does                                                                                                                                                                                                                | Measured                                                                   |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Agent definitions               | `subagent` spawn takes `agent: <name>` and loads `~/.pi-pocket/agents/<name>.md`: role instructions, model, thinking level, and tools. Pipelines (plan, implement, review) run each stage as its own role.                  | 5 tests                                                                    |
+| Background compaction off       | `compaction.backgroundTokens` in Pi's settings now reaches Pi Durable; `0` turns it off. A local server answers one request at a time, so a background summary only queues behind the turn it was meant to overlap.         | 3 tests                                                                    |
+| Titles on the session's model   | A session on a free model writes its own title. Before, a long first message picked any `*-mini` model on the same provider, and on a one-GPU server that load pushed the session's model out of VRAM for a six-word title. | no model swap before the first turn (about 40 s each way here)             |
+| Plan mode reads the board       | Tools can mark which calls only read (`host.readOnlyCalls`), and plan mode lets those through: listing and reading board tickets, say. `git -C <dir>`, `git branch -a`, and output sent to `/dev/null` count as reads too.  | 19 new test cases; the 4 calls a real plan session got blocked on now pass |
+| Per-role skill catalog (recipe) | A drop-in wraps the `skills` section (Pi Durable's `wrapSection`) and renders it from the session role's own list. Pi otherwise sends its whole catalog on every request.                                                   | router start context 19,395 to 13,133 tokens                               |
+
+Router start context, the tokens sent before the first word of every request: Pi Pocket with a router prompt 22,726;
+OMP 15,900; Oh-My-Pocket 13,133 (llama-swap `/api/metrics/activity`, probe "Reply with just: ok", 2026-10-11).
+
+### Building a router on it
+
+A router setup lives in drop-ins in `~/.pi-pocket/extensions/`, so Oh-My-Pocket itself stays general:
+
+- **Router prompt.** A `section` that adds the router's instructions when the session's model is the router model,
+  and stays out of subagents.
+- **Board tools.** One tool per MCP server (`ome {call, args}`) costs a fraction of one schema per call. The drop-in
+  puts its read-only calls in `host.readOnlyCalls`, so plan mode can read the board.
+- **Skills per role.** A `wrapSection("skills", ...)` that filters `host.skills(cwd)` to the role's list and renders it
+  with Pi's `formatSkillsForPrompt`. `/skill:<name>` still loads any skill.
+- **Stage roles.** Agent definitions, one per stage, each naming its model and tools.
+
+[docs/extensions.md](docs/extensions.md) covers the host members and hooks these use.
+
+### Measuring a change
+
+Run the same task in OMP and in Oh-My-Pocket against the same llama-swap server, then read
+`/api/metrics/activity` (paged, newest first) for prompt tokens, cache hits, output, and wall time. A battery stays only
+if it holds or improves those numbers without lowering the result.
+
+### Next
+
+Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: a lower default `read`
+limit with a structural summary; superseding stale reads and dropping useless turns before compaction; trimming
+oversized tool output (head and tail kept) when compaction starts, with no model call when that alone frees enough room.
+
 ## Quick start
 
 Requires Node.js 22.19 or newer. Runs on Linux, macOS, Windows, and Android (Termux); Linux is the most tested. Sign in to a provider with Pi first (`pi`, then `/login`), or later from the app's Providers sheet.
 
 ```bash
-git clone https://github.com/TannerMidd/pi-pocket.git
-cd pi-pocket
+git clone -b oh-my-pocket https://github.com/T-Crypt/oh-my-pocket.git
+cd oh-my-pocket
 npm install
 npm start
 ```
