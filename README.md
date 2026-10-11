@@ -61,7 +61,8 @@ if it holds or improves those numbers without lowering the result.
 
 ### Next
 
-Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: a lower default `read`
+Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: a context meter that
+splits each request into system prompt, tool schemas, file reads, and replay, so every A/B reads its own numbers; a lower default `read`
 limit with a structural summary; superseding stale reads and dropping useless turns before compaction; trimming
 oversized tool output (head and tail kept) when compaction starts, with no model call when that alone frees enough room.
 
