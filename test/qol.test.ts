@@ -499,6 +499,12 @@ test("a long first message gets a short written title; a short one is the title"
         "big-mini",
     );
     assert.equal(titleModel([model("gemini-pro")], model("big")).id, "big");
+    // A free (local) model keeps its own titles: a small one would only cost a model swap.
+    assert.equal(
+        titleModel([model("local", "l", 0), model("local-mini", "l", 0)], model("local", "l", 0))
+            .id,
+        "local",
+    );
 
     const id = await newSession(app, folder);
 

@@ -30,8 +30,16 @@ export function wantsTitle(text: string): boolean {
     return words >= LONG_WORDS || text.trim().includes("\n");
 }
 
-/** The cheapest small model of the same provider that can be used now, or the session's own. */
+/**
+ * The cheapest small model of the same provider that can be used now, or the session's own. A session whose model is
+ * free (a local server) keeps it: a small model there saves nothing, and loading it can push the session's model out
+ * of a one-GPU server, so the next turn waits for it to load again.
+ */
 export function titleModel(models: readonly Model<Api>[], current: Model<Api>): Model<Api> {
+    if (current.cost.input + current.cost.output === 0) {
+        return current;
+    }
+
     const small = models
         .filter(
             (model) =>
