@@ -24,20 +24,31 @@ Oh-My-Pocket keeps Pi Pocket whole and adds what a self-hosted model on one GPU 
 surprise model swaps, and a plan mode that can read the project board. Each change ships with tests, and each one that
 touches the prompt is measured against oh-my-pi (OMP) on the same task, model, and server.
 
-Work lands on branch `oh-my-pocket`; `main` mirrors Pi Pocket, whose releases merge in.
+`oh-my-pocket` is the default branch. `main` mirrors Pi Pocket: upstream changes land there first, get reviewed, and
+only then merge into `oh-my-pocket`.
 
 ### Batteries
 
-| Battery                         | What it does                                                                                                                                                                                                                | Measured                                                                   |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| Agent definitions               | `subagent` spawn takes `agent: <name>` and loads `~/.pi-pocket/agents/<name>.md`: role instructions, model, thinking level, and tools. Pipelines (plan, implement, review) run each stage as its own role.                  | 5 tests                                                                    |
-| Background compaction off       | `compaction.backgroundTokens` in Pi's settings now reaches Pi Durable; `0` turns it off. A local server answers one request at a time, so a background summary only queues behind the turn it was meant to overlap.         | 3 tests                                                                    |
-| Titles on the session's model   | A session on a free model writes its own title. Before, a long first message picked any `*-mini` model on the same provider, and on a one-GPU server that load pushed the session's model out of VRAM for a six-word title. | no model swap before the first turn (about 40 s each way here)             |
-| Plan mode reads the board       | Tools can mark which calls only read (`host.readOnlyCalls`), and plan mode lets those through: listing and reading board tickets, say. `git -C <dir>`, `git branch -a`, and output sent to `/dev/null` count as reads too.  | 19 new test cases; the 4 calls a real plan session got blocked on now pass |
-| Per-role skill catalog (recipe) | A drop-in wraps the `skills` section (Pi Durable's `wrapSection`) and renders it from the session role's own list. Pi otherwise sends its whole catalog on every request.                                                   | router start context 19,395 to 13,133 tokens                               |
+| Battery                         | What it does                                                                                                                                                                                                                                       | Measured                                                                   |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Agent definitions               | `subagent` spawn takes `agent: <name>` and loads `~/.pi-pocket/agents/<name>.md`: role instructions, model, thinking level, and tools. Pipelines (plan, implement, review) run each stage as its own role.                                         | 5 tests                                                                    |
+| Background compaction off       | `compaction.backgroundTokens` in Pi's settings now reaches Pi Durable; `0` turns it off. A local server answers one request at a time, so a background summary only queues behind the turn it was meant to overlap.                                | 3 tests                                                                    |
+| Titles on the session's model   | A session on a free model writes its own title. Before, a long first message picked any `*-mini` model on the same provider, and on a one-GPU server that load pushed the session's model out of VRAM for a six-word title.                        | no model swap before the first turn (about 40 s each way here)             |
+| Plan mode reads the board       | Tools can mark which calls only read (`host.readOnlyCalls`), and plan mode lets those through: listing and reading board tickets, say. `git -C <dir>`, `git branch -a`, and output sent to `/dev/null` count as reads too.                         | 19 new test cases; the 4 calls a real plan session got blocked on now pass |
+| Per-role skill catalog (recipe) | A drop-in wraps the `skills` section (Pi Durable's `wrapSection`) and renders it from the session role's own list. Pi otherwise sends its whole catalog on every request.                                                                          | router start context 19,395 to 13,133 tokens                               |
+| Context meter                   | `/context`, a tap on the status-line meter, or `GET /api/c/:id/context`: the context split into prompt sections, tool schemas, and history by kind, scaled to the newest measured prompt. Every A/B reads its own numbers.                         | within 0.1% of the measured prompt; 3 tests                                |
+| Waiting subagents               | `subagent` spawn and send take `wait: true` and return the answer as the call's result. The parent writes nothing while a stage runs, so on a one-slot server the stage keeps its cache. A stopped waiting call still gets its answer as a report. | cached share 60% to 90%; 2 tests                                           |
 
 Router start context, the tokens sent before the first word of every request: Pi Pocket with a router prompt 22,726;
 OMP 15,900; Oh-My-Pocket 13,133 (llama-swap `/api/metrics/activity`, probe "Reply with just: ok", 2026-10-11).
+
+Same T2 job (add `subtract(a, b)` with a pytest test: plan, implement, review, one model, one GPU), 2026-10-11:
+
+| Harness                     | Wall  | Requests | Prompt tokens | Cached | Prefilled | Output | Result                 |
+| --------------------------- | ----- | -------- | ------------- | ------ | --------- | ------ | ---------------------- |
+| OMP                         | 213 s | 41       | 685,014       | 81%    | 130K      | 20,009 | 2 passed, review clean |
+| Oh-My-Pocket, before `wait` | 187 s | 34       | 468,160       | 60%    | 186K      | 13,880 | 2 passed, review clean |
+| Oh-My-Pocket                | 179 s | 36       | 470,091       | 90%    | 47K       | 14,252 | 2 passed, review ship  |
 
 ### Building a router on it
 
@@ -49,7 +60,7 @@ A router setup lives in drop-ins in `~/.pi-pocket/extensions/`, so Oh-My-Pocket 
   puts its read-only calls in `host.readOnlyCalls`, so plan mode can read the board.
 - **Skills per role.** A `wrapSection("skills", ...)` that filters `host.skills(cwd)` to the role's list and renders it
   with Pi's `formatSkillsForPrompt`. `/skill:<name>` still loads any skill.
-- **Stage roles.** Agent definitions, one per stage, each naming its model and tools.
+- **Stage roles.** Agent definitions, one per stage, each naming its model and tools, spawned with `wait: true`.
 
 [docs/extensions.md](docs/extensions.md) covers the host members and hooks these use.
 
@@ -61,8 +72,7 @@ if it holds or improves those numbers without lowering the result.
 
 ### Next
 
-Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: a context meter that
-splits each request into system prompt, tool schemas, file reads, and replay, so every A/B reads its own numbers; a lower default `read`
+Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: a lower default `read`
 limit with a structural summary; superseding stale reads and dropping useless turns before compaction; trimming
 oversized tool output (head and tail kept) when compaction starts, with no model call when that alone frees enough room.
 
