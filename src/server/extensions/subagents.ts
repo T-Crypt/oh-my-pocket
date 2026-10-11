@@ -27,6 +27,7 @@ import {
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
+import { listAgents, loadAgent } from "../agents.ts";
 import { type PendingReport, REPORT_PREFIX, STOPPED, SubagentsDoc } from "../docs.ts";
 import { describe } from "../errors.ts";
 import type { PocketHost } from "../host.ts";
@@ -616,8 +617,8 @@ export default function createSubagents(host: PocketHost) {
     const subagent = defineTool({
         name: "subagent",
         description:
-            "Manage persistent background subagents. Actions: spawn (name, message; optional model as provider/modelId, " +
-            "thinking level, and tools to allow), send (name, message; followUp: true queues it after the current answer " +
+            "Manage persistent background subagents. Actions: spawn (name, message; optional agent definition, model as " +
+            "provider/modelId, thinking level, and tools to allow), send (name, message; followUp: true queues it after the current answer " +
             "instead of steering), stop (name: aborts its current work), status (one name, or all). Answers come back " +
             "to you as messages at your next pause; those that arrive together come in one.",
         parameters: Type.Object({
@@ -632,6 +633,13 @@ export default function createSubagents(host: PocketHost) {
             ),
             message: Type.Optional(Type.String()),
             followUp: Type.Optional(Type.Boolean()),
+            agent: Type.Optional(
+                Type.String({
+                    description:
+                        "spawn only: an agent definition to start as (its role, model, thinking level, and tools). " +
+                        "The other spawn options override it.",
+                }),
+            ),
             model: Type.Optional(
                 Type.String({ description: "spawn only: provider/modelId. Default: your model." }),
             ),
@@ -716,19 +724,35 @@ export default function createSubagents(host: PocketHost) {
                 return reply(`${action} needs a message.`);
             }
 
-            // Resolve spawn options before the commit, so a bad model name fails without side effects.
+            // Resolve spawn options before the commit, so a bad model or agent name fails without side effects.
+            const definition =
+                action === "spawn" && args.agent !== undefined
+                    ? loadAgent(host.dataDir, args.agent)
+                    : undefined;
+
+            if (
+                definition?.thinking !== undefined &&
+                !(THINKING_LEVELS as readonly string[]).includes(definition.thinking)
+            ) {
+                throw new Error(
+                    `Agent ${definition.name} asks for thinking ${definition.thinking}. Levels: ${THINKING_LEVELS.join(", ")}`,
+                );
+            }
+
+            const modelSpec = args.model ?? definition?.model;
+            const toolNames = args.tools ?? definition?.tools;
             const model =
-                action === "spawn" && args.model !== undefined
-                    ? host.resolveModel(args.model)
+                action === "spawn" && modelSpec !== undefined
+                    ? host.resolveModel(modelSpec)
                     : undefined;
             const parentTools =
-                action === "spawn" && args.tools !== undefined
+                action === "spawn" && toolNames !== undefined
                     ? (await api.agent(context)).tools
                     : [];
             const tools =
-                args.tools === undefined
+                action !== "spawn" || toolNames === undefined
                     ? undefined
-                    : args.tools.map((tool) => {
+                    : toolNames.map((tool) => {
                           const found = parentTools.find((each) => each.name === tool);
 
                           if (found === undefined) {
@@ -740,7 +764,7 @@ export default function createSubagents(host: PocketHost) {
                           return found;
                       });
             // TypeBox infers no type from a union built from a list; the schema itself checks the value.
-            const asked = args.thinking as ModelThinkingLevel | undefined;
+            const asked = (args.thinking ?? definition?.thinking) as ModelThinkingLevel | undefined;
             let wanted = asked;
             let thinking = asked;
 
@@ -772,7 +796,11 @@ export default function createSubagents(host: PocketHost) {
 
                     await configure(tx, child.id, {
                         extensions: { remove: [SubagentTools] },
-                        instructions: `You are the subagent "${name}". You work for another agent, not directly for a person, although a person may open your conversation and talk to you. Answer requests completely but concisely: your final answer is what gets reported back.`,
+                        instructions:
+                            `You are the subagent "${name}". You work for another agent, not directly for a person, although a person may open your conversation and talk to you. Answer requests completely but concisely: your final answer is what gets reported back.` +
+                            (definition === undefined || definition.instructions === ""
+                                ? ""
+                                : `\n\n${definition.instructions}`),
                         ...(model === undefined ? {} : { model }),
                         ...(thinking === undefined ? {} : { thinkingLevel: thinking }),
                         ...(tools === undefined ? {} : { tools }),
@@ -817,7 +845,21 @@ export default function createSubagents(host: PocketHost) {
         name: "pocket-subagents",
         tasks: [Anchor, Reporter, Courier],
         tools: [subagent],
-        sections: [section("subagents", () => GUIDE)],
+        sections: [
+            section("subagents", () => GUIDE),
+            section("subagent_definitions", () => {
+                const agents = listAgents(host.dataDir);
+
+                return agents.length === 0
+                    ? undefined
+                    : `Agent definitions you can spawn a subagent as (subagent spawn with agent: <name>):\n${agents
+                          .map(
+                              (agent) =>
+                                  `- ${agent.name}${agent.description ? `: ${agent.description}` : ""}`,
+                          )
+                          .join("\n")}`;
+            }),
+        ],
     });
 
     return SubagentTools;
