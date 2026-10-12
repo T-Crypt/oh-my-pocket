@@ -4427,6 +4427,12 @@ button.chip:hover {
     width: auto;
 }
 
+/* One provider in the Providers sheet: its row, and the models open under it. */
+.provider-block {
+    display: flex;
+    flex-direction: column;
+}
+
 .provider {
     display: flex;
     justify-content: space-between;
@@ -4434,6 +4440,27 @@ button.chip:hover {
     gap: 0.6rem;
     padding: 0.55rem 0.2rem;
     border-bottom: 1px solid var(--line);
+}
+
+/* The models a provider offers the pickers: searched above, switched one by one below. */
+.provider-models {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.4rem 0.2rem 0.7rem;
+    border-bottom: 1px solid var(--line);
+}
+
+.provider-models .setting {
+    margin-top: 0;
+}
+
+.provider-models .setting .mono {
+    font-size: 0.72rem;
+}
+
+.provider-models .row {
+    padding: 0.15rem 0 0.25rem;
 }
 
 .provider-actions {
