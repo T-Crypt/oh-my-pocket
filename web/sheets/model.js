@@ -1,7 +1,8 @@
 // The model picker: a menu over the model chip, searchable once there are many models; and the same menu for the model
 // and thinking level new sessions start with.
 import { useEffect, useRef, useState } from "preact/hooks";
-import { actions, attempt, closeSheet, openSheet, store } from "../store.js";
+import { toggleRouters } from "../routers.js";
+import { actions, api, attempt, closeSheet, openSheet, store } from "../store.js";
 import { anchorStyle, formatTokens, html, Icon, popAnchor } from "../ui.js";
 
 /** Models past this many get a search box in the picker. */
@@ -54,6 +55,8 @@ export function ModelPicker() {
     const list = useRef(null);
     // Arrows scroll the list to the model they reach; the mouse does not, or the list would run away under it.
     const keyed = useRef(false);
+    // The Routers group: a session runs as one, its model and stage models with it. Not for the default's picker.
+    const [routers, setRouters] = useState([]);
     const agent = view.agent;
     const owner = me?.role === "owner";
     const chosen = server?.defaultModel ?? null;
@@ -112,6 +115,13 @@ export function ModelPicker() {
             visualViewport?.removeEventListener("resize", place);
             removeEventListener("keydown", onKey);
         };
+    }, []);
+    useEffect(() => {
+        if (!forDefault && view.conversation) {
+            api("routers")
+                .then((answer) => setRouters(answer?.routers ?? []))
+                .catch(() => {});
+        }
     }, []);
     useEffect(() => {
         if (!keyed.current) {
@@ -212,6 +222,50 @@ export function ModelPicker() {
                     models.length > 0 &&
                     shown.length === 0 &&
                     html`<p class="muted pop-menu-note">No model matches “${query.trim()}”.</p>`
+                }
+                ${
+                    routers.length > 0 &&
+                    needle === "" &&
+                    html`<div class="pop-menu-group" role="group" aria-label="Routers">
+                        <div class="pop-menu-group-head">
+                            <span>Routers</span>
+                            <button
+                                class="pop-menu-link"
+                                onClick=${() => {
+                                    closeSheet();
+                                    toggleRouters();
+                                }}
+                            >
+                                Edit
+                            </button>
+                        </div>
+                        ${routers.map(
+                            (router) => html`<button
+                                key=${`router:${router.id}`}
+                                class="pop-menu-row router-row"
+                                role="option"
+                                aria-selected=${view.router?.id === router.id}
+                                title=${`${router.id} on ${router.model || "no model yet"}`}
+                                onClick=${() =>
+                                    attempt(async () => {
+                                        if (view.router?.id !== router.id) {
+                                            await actions.setRouter(router.id);
+                                        }
+
+                                        closeSheet();
+                                    })}
+                            >
+                                <span class="pop-menu-row-text">
+                                    <span class="pop-menu-row-name">${router.label}</span>
+                                    <span class="pop-menu-row-sub">
+                                        router · ${router.model || "no model yet"}
+                                    </span>
+                                </span>
+                                ${view.router?.id === router.id && html`<${Icon} name="check" size=${14} />`}
+                            </button>`,
+                        )}
+                        <div class="pop-menu-group-head"><span>Models</span></div>
+                    </div>`
                 }
                 ${shown.map(
                     (model, index) => html`<button

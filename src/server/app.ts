@@ -2468,6 +2468,7 @@ export class PocketApp {
                 ...router,
                 promptText: promptOf(router) ?? "",
             })),
+            thinkingLevels: THINKING_LEVELS,
             roles: listAgents(this.dataDir).map((agent) => ({
                 name: agent.name,
                 ...(agent.model === undefined ? {} : { model: agent.model }),

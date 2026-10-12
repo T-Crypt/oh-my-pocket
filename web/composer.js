@@ -1318,7 +1318,7 @@ export function Composer() {
                             onClick=${() => openSheet({ type: "model" })}
                         >
                             <${Icon} name="sparkle" size=${12} class="model-spark" />
-                            <span class="model-name">${shortModel(agent)}</span>
+                            <span class="model-name">${view.router ? view.router.label : shortModel(agent)}</span>
                             ${level && html`<span class="model-level">${level}</span>`}
                         </button>
                         ${

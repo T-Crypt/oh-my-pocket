@@ -10833,3 +10833,162 @@ textarea.notes {
     user-select: all;
     color: var(--accent);
 }
+
+/* The model picker's Routers group: a heading, its routers, then the models' heading. */
+.pop-menu-group-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.35rem 0.8rem;
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+}
+
+/* The router editor, in the conversation's place: the routers down the left, the one chosen in a form. */
+.routers-body {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(200px, 260px) 1fr;
+}
+
+.routers-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 0.6rem;
+    overflow-y: auto;
+    border-right: 1px solid var(--line);
+}
+
+.routers-list .list-item {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+}
+
+.routers-list .list-item.on {
+    border-color: var(--accent);
+}
+
+.routers-list .button {
+    margin-top: 0.4rem;
+}
+
+.routers-form {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.8rem 1rem 2rem;
+    overflow-y: auto;
+    min-width: 0;
+}
+
+.routers-form .label {
+    margin-top: 0.4rem;
+}
+
+.routers-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8rem;
+}
+
+.routers-row > label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1 1 220px;
+    min-width: 0;
+}
+
+.routers-form input:not([type]),
+.routers-form select,
+.routers-form textarea {
+    width: 100%;
+    min-width: 0;
+}
+
+.routers-check,
+.routers-row > label.routers-check {
+    display: flex;
+    flex-direction: row;
+    flex: 0 1 auto;
+    align-items: flex-start;
+    gap: 0.5rem;
+}
+
+/* Inputs fill their row everywhere else (the app's rule): a checkbox or a radio keeps its own size. */
+.routers-check input {
+    flex: none;
+    width: auto;
+    margin-top: 0.15rem;
+}
+
+.routers-check > span {
+    display: flex;
+    flex-direction: column;
+}
+
+.routers-prompt {
+    min-height: 12rem;
+    resize: vertical;
+    font-size: 0.78rem;
+}
+
+.routers-stages {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--line);
+}
+
+.routers-stage {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(180px, 320px);
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.45rem 0.6rem;
+    border-bottom: 1px solid var(--line);
+}
+
+.routers-stage:last-child {
+    border-bottom: none;
+}
+
+.routers-role {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.routers-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.6rem;
+}
+
+@media (max-width: 699px) {
+    .routers-body {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto 1fr;
+    }
+    .routers-list {
+        flex-direction: row;
+        overflow-x: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--line);
+    }
+    .routers-list .list-item {
+        flex: none;
+    }
+    .routers-stage {
+        grid-template-columns: 1fr;
+    }
+}

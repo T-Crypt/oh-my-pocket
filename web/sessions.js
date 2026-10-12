@@ -5,6 +5,7 @@ import { Avatar, folderColor, initials } from "./avatar.js";
 import { useBack } from "./back.js";
 import { useDragToClose } from "./gestures.js";
 import { PipRailButton } from "./pip.js";
+import { toggleRouters } from "./routers.js";
 import {
     actions,
     canSteer,
@@ -1070,7 +1071,9 @@ export function subagentTotals(sessions = store.state.sessions) {
 /** Open the subagents board in the conversation's place, or close it. */
 export const toggleBoard = () =>
     store.set((state) =>
-        state.board ? { board: false, boardAgents: null } : { board: true, drawer: false },
+        state.board
+            ? { board: false, boardAgents: null }
+            : { board: true, drawer: false, routersOpen: false },
     );
 
 /** The folded sidebar's sessions, numbered like Waybar's workspaces. */
@@ -1107,7 +1110,7 @@ function RailTiles() {
  * on a phone's home screen it does not fold.
  */
 export function RailNav({ foldable = false, folded = false }) {
-    const { sessions, board, me } = store.state;
+    const { sessions, board, me, routersOpen } = store.state;
     const canStart = canSteer() && !scoped();
     const busy = sessions.filter((session) => session.busy).length;
     const agents = subagentTotals(sessions);
@@ -1192,6 +1195,15 @@ export function RailNav({ foldable = false, folded = false }) {
                 (failed > 0 || agents.waiting > 0) &&
                 html`<span class="rail-trouble" aria-hidden="true"></span>`
             }
+        </button>
+        <button
+            class=${`rail-button rail-routers ${routersOpen ? "open" : ""}`}
+            title="Routers: edit them, make new ones"
+            aria-label="Routers"
+            aria-pressed=${routersOpen}
+            onClick=${toggleRouters}
+        >
+            <${Icon} name="route" size=${18} />
         </button>
         ${
             collab()
