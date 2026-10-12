@@ -371,13 +371,13 @@ test(
             }
 
             // The words that go still name their figures for a screen reader, and the guard, down to its shield,
-            // still takes a thumb.
+            // still takes a thumb. The baseline button stands between the context and the cache.
             if (width === 390) {
                 assert.equal(
                     await inPage<string>(
                         `return JSON.stringify(document.querySelector(".status-line").innerText.replace(/\\s+/g, " ").trim())`,
                     ),
-                    "87 tok/s first token 1.2s context 77% cache 83% $12.34 on",
+                    "87 tok/s first token 1.2s context 77% baseline cache 83% $12.34 on",
                 );
                 const guard = await inPage<{ w: number; h: number; label: string }>(`
                     const guard = document.querySelector(".status-line .guard");
@@ -431,7 +431,7 @@ test(
         assert.equal(wide.short, "", `wide, the line is whole: ${JSON.stringify(wide)}`);
         assert.match(
             await lineShown(),
-            /^1 here 87 tokens\/s first token 1\.2s context 77% cache 83% \$12\.34 guard on$/,
+            /^1 here 87 tokens\/s first token 1\.2s context 77% baseline cache 83% \$12\.34 guard on$/,
         );
 
         // Narrowed and widened again on the same page, without a reload: it shortens, then is whole again.
@@ -452,8 +452,9 @@ test(
         await everything();
         const before = await oneRow("one row with the speed off");
 
-        // Without the speed, an iPhone's width shows the line whole, as it was before the setting.
-        assert.equal(before.short, "", `nothing shortened: ${JSON.stringify(before)}`);
+        // Without the speed, an iPhone's width takes shorter forms for the baseline button's room: tighter gaps and
+        // no "1 here" while alone. The line stays on one row with everything else showing.
+        assert.equal(before.short, "words here", `shorter forms: ${JSON.stringify(before)}`);
 
         await flipSwitch();
         await page.evaluate(`(await import("/store.js")).closeSheet()`);
@@ -465,7 +466,8 @@ test(
         await page.evaluate(`(await import("/store.js")).closeSheet()`);
         await settle();
         await until(async () => (await speedShown()) === null, "the speed gone");
-        await until(async () => (await line()).short === "", "whole again");
+        // Back to the speed-off form: the baseline button's room, as above.
+        await until(async () => (await line()).short === "words here", "whole again");
     },
 );
 
