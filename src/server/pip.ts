@@ -58,6 +58,7 @@ export const PIP_EXTENSIONS = [
     "pocket-guard",
     "pocket-codemode",
     "pocket-memory",
+    "pocket-today",
 ];
 /** Pi Durable's coding tools PiP goes without: it reads files, and changes nothing itself. */
 export const PIP_WITHOUT = ["bash", "write", "edit"];

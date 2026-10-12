@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Repeat } from "./when.ts";
 import type { Worktree } from "./worktrees.ts";
+import type { ContextRow } from "./context-meter.ts";
 
 export type SessionMeta = {
     title?: string;
@@ -604,4 +605,23 @@ export const RepoWatchesDoc = defineDoc<{ items: Record<string, RepoWatch> }>({
     version: 1,
     scope: "session",
     initial: () => ({ items: {} }),
+});
+
+/**
+ * A snapshot of the context meter, which the owner takes before changing something - a prompt line, a tool, a skill
+ * list - so the later meter can line its rows up against it: the row the change touched, before and after. `takenAt`
+ * is zero until one is taken.
+ */
+export const ContextBaselineDoc = defineDoc<{
+    takenAt: number;
+    measured: boolean;
+    tokens: number;
+    rows: ContextRow[];
+}>({
+    kind: "pocket.context-baseline",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "current",
+    initial: () => ({ takenAt: 0, measured: false, tokens: 0, rows: [] }),
 });

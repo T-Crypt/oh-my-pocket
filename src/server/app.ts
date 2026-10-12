@@ -56,6 +56,7 @@ import {
     BrowserDoc,
     ChatDoc,
     type ChatMessage,
+    ContextBaselineDoc,
     DecisionsDoc,
     MemoryDoc,
     type SessionMeta,
@@ -76,6 +77,8 @@ import { PiSessions } from "./pi-sessions.ts";
 import { Hooks } from "./hooks.ts";
 import { Pip, PIP_EXTENSION } from "./pip.ts";
 import { PIP_COMPACT_CHOICES, PipCompaction } from "./pip-compact.ts";
+import { Pruner } from "./pruner.ts";
+import { LoopGuard } from "./loop-guard.ts";
 import { RepoWatches } from "./repo-watches.ts";
 import { snippet } from "./projection.ts";
 import { loadPromptTemplates, type PromptTemplate, type SkillCommand } from "./prompts.ts";
@@ -250,6 +253,10 @@ export class PocketApp {
     readonly pip = new Pip(this);
     /** PiP's context kept small: compacted sooner than a session's, with summaries of its own (`pip-compact.ts`). */
     readonly pipCompaction = new PipCompaction(this);
+    /** Sessions' context pruned before it is summarised, without a model call (`pruner.ts`). */
+    readonly pruner = new Pruner(this);
+    /** What a repeated tool call should not run again (`loop-guard.ts`), judged on the turn's own outcomes. */
+    readonly loopGuard = new LoopGuard();
     /** Sessions' watches of their pull requests (`watches.ts`). */
     readonly watches = new Watches(this);
     /** PiP's standing orders on GitHub repositories: what happens there goes to PiP or a session (`repo-watches.ts`). */
@@ -392,7 +399,9 @@ export class PocketApp {
             },
             skills: (cwd) => this.skills(cwd),
             resolveModel: (spec) => resolveModel(this.models, spec),
+            envFor: (conversationId) => this.envFor(conversationId),
             requesterOf: (conversationId) => this.attribution.requesterOf(conversationId),
+            loopGuard: this.loopGuard,
             notice: (level, message) => this.notice(level, message),
             heldBack: (conversationId) => this.spend.heldBack(conversationId),
             onLimitsChanged: (listener) => this.spend.onLimitsChanged(listener),
@@ -401,6 +410,7 @@ export class PocketApp {
             browsers: this.browsers,
             pip: this.pip,
             pipCompaction: this.pipCompaction,
+            pruner: this.pruner,
             watches: this.watches,
             repoWatches: this.repoWatches,
             memory: this.memory,
@@ -1673,6 +1683,42 @@ export class PocketApp {
     /** Where a conversation's context goes: system prompt by section, tool schemas, and history by kind. */
     async contextMeter(id: ConversationId): Promise<ContextMeter> {
         return contextMeter((await (await this.conversation(id)).context(context)).messages);
+    }
+
+    /** The context baseline the owner took here, if any: what the context measured like before a change. */
+    async contextBaseline(id: ConversationId) {
+        const baseline = await this.harness.snapshot(ContextBaselineDoc, id, context);
+
+        return baseline?.takenAt === 0 ? undefined : baseline;
+    }
+
+    /** Take the conversation's context meter as the baseline the next meter is diffed against. */
+    async takeContextBaseline(id: ConversationId) {
+        const meter = await this.contextMeter(id);
+        const takenAt = Date.now();
+
+        await this.harness.commit(async (tx) => {
+            Object.assign(await tx.doc(ContextBaselineDoc, id), {
+                takenAt,
+                measured: meter.measured,
+                tokens: meter.tokens,
+                rows: meter.rows,
+            });
+        }, context);
+
+        return { takenAt, measured: meter.measured, tokens: meter.tokens, rows: meter.rows };
+    }
+
+    /** Forget the baseline, so the next meter stands on its own. */
+    async clearContextBaseline(id: ConversationId) {
+        await this.harness.commit(async (tx) => {
+            Object.assign(await tx.doc(ContextBaselineDoc, id), {
+                takenAt: 0,
+                measured: false,
+                tokens: 0,
+                rows: [],
+            });
+        }, context);
     }
 
     async conversation(id: ConversationId): Promise<Conversation> {

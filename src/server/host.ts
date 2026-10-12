@@ -2,12 +2,15 @@ import type { Context } from "@earendil-works/chord";
 import { awaitWithContext } from "@earendil-works/chord/context";
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import type { ConversationId, Extension, ModelRef, TaskId } from "@earendil-works/pi-durable";
+import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import type { Browsers } from "./browser.ts";
 import type { Goals } from "./goals.ts";
 import type { LancetGuard } from "./lancet.ts";
+import type { LoopGuard } from "./loop-guard.ts";
 import type { Memory } from "./memory.ts";
 import type { Pip } from "./pip.ts";
 import type { PipCompaction } from "./pip-compact.ts";
+import type { Pruner } from "./pruner.ts";
 import type { Schedules } from "./schedules.ts";
 import type { RepoWatches } from "./repo-watches.ts";
 import type { Watches } from "./watches.ts";
@@ -121,8 +124,12 @@ export interface PocketHost {
     skills(cwd: string): Skill[];
     /** `provider/modelId` (or a bare model id) to an available model, or an error naming the choices. */
     resolveModel(spec: string): ModelRef;
+    /** The file system a conversation works in: its environment, rooted at the conversation's working directory. */
+    envFor(conversationId: ConversationId): ExecutionEnv;
     /** Who Pi works for in a conversation now: whose message led to its current work. */
     requesterOf(conversationId: ConversationId): string | undefined;
+    /** Why a tool call that repeats one that already failed (or a third identical one) should not run. */
+    readonly loopGuard: Pick<LoopGuard, "onRequest" | "noteCall" | "blocked">;
     /** Report something odd to the log and the connected clients. */
     notice(level: "info" | "warning" | "error", message: string): void;
     /**
@@ -165,6 +172,8 @@ export interface PocketHost {
     >;
     /** PiP's compactions: its extension's hook has PiP write its own summaries. */
     readonly pipCompaction: Pick<PipCompaction, "summarize">;
+    /** Sessions' compactions pruned before they are summarised (`pruner.ts`): its extension's hook takes the note. */
+    readonly pruner: Pick<Pruner, "summarize">;
     /** Sessions' watches of their pull requests: Pi's watch_pr tool starts and stops them. */
     readonly watches: Pick<Watches, "task" | "start" | "stop" | "get">;
     /** Repository watches: the triggers extension runs their task; PiP's repo_watch tool sets them up. */
