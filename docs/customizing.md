@@ -33,6 +33,10 @@ A Markdown file in `~/.pi/agent/prompts/` (or a project's `.pi/prompts/`, unless
 
 Use a template for a message people send often; use a skill for steps Pi should know how to take.
 
+## Routers: pipelines of stage roles
+
+A router (`~/.pi-pocket/routers/<id>.json`, made in the router editor: the rail's Routers button) is a prompt, the model a session runs on, and a map from stage role (an agent definition's name) to the model that stage runs on. A session running as a router gets the prompt with every message, and a role it spawns runs on the router's model and thinking level for it (`stages`, `stageThinking`), not its definition's. Router prompts that harnesses render (`~/.pi-pocket/routers/*.md`, `~/.omp/agent/router/ROUTER*.md`, and the built-in pipeline) are detected and listed; their stages are the agent definitions the prompt names in backticks.
+
 ## Agent definitions: roles a subagent starts as
 
 A Markdown file in the data folder's `agents/` (`~/.pi-pocket/agents/reviewer.md`) is a role Pi can start a subagent as: `subagent` spawn with `agent: reviewer`. Simple `key: value` front matter (all optional) sets its `description`, `model` (`provider/modelId`), `thinking` level, and `tools` (comma-separated); the body is its instructions, after the subagent's own. Options given to the spawn win over the file's. Its `model` is used where the session allows it (`/subagents`: on auto, a model on the session's own provider); elsewhere the role runs on the session's model. Their names and descriptions are listed in Pi's prompt, and each spawn reads the file again, so an edit applies to the next one.

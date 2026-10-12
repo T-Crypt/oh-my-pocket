@@ -559,6 +559,26 @@ export function createApi(options: HttpOptions, auth: Auth) {
             });
         }
 
+        // The router editor: every router, each with its prompt, and the roles a stage can be. Saving and deleting
+        // are the owner's (checked in `app.ts`); anyone signed in may look, as they may pick a router.
+        if (first === "routers" && second === undefined && method === "GET") {
+            return json(response, 200, app.routerEditorState());
+        }
+
+        if (first === "routers" && second === undefined && method === "POST") {
+            const body = await readJson<{ router?: unknown }>(request);
+
+            return json(response, 200, { router: app.saveRouter(user, body.router) });
+        }
+
+        if (first === "routers" && second === "delete" && method === "POST") {
+            const body = await readJson<{ id?: unknown }>(request);
+
+            app.deleteRouter(user, body.id);
+
+            return json(response, 200, { ok: true });
+        }
+
         if (first === "extensions" && second === undefined && method === "GET") {
             return json(response, 200, await app.extensions(user));
         }

@@ -8,6 +8,7 @@ import type { Goals } from "./goals.ts";
 import type { LancetGuard } from "./lancet.ts";
 import type { LoopGuard } from "./loop-guard.ts";
 import type { Memory } from "./memory.ts";
+import type { RouterConfig } from "./routers.ts";
 import type { Pip } from "./pip.ts";
 import type { PipCompaction } from "./pip-compact.ts";
 import type { Pruner } from "./pruner.ts";
@@ -132,6 +133,11 @@ export interface PocketHost {
      * Empty, the default: none.
      */
     subagentModels(): readonly string[];
+    /**
+     * The router a conversation runs as (`routers.ts`), or undefined for a plain session: its prompt, its model, and
+     * the model each stage role runs on. Read when asked, so a change applies to the next request.
+     */
+    routerFor?(conversationId: ConversationId): Promise<RouterConfig | undefined>;
     /**
      * Why Pi may not use a model now, in words for Pi to pass on (not known here, its provider not signed in, or its
      * sign-in expired), or undefined when it may. `fresh` asks the provider's sign-in again first.

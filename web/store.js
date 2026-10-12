@@ -57,6 +57,7 @@ const emptyView = () => ({
     decisions: {},
     plan: { on: false },
     subagentPolicy: null,
+    router: null,
     schedules: [],
     goal: null,
     watch: null,
@@ -102,6 +103,8 @@ export const store = {
         subagentsOpen: null,
         /** The subagents board shows in the conversation's place (`subagents-board.js`). */
         board: false,
+        /** The router editor, in the conversation's place (`routers.js`). */
+        routersOpen: false,
         /** Every subagent in every session, while the board shows; null until the server's first list arrives. */
         boardAgents: null,
         /** Counts the lists of files for @ mentions that arrived; the lists themselves are kept in `files.js`. */
@@ -422,6 +425,8 @@ function mergeView(current, data) {
         decisions: data.decisions ?? base.decisions,
         plan: data.plan ?? base.plan,
         subagentPolicy: data.subagentPolicy ?? base.subagentPolicy,
+        // No router is null, which the server sends too: only a missing field keeps the last value.
+        router: data.router === undefined ? base.router : data.router,
         schedules: data.schedules ?? base.schedules,
         // No goal is null, which the server sends too: only a missing field keeps the last value.
         goal: data.goal === undefined ? base.goal : data.goal,
@@ -799,8 +804,8 @@ export function navigate(conversationId, { replace = false, sheet = null } = {})
     }
 
     // The subagents board shows in the conversation's place: going to one, even the one under it, closes it.
-    if (store.state.board) {
-        store.set({ board: false, boardAgents: null });
+    if (store.state.board || store.state.routersOpen) {
+        store.set({ board: false, boardAgents: null, routersOpen: false });
     }
 
     // Its row tapped again counts too.
@@ -924,6 +929,8 @@ export const actions = {
     setPlan: (on) => api(`c/${current()}/plan`, { on }),
     /** `{ mode }`, or `{ mode: "custom", models }`: which models this session's subagents may run on. */
     setSubagents: (request) => api(`c/${current()}/subagents`, request),
+    /** Run this session as a router by id, or as a plain session again (null). */
+    setRouter: (router) => api(`c/${current()}/router`, { router }),
     approvePlan: () => api(`c/${current()}/plan`, { approve: true }),
     prompts: () => api(`c/${current()}/prompts`),
     trust: () => api(`c/${current()}/trust`),

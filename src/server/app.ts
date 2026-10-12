@@ -61,6 +61,7 @@ import {
     ContextBaselineDoc,
     DecisionsDoc,
     MemoryDoc,
+    RouterDoc,
     type SessionMeta,
     SessionsDoc,
     type SubagentRecord,
@@ -73,7 +74,7 @@ import { type ApprovalRequest, Approvals, type PocketHost } from "./host.ts";
 import { type GuardStatus, LancetGuard } from "./lancet.ts";
 import { takeLock } from "./lock.ts";
 import { Memory } from "./memory.ts";
-import { isThinkingLevel, modelList, resolveModel, THINKING_LEVELS } from "./models.ts";
+import { findModel, isThinkingLevel, modelList, resolveModel, THINKING_LEVELS } from "./models.ts";
 import { configureHttp } from "./net.ts";
 import { PiSessions } from "./pi-sessions.ts";
 import { Hooks } from "./hooks.ts";
@@ -87,6 +88,15 @@ import { loadPromptTemplates, type PromptTemplate, type SkillCommand } from "./p
 import { measureModelStreams } from "./timing.ts";
 import { Providers } from "./providers.ts";
 import { PushStore } from "./push.ts";
+import {
+    allRouters,
+    checkRouter,
+    deleteRouter,
+    promptPlaces,
+    promptOf,
+    type RouterConfig,
+    saveRouter,
+} from "./routers.ts";
 import {
     policyLabel,
     policyModels,
@@ -426,6 +436,7 @@ export class PocketApp {
             skills: (cwd) => this.skills(cwd),
             resolveModel: (spec) => resolveModel(this.models, spec, this.signInNeeded),
             subagentModels: () => this.config.subagentModels,
+            routerFor: (conversationId) => this.routerFor(conversationId),
             modelProblem: (ref, fresh) => this.providers.problem(ref, fresh),
             envFor: (conversationId) => this.envFor(conversationId),
             requesterOf: (conversationId) => this.attribution.requesterOf(conversationId),
@@ -2382,6 +2393,95 @@ export class PocketApp {
      */
     readonly signInNeeded = (provider: string): boolean =>
         this.providers.needsSignIn(provider) !== undefined;
+
+    /** Routers, read again at most every few seconds: rooms and prompts ask for them often. */
+    #routers: { at: number; list: RouterConfig[] } | undefined;
+
+    /** Every router (`routers.ts`): detected on this machine, and saved from the router editor. */
+    routers(fresh = false): RouterConfig[] {
+        const now = Date.now();
+
+        if (fresh || this.#routers === undefined || now - this.#routers.at > 3000) {
+            this.#routers = {
+                at: now,
+                list: allRouters(
+                    this.dataDir,
+                    (id) => {
+                        const model = findModel(this.models, id);
+
+                        return model === undefined
+                            ? undefined
+                            : { provider: model.provider, modelId: model.id };
+                    },
+                    this.#home,
+                ),
+            };
+        }
+
+        return this.#routers.list;
+    }
+
+    /** The router a conversation runs as; a subagent's is its session's, as its stages work for that router. */
+    async routerFor(id: ConversationId): Promise<RouterConfig | undefined> {
+        const chosen = (await this.harness.snapshot(RouterDoc, id, context))?.router;
+
+        return chosen === undefined
+            ? undefined
+            : this.routers().find((router) => router.id === chosen);
+    }
+
+    /** Save a router from the editor (the owner): a new one, or one that takes a detected one's place. */
+    saveRouter(user: User, input: unknown): RouterConfig {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        let router: RouterConfig;
+
+        try {
+            router = checkRouter(
+                input,
+                (spec) => this.resolveModelSpec(spec),
+                THINKING_LEVELS,
+                promptPlaces(this.dataDir, this.#home),
+            );
+        } catch (error) {
+            throw new HttpError(400, describe(error));
+        }
+
+        saveRouter(this.dataDir, router);
+
+        return this.routers(true).find((each) => each.id === router.id)!;
+    }
+
+    /** Delete a saved router (the owner); a detected one with its id shows again. */
+    deleteRouter(user: User, id: unknown): void {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        if (typeof id !== "string" || !deleteRouter(this.dataDir, id)) {
+            throw new HttpError(404, "No saved router by that id");
+        }
+
+        this.routers(true);
+    }
+
+    /** What the router editor shows: the routers, each with its prompt as it is now, and the roles there are. */
+    routerEditorState() {
+        return {
+            routers: this.routers(true).map((router) => ({
+                ...router,
+                promptText: promptOf(router) ?? "",
+            })),
+            thinkingLevels: THINKING_LEVELS,
+            roles: listAgents(this.dataDir).map((agent) => ({
+                name: agent.name,
+                ...(agent.model === undefined ? {} : { model: agent.model }),
+                ...(agent.description === undefined ? {} : { description: agent.description }),
+            })),
+        };
+    }
 
     /** `provider/modelId` (or a bare model id) to a model Pi may use now, or an error that says why not. */
     resolveModelSpec(spec: string): ModelRef {

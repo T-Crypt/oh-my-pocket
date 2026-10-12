@@ -515,6 +515,7 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "artifacts.ts",
             "browser.ts",
             "subagents.ts",
+            "routers.ts",
             "schedules.ts",
             "goals.ts",
             "plan.ts",
