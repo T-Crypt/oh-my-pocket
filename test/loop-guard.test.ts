@@ -1,6 +1,6 @@
-// Loop guard: a tool call is blocked when it is identical to one that already failed this turn, or identical to
-// one repeated a third time, whatever the result - and the system prompt tells the model the same thing. A call a
-// restart interrupted is not a failure, and a mutating call clears the repeats of reads. Tool arguments a model
+// Loop guard: the third identical tool call in one turn is blocked, whatever the result, and the block says so when
+// the earlier runs failed - and the system prompt tells the model the same thing. A call a restart interrupted is not
+// a failure, a mutating call clears the repeats of reads, and a file edit clears the repeats of shell checks too. Tool arguments a model
 // wrote slightly wrong (a JSON string where an object belongs, one item where a list belongs) are repaired before
 // validation, instead of failing it.
 import assert from "node:assert/strict";
@@ -173,6 +173,49 @@ test("a mutating call clears the repeats of a read, so a retry after the fix is 
     // The third read of the same path is the write's consequence, not a loop: it runs, and it succeeds.
     assert.equal(results[2]!.isError, false);
     assert.ok(textOf(results[2]!.content).includes("hello again"));
+});
+
+test("a check run after each fix is not a loop: an edit clears the repeats of shell commands", async () => {
+    const id = await newSession(app);
+    const file = join(work, "loop-guard-check.txt");
+    const check = tool("bash", { command: `grep -q fixed ${file}` });
+
+    writeFileSync(file, "broken\n");
+    steps = [
+        check,
+        tool("write", { path: file, content: "still broken\n" }),
+        check,
+        tool("write", { path: file, content: "fixed\n" }),
+        check,
+        done,
+    ];
+    stepIndex = 0;
+    await say(app, id, "make the check pass");
+
+    const results = await resultsOf(id);
+
+    assert.equal(results.length, 5);
+    assert.equal(results[2]!.isError, true);
+    // The third check follows two fixes: it runs, and it passes.
+    assert.ok(!textOf(results[4]!.content).includes("blocked"));
+    assert.equal(results[4]!.isError, false);
+});
+
+test("a shell command does not clear another's repeats: the third identical run with no edit between is blocked", async () => {
+    const id = await newSession(app);
+    const attempt = tool("bash", { command: "definitely-not-a-command" });
+
+    steps = [attempt, tool("bash", { command: "true" }), attempt, attempt, done];
+    stepIndex = 0;
+    await say(app, id, "shell only");
+
+    const results = await resultsOf(id);
+
+    assert.equal(results.length, 4);
+    assert.match(
+        textOf(results[3]!.content),
+        /blocked: you already ran bash with exactly these arguments and it failed/,
+    );
 });
 
 test("two identical failing calls are fine: the guard blocks the third, not the second", async () => {

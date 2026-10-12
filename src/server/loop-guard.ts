@@ -1,11 +1,12 @@
 /**
- * The loop guard: a tool call that is exactly identical to one that already failed this turn, or identical to one
- * repeated a third time, is blocked. A local model that serves one request at a time can burn its whole slot
+ * The loop guard: the third exactly identical tool call in one turn is blocked, and the block says so when the
+ * earlier runs failed. A local model that serves one request at a time can burn its whole slot
  * retrying a failing call, and the fix is a change of approach, not another attempt; the no-repeat rule in the
  * system prompt says the same thing the guard enforces. Outcomes are noted after each call and the count resets at
  * every new person's message, so a fresh request is a fresh chance to try the same thing. A call a restart cut off
  * is not a failure: checking what happened and running it again is how recovery works. A mutating call clears the
- * repeats of read-shaped tools, which can legitimately return something new after it. In memory on purpose: a
+ * repeats of read-shaped tools, which can legitimately return something new after it, and a file edit also clears
+ * the repeats of shell commands: run the tests, fix, run them again is how work gets done, not a loop. In memory on purpose: a
  * restart interrupts the loop anyway, and the guard re-arms on the next failure of the resumed run.
  */
 import type { Message, ToolCall } from "@earendil-works/pi-ai";
@@ -16,8 +17,12 @@ import type { ConversationId, JsonObject, ToolRegistration } from "@earendil-wor
 const REPEAT_LIMIT = 3;
 /** Reads: after a mutating call, a repeat may legitimately return something new, so their repeats clear. */
 const READ_TOOLS = new Set(["read", "grep", "find", "ls"]);
+/** Shell commands: after a file edit, a check (a test run, a build) may legitimately pass, so their repeats clear too. */
+const SHELL_TOOLS = new Set(["bash", "powershell"]);
+/** Calls that change files: the repeats of reads and of shell checks clear after one. */
+const FILE_EDITS = new Set(["edit", "write"]);
 /** Calls that can change what a later read finds. */
-const MUTATING = new Set(["edit", "write", "bash", "powershell"]);
+const MUTATING = new Set([...FILE_EDITS, ...SHELL_TOOLS]);
 /** How many signatures one conversation keeps: more than any loop has. */
 const MAX_SIGNATURES = 500;
 
@@ -151,7 +156,9 @@ export class LoopGuard {
 
         if (MUTATING.has(name)) {
             for (const key of [...state.calls.keys()]) {
-                if (READ_TOOLS.has(key.split(":", 1)[0] ?? "")) {
+                const tool = key.split(":", 1)[0] ?? "";
+
+                if (READ_TOOLS.has(tool) || (FILE_EDITS.has(name) && SHELL_TOOLS.has(tool))) {
                     state.calls.delete(key);
                     state.failed.delete(key);
                 }

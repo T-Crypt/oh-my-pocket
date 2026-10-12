@@ -1,6 +1,6 @@
 /**
- * Loop guard: a tool call that is exactly identical to one that already failed this turn, or to one repeated a
- * third time, is blocked. A local model can fall into a loop of retrying a failing call, and a server that answers
+ * Loop guard: the third exactly identical tool call in one turn is blocked, and the block says so when the earlier
+ * runs failed; a file edit re-arms reads and shell checks. A local model can fall into a loop of retrying a failing call, and a server that answers
  * one request at a time burns its whole slot on that; the fix is a different approach, which the no-repeat rule in
  * the system prompt also tells the model. A call a restart cut off is not a failure, and a fresh person's message
  * is a fresh chance to try the same thing. Both hooks sign the arguments the harness prepared and validated -

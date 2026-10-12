@@ -449,7 +449,6 @@ const COMMANDS = [
             "Show where the context goes: prompt sections, tools, and history; baseline takes a reference point to diff the next view against",
         run: (arg) => showContext(arg || undefined),
         available: isSession,
-        run: showContext,
     },
     {
         name: "export",

@@ -4,6 +4,8 @@
 // change of it turns a cache hit into a thousands-of-tokens re-prefill, so this test pins the order both prompt
 // packs actually resolve to: the date last in each, and each pack's own date section the only one that renders.
 import assert from "node:assert/strict";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { ConversationId, PromptSection } from "@earendil-works/pi-durable";
 import {
@@ -13,13 +15,34 @@ import {
     newSession,
     openApp,
     owner,
+    root,
     scriptedModel,
 } from "./helpers.ts";
 
 let app: App;
 
+const dataDir = join(root, "data");
+
 before(async () => {
-    app = await openApp(scriptedModel());
+    // A drop-in with a big stable section, as a router setup has: the date must still come after it.
+    mkdirSync(join(dataDir, "extensions"), { recursive: true });
+    writeFileSync(
+        join(dataDir, "extensions", "router-pack.ts"),
+        `import { defineExtension, section } from "@earendil-works/pi-durable";
+export default () => defineExtension({ name: "router-pack", sections: [section("router_pack", () => "stable router instructions")] });
+`,
+    );
+    writeFileSync(
+        join(dataDir, "extensions", "late-pack.ts"),
+        `import { defineExtension, section } from "@earendil-works/pi-durable";
+export default () => defineExtension({ name: "late-pack", sections: [section("late_pack", () => "turned on later")] });
+`,
+    );
+    app = await openApp(scriptedModel(), dataDir);
+    await app.setExtensionEnabled(owner(app), "router-pack.ts", true);
+    await app.close();
+    // A restart loads the drop-in at startup, the way a router setup runs.
+    app = await openApp(scriptedModel(), dataDir);
 });
 
 after(async () => {
@@ -77,4 +100,29 @@ test("the PiP pack ends with its date in its own time zone", async () => {
 
     assert.match((await rendered(id, agent, "pip_today")) ?? "", /Today: \d{4}-\d{2}-\d{2}/);
     assert.equal(await rendered(id, agent, "today"), undefined);
+});
+
+test("the date stays behind a drop-in's sections, at startup and when one is turned on later", async () => {
+    const order = async () => {
+        const id = await newSession(app);
+        const agent = (await (await app.harness.conversation(id, context))!.agent(context))!;
+
+        return keysOf(agent.sections);
+    };
+
+    const atStart = await order();
+
+    assert.ok(atStart.indexOf("router_pack") >= 0, `the drop-in is loaded: ${atStart.join(", ")}`);
+    assert.ok(
+        atStart.indexOf("router_pack") < atStart.indexOf("today"),
+        `today should come after the drop-in's section: ${atStart.join(", ")}`,
+    );
+
+    await app.setExtensionEnabled(owner(app), "late-pack.ts", true);
+    const later = await order();
+
+    assert.ok(
+        later.indexOf("late_pack") < later.indexOf("today"),
+        `today should come after a drop-in turned on later: ${later.join(", ")}`,
+    );
 });
