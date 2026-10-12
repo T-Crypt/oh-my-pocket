@@ -249,7 +249,9 @@ export function RouterEditor() {
                     </button>`,
                 )}
                 ${
+                    // Only once the routers are in: a load that lands after would replace the new router's form.
                     editable &&
+                    data !== null &&
                     html`<button class="button" onClick=${() => fresh()}>
                         <${Icon} name="plus" size=${14} /> New router
                     </button>`
