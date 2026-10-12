@@ -177,6 +177,16 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    if (third === "subagents" && method === "POST") {
+        await app.commands.setSubagents(
+            id,
+            user,
+            await readJson<{ mode?: unknown; models?: unknown }>(request),
+        );
+
+        return json(response, 200, { ok: true });
+    }
+
     if (third === "schedules" && fourth === undefined && method === "POST") {
         return json(response, 200, await app.commands.schedule(id, user, await readJson(request)));
     }

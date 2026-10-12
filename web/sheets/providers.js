@@ -89,7 +89,7 @@ function SubagentModels({ names }) {
     return html`<div class="subagent-models">
         <div class="label">Models for subagents</div>
         <p class="muted small">
-            Subagents always run on their session's model, the one people picked. Pi cannot choose another model unless you allow it here.
+            Allowed here, a model is open to subagents in every session. Each session also has its own choice: the Subagents chip by the message box, or /subagents.
         </p>
         <p class="small subagent-models-chosen" title=${summary}>${summary}</p>
         ${

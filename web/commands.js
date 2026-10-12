@@ -3,6 +3,7 @@ import { browserAvailable, openInBrowser, toggleBrowser } from "./browser.js";
 import { filesAvailable, toggleFiles } from "./files-panel.js";
 import { branchAvailable } from "./sheets/branch.js";
 import { memoryAvailable, remember } from "./sheets/memory.js";
+import { subagentsRequest } from "./sheets/subagents.js";
 import { togglePeeks } from "./peeks.js";
 import { askPip, openPip, pipAvailable } from "./pip.js";
 import {
@@ -332,6 +333,22 @@ const COMMANDS = [
             arg === "" ? openSheet({ type: "instructions" }) : actions.setInstructions(arg),
     },
     { name: "model", args: "[name]", description: "Switch the model", run: switchModel },
+    {
+        name: "subagents",
+        args: "[auto|own|local|provider/model…]",
+        description: "Which models this session's subagents may run on",
+        available: isSession,
+        run: async (arg) => {
+            if (arg === "") {
+                openSheet({ type: "subagents" });
+
+                return;
+            }
+
+            await actions.setSubagents(subagentsRequest(arg));
+            notify("info", `Subagents: ${arg.trim()}.`);
+        },
+    },
     { name: "thinking", args: "[level]", description: "Set the thinking level", run: setThinking },
     {
         name: "new",

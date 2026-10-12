@@ -35,7 +35,7 @@ Use a template for a message people send often; use a skill for steps Pi should 
 
 ## Agent definitions: roles a subagent starts as
 
-A Markdown file in the data folder's `agents/` (`~/.pi-pocket/agents/reviewer.md`) is a role Pi can start a subagent as: `subagent` spawn with `agent: reviewer`. Simple `key: value` front matter (all optional) sets its `description`, `model` (`provider/modelId`), `thinking` level, and `tools` (comma-separated); the body is its instructions, after the subagent's own. Options given to the spawn win over the file's. Their names and descriptions are listed in Pi's prompt, and each spawn reads the file again, so an edit applies to the next one.
+A Markdown file in the data folder's `agents/` (`~/.pi-pocket/agents/reviewer.md`) is a role Pi can start a subagent as: `subagent` spawn with `agent: reviewer`. Simple `key: value` front matter (all optional) sets its `description`, `model` (`provider/modelId`), `thinking` level, and `tools` (comma-separated); the body is its instructions, after the subagent's own. Options given to the spawn win over the file's. Its `model` is used where the session allows it (`/subagents`: on auto, a model on the session's own provider); elsewhere the role runs on the session's model. Their names and descriptions are listed in Pi's prompt, and each spawn reads the file again, so an edit applies to the next one.
 
 Use one for a role with its own model or rules: a planner on a large model, a reviewer that only reads.
 
@@ -43,7 +43,7 @@ Use one for a role with its own model or rules: a planner on a large model, a re
 
 People sign in to providers from Menu → **Providers**, and pick a model per session from the model chip in the message box. Pi Pocket uses Pi's sign-ins (`~/.pi/agent/auth.json`) and Pi's model list: to add a model or a provider Pi does not know, follow Pi's `models.md` and `custom-provider.md`.
 
-Models are the person's to choose, never Pi's: a subagent runs on its session's model unless the owner allows others under **Models for subagents** at the top of the Providers sheet (none by default), and PiP passes a model only when its person named it. Instructions, skills, or `AGENTS.md` cannot widen that; tell the person where the setting is instead.
+Models are the person's to choose, never Pi's: a subagent runs on its session's model unless the session's person allows others with the Subagents chip or `/subagents`, or the owner allows them everywhere under **Models for subagents** at the top of the Providers sheet (none by default), and PiP passes a model only when its person named it. Instructions, skills, or `AGENTS.md` cannot widen that; tell the person where the setting is instead.
 
 ## Other switches people have
 

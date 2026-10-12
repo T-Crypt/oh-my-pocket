@@ -2430,6 +2430,25 @@ button.chip:hover {
     color: var(--accent);
 }
 
+/* Which models this session's subagents may run on: accent while some besides the session's own. */
+.composer-row .subagents-chip {
+    flex: none;
+    height: 26px;
+    padding: 0 9px;
+    font-size: 0.74rem;
+    background: none;
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.composer-row .subagents-chip.on {
+    color: var(--accent);
+}
+
+.subagents-now {
+    margin: 0 0 8px;
+}
+
 /* While Pi works: whether a message steers the run or waits for its end. */
 .mode-switch {
     flex: none;
@@ -8627,7 +8646,12 @@ textarea.notes {
         padding-inline: 6px;
     }
     /* While Pi works, Steer and Queue take the plan chip's place (`/plan` still turns plan mode on or off). */
-    .composer.busy .plan-chip {
+    /* The chip keeps its word (auto, own, local); its colour says whether roles leave this session's model. */
+    .composer-row .subagents-chip .detail {
+        display: none;
+    }
+    .composer.busy .plan-chip,
+    .composer.busy .subagents-chip {
         display: none;
     }
     /* While Pi works the row is full: the mic takes Send's place while there is nothing to send, and gives it back once

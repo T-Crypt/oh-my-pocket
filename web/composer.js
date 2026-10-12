@@ -1322,6 +1322,22 @@ export function Composer() {
                             ${level && html`<span class="model-level">${level}</span>`}
                         </button>
                         ${
+                            view.subagentPolicy &&
+                            view.conversation?.kind !== "subagent" &&
+                            html`<button
+                                class=${`chip subagents-chip ${view.subagentPolicy.allowed.length > 0 ? "on" : ""}`}
+                                title=${`Subagents: ${view.subagentPolicy.label}. ${view.subagentPolicy.allowed.length === 0 ? "They run on this session's model." : `They may also run on ${view.subagentPolicy.allowed.join(", ")}.`}`}
+                                aria-label=${`Subagents: ${view.subagentPolicy.label}`}
+                                onClick=${() => openSheet({ type: "subagents" })}
+                            >
+                                ${view.subagentPolicy.label.split(" · ")[0]}
+                                ${
+                                    view.subagentPolicy.label.includes(" · ") &&
+                                    html`<span class="detail">${` · ${view.subagentPolicy.label.split(" · ")[1]}`}</span>`
+                                }
+                            </button>`
+                        }
+                        ${
                             planAvailable() &&
                             view.conversation?.kind !== "subagent" &&
                             html`<button
