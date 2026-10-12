@@ -693,7 +693,10 @@ async function allowedFor(
     const mode = policy?.mode ?? "auto";
     const resolve = (spec: string) => host.resolveModel(spec);
     const chosen = policyModels(policy, own, listAgents(host.dataDir), resolve);
-    const allowed = [...new Set([...ownerModels(host), ...chosen])].filter(
+    // A router's stages run where its person set them: choosing the router chose those models.
+    const router = await host.routerFor?.(id);
+    const stages = router === undefined ? [] : Object.values(router.stages);
+    const allowed = [...new Set([...ownerModels(host), ...chosen, ...stages])].filter(
         (spec) => own === undefined || spec !== keyOf(own),
     );
 
@@ -996,9 +999,19 @@ export default function createSubagents(host: PocketHost) {
             const askedModel = (args as { model?: unknown }).model;
             // A model passed to spawn is Pi's choice, refused unless allowed. A definition's model is its role's: used
             // where this session allows it, and otherwise the role runs on this session's model, and Pi is told so.
+            // In a router session, a stage role runs on the model the router gives it, not its definition's.
+            const stageModel =
+                definition === undefined
+                    ? undefined
+                    : (await host.routerFor?.(api.conversationId))?.stages[definition.name];
             const fromDefinition =
                 action === "spawn" && askedModel === undefined && definition !== undefined
-                    ? definitionModel(definition, (spec) => host.resolveModel(spec))
+                    ? definitionModel(
+                          stageModel === undefined
+                              ? definition
+                              : { ...definition, model: stageModel },
+                          (spec) => host.resolveModel(spec),
+                      )
                     : undefined;
             const definitionAllowed =
                 fromDefinition !== undefined &&
@@ -1191,8 +1204,14 @@ export default function createSubagents(host: PocketHost) {
                 );
 
                 // Where each runs, so Pi knows which share this session's model and which another (one GPU, say).
+                const stages = (await host.routerFor?.(input.conversationId))?.stages ?? {};
+
                 const where = (agent: AgentDefinition) => {
-                    const ref = definitionModel(agent, (spec) => host.resolveModel(spec));
+                    const stage = stages[agent.name];
+                    const ref = definitionModel(
+                        stage === undefined ? agent : { ...agent, model: stage },
+                        (spec) => host.resolveModel(spec),
+                    );
 
                     return ref !== undefined && !same(ref, own) && allowed.includes(keyOf(ref))
                         ? ` (runs on ${keyOf(ref)})`

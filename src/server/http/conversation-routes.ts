@@ -177,6 +177,14 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    if (third === "router" && method === "POST") {
+        const body = await readJson<{ router?: unknown }>(request);
+
+        await app.commands.setRouter(id, user, body.router ?? null);
+
+        return json(response, 200, { ok: true });
+    }
+
     if (third === "subagents" && method === "POST") {
         await app.commands.setSubagents(
             id,

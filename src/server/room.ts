@@ -32,6 +32,7 @@ import {
     type Pin,
     PinsDoc,
     PlanDoc,
+    RouterDoc,
     SubagentPolicyDoc,
     type PrWatch,
     ReactionsDoc,
@@ -74,6 +75,7 @@ export const ROOM_DOCS = new Set(
         DecisionsDoc,
         PlanDoc,
         SubagentPolicyDoc,
+        RouterDoc,
         ScheduleDoc,
         GoalDoc,
         WatchDoc,
@@ -244,6 +246,7 @@ export class Room {
     decisions: Record<string, Decision> = {};
     plan: { on: boolean; by?: string; at?: number } = { on: false };
     subagentPolicy: SubagentPolicy | undefined;
+    router: string | undefined;
     schedules: Record<string, Schedule> = {};
     goal: Goal | undefined;
     watch: PrWatch | undefined;
@@ -297,6 +300,7 @@ export class Room {
         };
         this.plan = { ...((await harness.snapshot(PlanDoc, this.id, context)) ?? { on: false }) };
         this.subagentPolicy = await harness.snapshot(SubagentPolicyDoc, this.id, context);
+        this.router = (await harness.snapshot(RouterDoc, this.id, context))?.router;
         this.schedules = {
             ...((await harness.snapshot(ScheduleDoc, this.id, context))?.items ?? {}),
         };
@@ -367,6 +371,8 @@ export class Room {
             this.decisions = { ...((value?.calls as Record<string, Decision>) ?? {}) };
         } else if (kind === PlanDoc.definition.kind) {
             this.plan = { on: false, ...((value as Room["plan"] | null) ?? {}) };
+        } else if (kind === RouterDoc.definition.kind) {
+            this.router = (value?.router as string | undefined) ?? undefined;
         } else if (kind === SubagentPolicyDoc.definition.kind) {
             this.subagentPolicy = (value as SubagentPolicy | null) ?? undefined;
         } else if (kind === ScheduleDoc.definition.kind) {
@@ -430,6 +436,16 @@ export class Room {
         }
 
         return projected;
+    }
+
+    /** The router this session runs as, as the message box shows it; null when it runs as none. */
+    #routerView(): { id: string; label: string } | null {
+        const router =
+            this.router === undefined
+                ? undefined
+                : this.#app.routers().find((each) => each.id === this.router);
+
+        return router === undefined ? null : { id: router.id, label: router.label };
     }
 
     /** Send this client what changed since its last update, or everything with `full`. */
@@ -504,6 +520,8 @@ export class Room {
             plan: this.plan,
             // Which models its subagents may run on besides its own: the message box's chip.
             subagentPolicy: this.#app.subagentsView(this.subagentPolicy, agentState.model),
+            // The router it runs as, for the message box's model chip: its id and label, or null.
+            router: this.#routerView(),
             schedules: Object.values(this.schedules)
                 .sort((a, b) => a.next - b.next)
                 .map(({ id, text, next, every, by, runs }) => ({

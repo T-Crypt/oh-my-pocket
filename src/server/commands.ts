@@ -37,6 +37,7 @@ import {
     NotesDoc,
     PinsDoc,
     PlanDoc,
+    RouterDoc,
     type Schedule,
     SessionsDoc,
     STOPPED,
@@ -1206,6 +1207,14 @@ export class Commands {
 
         if (modelChanged) {
             changes.push(`switched the model to ${model?.name ?? request.model!.modelId}`);
+            // Another model picked by hand: the session stops running as a router (`setRouter` sets it again).
+            await app.harness.commit(async (tx) => {
+                const doc = await tx.doc(RouterDoc, id);
+
+                if (doc.router !== undefined) {
+                    delete doc.router;
+                }
+            }, context);
         }
 
         if (
@@ -1364,6 +1373,83 @@ export class Commands {
                 mode === "custom"
                     ? `let subagents run on ${chosen!.length === 0 ? "this session's model only" : chosen!.join(", ")}`
                     : `set subagents to ${mode}`,
+            );
+        }
+    }
+
+    /**
+     * Run a session as a router (`routers.ts`), or as a plain session again (`router` null): its model becomes the
+     * router's, and its prompt and stage models come with it. Set for a whole session.
+     */
+    async setRouter(id: ConversationId, user: User, router: unknown): Promise<void> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        await app.requireDriver(id, user);
+
+        if (app.parentOf(id) !== undefined) {
+            throw new HttpError(
+                400,
+                "A router is set for the whole session, in its main conversation.",
+            );
+        }
+
+        if (router !== null && typeof router !== "string") {
+            throw new HttpError(400, "router must be a router's id, or null");
+        }
+
+        const chosen =
+            router === null ? undefined : app.routers(true).find((each) => each.id === router);
+
+        if (router !== null && chosen === undefined) {
+            throw new HttpError(404, `No router named ${String(router)}`);
+        }
+
+        if (chosen !== undefined) {
+            const slash = chosen.model.indexOf("/");
+
+            if (slash < 1) {
+                throw new HttpError(
+                    409,
+                    `Router ${chosen.id} has no model Pi can use: give it one in the router editor.`,
+                );
+            }
+
+            await this.configure(id, user, {
+                model: {
+                    provider: chosen.model.slice(0, slash),
+                    modelId: chosen.model.slice(slash + 1),
+                },
+                ...(chosen.thinking === undefined ? {} : { thinkingLevel: chosen.thinking }),
+            });
+        }
+
+        const changed = await app.harness.commit(async (tx) => {
+            const doc = await tx.doc(RouterDoc, id);
+
+            if (doc.router === chosen?.id) {
+                return false;
+            }
+
+            if (chosen === undefined) {
+                delete doc.router;
+            } else {
+                doc.router = chosen.id;
+            }
+
+            doc.by = user.id;
+            doc.at = Date.now();
+
+            return true;
+        }, context);
+
+        if (changed) {
+            await app.collab.activity(
+                id,
+                user,
+                chosen === undefined
+                    ? "stopped running as a router"
+                    : `runs as the router ${chosen.label}`,
             );
         }
     }

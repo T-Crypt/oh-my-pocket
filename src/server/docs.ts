@@ -188,6 +188,17 @@ export const SubagentPolicyDoc = defineDoc<SubagentPolicy>({
     initial: () => ({ mode: "auto" }),
 });
 
+/** The router this session runs as (`routers.ts`), by id; none for a plain session. Its people choose it. */
+export const RouterDoc = defineDoc<{ router?: string; by?: string; at?: number }>({
+    kind: "pocket.router",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    // A fork runs as its session did, as it keeps the model.
+    fork: "current",
+    initial: () => ({}),
+});
+
 export type ChatMessage = {
     /** Made from the client's request id, so a retried send does not post twice. */
     id: string;
