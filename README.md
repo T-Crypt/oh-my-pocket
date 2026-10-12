@@ -54,13 +54,13 @@ Same T2 job (add `subtract(a, b)` with a pytest test: plan, implement, review, o
 | OMP                         | 213 s | 41       | 685,014       | 81%    | 130K      | 20,009 | 2 passed, review clean |
 | Oh-My-Pocket, before `wait` | 187 s | 34       | 468,160       | 60%    | 186K      | 13,880 | 2 passed, review clean |
 | Oh-My-Pocket, `wait`        | 179 s | 36       | 470,091       | 90%    | 47K       | 14,252 | 2 passed, review ship  |
-| Oh-My-Pocket, batteries     | 283 s | 43       | 637,496       | 83%    | 109K      | 27,006 | 2 passed, review clean |
+| Oh-My-Pocket, batteries     | 145 s | 31       | 397,605       | 75%    | 99K       | 13,395 | 3 passed, review clean |
 
-The batteries row is the median of three runs that evening, after NInfer moved to v3: 174, 283 and 344 s. The build
-before the batteries ran the same job on the same engine in 196 and 253 s (78% cached, about 102K prefilled). A
-three-file repository triggers none of the batteries (no read past 500 lines, no compaction, no repeated call), so
-this job shows that they break nothing, not what they save; the spread between runs is the model's sampling, with
-output from 13,768 to 34,158 tokens.
+The batteries row is the median of three runs on NInfer v3 (2026-10-11 evening; 136, 145 and 181 s), alternating with
+the build before the batteries on the same engine: 166, 184 and 256 s, median 476K prompt, 104K prefilled, 18.4K
+output. On a three-file repository the batteries barely fire, so the gap sits inside run-to-run noise: they cost
+nothing here. With a 1,007-line file to edit, read economy fires (4 maps over two runs) and the median prefill falls
+from 156K to 139K tokens (298 s against 307 s); two runs each, so a direction, not a result.
 
 ### Building a router on it
 
