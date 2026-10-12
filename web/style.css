@@ -10948,7 +10948,7 @@ textarea.notes {
 
 .routers-stage {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(180px, 320px);
+    grid-template-columns: minmax(0, 1fr) minmax(180px, 300px) minmax(120px, 180px);
     align-items: center;
     gap: 0.6rem;
     padding: 0.45rem 0.6rem;

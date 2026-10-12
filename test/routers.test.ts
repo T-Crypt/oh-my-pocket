@@ -11,7 +11,6 @@ import {
     openApp,
     owner,
     root,
-    scriptedModel,
     until,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
@@ -19,9 +18,14 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { FauxResponseStep, Message } from "@earendil-works/pi-ai";
-import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
+import {
+    fauxAssistantMessage,
+    fauxProvider,
+    fauxText,
+    fauxToolCall,
+} from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId, JsonObject } from "@earendil-works/pi-durable";
-import { RouterDoc } from "../src/server/docs.ts";
+import { RouterDoc, SubagentsDoc } from "../src/server/docs.ts";
 import { checkRouter, detectRouters, namedStages } from "../src/server/routers.ts";
 
 const dataDir = join(root, "routers-data");
@@ -78,7 +82,19 @@ before(async () => {
     );
     writeFileSync(join(ompDir, "ROUTER.md"), "OMP's main router, shadowed by Pi Pocket's.\n");
     writeFileSync(join(ompDir, "ROUTER-FAST.md"), "You are FASTROUTER: `builder` only.\n");
-    app = await openApp(scriptedModel(route), dataDir);
+    // The scripted models, and one that thinks, for stage thinking levels.
+    const faux = fauxProvider({
+        tokensPerSecond: 2000,
+        models: [
+            { id: "faux-1" },
+            { id: "faux-2" },
+            { id: "faux-vision", input: ["text", "image"] },
+            { id: "faux-think", reasoning: true },
+        ],
+    });
+
+    faux.setResponses(Array.from({ length: 1000 }, () => route));
+    app = await openApp(faux, dataDir);
 });
 
 after(async () => {
@@ -231,4 +247,37 @@ test("a dispatcher router may not run commands itself", async () => {
 
     await app.commands.setRouter(id, owner(app), null);
     assert.doesNotMatch(await go(id, "bash", { command: "echo hi" }), /dispatcher/);
+});
+
+test("a router's stage thinks as its person set it, above the session's own level too", async () => {
+    app.saveRouter(owner(app), {
+        id: "deep",
+        model: "faux/faux-think",
+        thinking: "low",
+        prompt: "Deep.",
+        stages: { planner: "faux/faux-think" },
+        stageThinking: { planner: "high" },
+    });
+    assert.throws(
+        () =>
+            app.saveRouter(owner(app), {
+                id: "bad",
+                model: "faux/faux-1",
+                prompt: "x",
+                stages: {},
+                stageThinking: { planner: "enormous" },
+            }),
+        { status: 400 },
+    );
+
+    const id = await newSession(app);
+
+    await app.commands.setRouter(id, owner(app), "deep");
+    assert.equal((await app.agentState(id))?.thinkingLevel, "low");
+    await go(id, "subagent", { action: "spawn", name: "d1", agent: "planner", message: "x" });
+    await until(() => seen.d1 !== undefined, "the stage's request");
+
+    const stage = (await app.harness.snapshot(SubagentsDoc, id, context))?.agents.d1;
+
+    assert.equal((await app.agentState(stage!.conversationId))?.thinkingLevel, "high");
 });

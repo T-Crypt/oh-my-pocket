@@ -33,6 +33,8 @@ export type RouterConfig = {
     promptFile?: string;
     /** Stage role (agent definition name) to `provider/modelId`. A role left out runs as its definition says. */
     stages: Record<string, string>;
+    /** Stage role to its thinking level; a role left out thinks as its definition says. */
+    stageThinking?: Record<string, string>;
     /** Dispatcher only: the router itself may not run commands or change files; its stages do the work. */
     dispatcher?: boolean;
     source: "custom" | "detected";
@@ -283,6 +285,26 @@ export function checkRouter(
         stages[role] = (spec as string).trim();
     }
 
+    const stageThinking: Record<string, string> = {};
+
+    if (raw.stageThinking !== undefined) {
+        if (
+            typeof raw.stageThinking !== "object" ||
+            raw.stageThinking === null ||
+            Array.isArray(raw.stageThinking)
+        ) {
+            fail("stageThinking must map role names to thinking levels");
+        }
+
+        for (const [role, level] of Object.entries(raw.stageThinking as Record<string, unknown>)) {
+            if (typeof level !== "string" || !thinkingLevels.includes(level)) {
+                fail(`stage ${role}'s thinking must be one of ${thinkingLevels.join(", ")}`);
+            }
+
+            stageThinking[role] = level as string;
+        }
+    }
+
     return {
         id,
         label,
@@ -292,6 +314,7 @@ export function checkRouter(
             ? { promptFile: promptFile as string }
             : { prompt: prompt as string }),
         stages,
+        ...(Object.keys(stageThinking).length === 0 ? {} : { stageThinking }),
         ...(raw.dispatcher === true ? { dispatcher: true } : {}),
         source: "custom",
     };

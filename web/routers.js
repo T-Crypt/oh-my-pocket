@@ -78,6 +78,7 @@ const draftOf = (router) => ({
     promptFile: router.promptFile ?? "",
     prompt: router.prompt ?? router.promptText ?? "",
     stages: { ...router.stages },
+    stageThinking: { ...(router.stageThinking ?? {}) },
     isNew: false,
 });
 
@@ -141,7 +142,23 @@ export function RouterEditor() {
     };
 
     const fresh = (from) => {
-        const base = from ? draftOf(from) : draftOf({ id: "", label: "", model: "", stages: {} });
+        // A new router starts with every stage on one model: this session's, or else the first there is. Each stage's
+        // model and thinking are then the person's to change.
+        const own = view.agent?.model;
+        const first = store.state.models[0];
+        const model = own
+            ? `${own.provider}/${own.modelId}`
+            : first
+              ? `${first.provider}/${first.id}`
+              : "";
+        const base = from
+            ? draftOf(from)
+            : draftOf({
+                  id: "",
+                  label: "",
+                  model,
+                  stages: Object.fromEntries(roles.map((role) => [role.name, model])),
+              });
         const id = from ? `${from.id}-copy` : "my-router";
 
         setChosen(null);
@@ -150,7 +167,11 @@ export function RouterEditor() {
             id,
             label: from ? `${from.label} copy` : "My router",
             promptMode: from ? base.promptMode : "file",
-            promptFile: from ? base.promptFile : (prompts[0]?.promptFile ?? ""),
+            // router-main's steps, as harnesses render them: a new router changes models, not the pipeline.
+            promptFile: from
+                ? base.promptFile
+                : ((prompts.find((router) => router.id === "router-main") ?? prompts[0])
+                      ?.promptFile ?? ""),
             isNew: true,
         });
         setSaved("");
@@ -167,6 +188,9 @@ export function RouterEditor() {
                 ? { promptFile: draft.promptFile }
                 : { prompt: draft.prompt }),
             stages: Object.fromEntries(Object.entries(draft.stages).filter(([, model]) => model)),
+            stageThinking: Object.fromEntries(
+                Object.entries(draft.stageThinking).filter(([, level]) => level),
+            ),
         };
         const answer = await attempt(() => api("routers", { router }));
 
@@ -270,7 +294,17 @@ export function RouterEditor() {
                                 label="Router model"
                                 empty=${draft.model ? undefined : "Choose a model"}
                                 disabled=${!editable}
-                                onChange=${(model) => set({ model })}
+                                onChange=${(model) =>
+                                    // Stages that were on the router's model move with it.
+                                    set({
+                                        model,
+                                        stages: Object.fromEntries(
+                                            Object.entries(draft.stages).map(([role, each]) => [
+                                                role,
+                                                each === draft.model ? model : each,
+                                            ]),
+                                        ),
+                                    })}
                             />
                         </label>
                         <label>
@@ -356,8 +390,8 @@ export function RouterEditor() {
                     }
                     <div class="label">Stages</div>
                     <p class="muted small">
-                        Each role keeps its instructions and tools; the model here is the one its stage runs on. Roles
-                        the prompt names come first.
+                        Each role keeps its instructions and tools; the model and thinking here are what its stage
+                        runs with. Roles the prompt names come first.
                     </p>
                     <div class="routers-stages" role="group" aria-label="Stage models">
                         ${ordered.map(
@@ -375,6 +409,26 @@ export function RouterEditor() {
                                     onChange=${(model) =>
                                         set({ stages: { ...draft.stages, [role.name]: model } })}
                                 />
+                                <select
+                                    class="routers-thinking"
+                                    aria-label=${`Thinking for ${role.name}`}
+                                    value=${draft.stageThinking[role.name] ?? ""}
+                                    disabled=${!editable}
+                                    onChange=${(event) =>
+                                        set({
+                                            stageThinking: {
+                                                ...draft.stageThinking,
+                                                [role.name]: event.currentTarget.value,
+                                            },
+                                        })}
+                                >
+                                    <option value="">thinking: as its definition</option>
+                                    ${(data?.thinkingLevels ?? []).map(
+                                        (level) => html`<option value=${level} key=${level}>
+                                            ${level}
+                                        </option>`,
+                                    )}
+                                </select>
                             </label>`,
                         )}
                     </div>
