@@ -244,25 +244,26 @@ export function ProvidersSheet() {
             (provider) => html`<div class="provider-block">
                 <div class="provider">
                     <div>
-                        ${provider.name}
+                        <div>
+                            ${provider.name}
+                            ${
+                                provider.needsSignIn
+                                    ? html` <span class="warn">needs sign-in</span>`
+                                    : provider.configured && html` <span class="ok">✓</span>`
+                            }
+                        </div>
+                        <div class="muted small">
+                            ${provider.needsSignIn ? "the sign-in expired and could not be renewed: sign in again. Until then, sessions on its models fail, and PiP and subagents on other models do not use them" : provider.configured ? `signed in${provider.label ? ` · ${provider.label}` : provider.source ? ` · ${provider.source}` : ""}` : "not configured"} · ${
+                                provider.shown === provider.models
+                                    ? `${provider.models} models`
+                                    : `${provider.shown} of ${provider.models} models shown`
+                            }
+                        </div>
                         ${
-                            provider.needsSignIn
-                                ? html` <span class="warn">needs sign-in</span>`
-                                : provider.configured && html` <span class="ok">✓</span>`
+                            provider.needsSignIn &&
+                            html`<div class="muted small mono provider-why">${provider.needsSignIn}</div>`
                         }
                     </div>
-                    <div class="muted small">
-                        ${provider.needsSignIn ? "the sign-in expired and could not be renewed: sign in again. Until then, sessions on its models fail, and PiP and subagents on other models do not use them" : provider.configured ? `signed in${provider.label ? ` · ${provider.label}` : provider.source ? ` · ${provider.source}` : ""}` : "not configured"} · ${
-                            provider.shown === provider.models
-                                ? `${provider.models} models`
-                                : `${provider.shown} of ${provider.models} models shown`
-                        }
-                    </div>
-                    ${
-                        provider.needsSignIn &&
-                        html`<div class="muted small mono provider-why">${provider.needsSignIn}</div>`
-                    }
-                </div>
                     ${
                         owner &&
                         html`<div class="provider-actions">
