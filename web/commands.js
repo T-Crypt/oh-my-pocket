@@ -582,15 +582,31 @@ export function parseTemplate(text) {
     return templates().find((template) => template.name === match[1]) ?? null;
 }
 
-/** Commands to offer while someone types a command name: "/" lists them all, then Pi's prompt templates and skills. */
-export function suggestCommands(text) {
-    const match = /^\/([\w:-]*)$/.exec(text);
+/**
+ * The slash command being typed at the caret, if any: a "/" at the start or after whitespace, with the word
+ * characters, colons, and hyphens after it. Paths like a/b and words like and/or stay out. Like an @mention
+ * (`mentionAt` in files.js),
+ * it works mid-text: "/review" at the start, or "ask pi to /skill" later in the message.
+ */
+export function slashAt(text, caret = text.length) {
+    const match = /(?:^|[\s([{])\/([\w:-]*)$/.exec(text.slice(0, caret));
 
     if (!match) {
+        return null;
+    }
+
+    return { start: caret - match[1].length - 1, prefix: match[1].toLowerCase() };
+}
+
+/** Commands to offer for the slash fragment at the caret: "/" lists them all, then Pi's prompt templates and skills. */
+export function suggestCommands(text, caret = text.length) {
+    const slash = slashAt(text, caret);
+
+    if (slash === null) {
         return [];
     }
 
-    const prefix = match[1].toLowerCase();
+    const { prefix } = slash;
     const own = available();
     const commands = [
         ...own,

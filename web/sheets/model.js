@@ -25,10 +25,10 @@ export function defaultLabel(chosen, models) {
         (each) => each.provider === chosen.provider && each.id === chosen.modelId,
     );
 
-    // Not signed in any more, or gone from its provider: new sessions start with it anyway, and say so, rather than
-    // with a model nobody chose for them.
+    // Not in the list: signed out at its provider, or the owner does not offer it to the pickers. New sessions
+    // start with it anyway, and say so, rather than with a model nobody chose for them.
     if (!model) {
-        return `${chosen.modelId} (not signed in)`;
+        return `${chosen.modelId} (not in the model list)`;
     }
 
     return `${model.name}${model.reasoning ? ` · ${chosen.thinkingLevel ?? "off"}` : ""}${model.signIn ? " (needs sign-in)" : ""}`;
@@ -205,7 +205,7 @@ export function ModelPicker() {
                 ${
                     models.length === 0 &&
                     html`<p class="muted pop-menu-note">
-                        No models are available. Add a provider first.
+                        No models to pick. Add a provider, or turn its models on in Providers.
                     </p>`
                 }
                 ${

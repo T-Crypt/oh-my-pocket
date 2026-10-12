@@ -9,6 +9,7 @@ import {
     parseTemplate,
     planAvailable,
     showContext,
+    slashAt,
     suggestCommands,
 } from "./commands.js";
 import { loadFiles, mentionAt, mentionText, suggestFiles } from "./files.js";
@@ -463,12 +464,14 @@ export function Composer() {
         setCaret(at);
         drafts.set(conversationId, value);
         setPick(0);
+        const fragment = slashAt(value, at);
 
-        if (!value.startsWith("/") || value === "/") {
+        // Escape hides the menu until the fragment is gone; a fresh "/" starts over.
+        if (fragment === null || value === "/") {
             setHideCommands(false);
         }
 
-        if (value.startsWith("/")) {
+        if (fragment !== null) {
             loadTemplates();
         }
 
@@ -479,7 +482,8 @@ export function Composer() {
     // Ctrl+R: what was sent before that has the words in the box.
     const recalled = searching ? searchHistory(text) : [];
     const chosenRecall = recalled[Math.min(pick, recalled.length - 1)];
-    const suggestions = hideCommands || searching ? [] : suggestCommands(text);
+    const slash = slashAt(text, caret);
+    const suggestions = hideCommands || searching ? [] : suggestCommands(text, caret);
     const chosen = suggestions[Math.min(pick, suggestions.length - 1)];
     const parsed = parseCommand(text);
     const template = parsed ? null : parseTemplate(text);
@@ -566,8 +570,31 @@ export function Composer() {
         });
     };
 
-    /** A tapped suggestion: commands that take text, and prompt templates, fill the box; the others run at once. */
+    /**
+     * A picked suggestion. At the start it works as before: commands that take text, and prompt templates, fill the
+     * box, and the others run at once. Mid-text it only completes the fragment: the message stays a message to Pi,
+     * and commands never run from there.
+     */
     const choose = (command) => {
+        if (slash !== null && slash.start > 0) {
+            const inserted = `/${command.name} `;
+            const at = slash.start + inserted.length;
+
+            update(`${text.slice(0, slash.start)}${inserted}${text.slice(caret)}`, at);
+            requestAnimationFrame(() => {
+                const element = box.current;
+
+                if (!element) {
+                    return;
+                }
+
+                element.focus();
+                element.setSelectionRange(at, at);
+            });
+
+            return;
+        }
+
         if (command.args || command.template) {
             update(`/${command.name} `);
             focusEnd();

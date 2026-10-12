@@ -61,6 +61,11 @@ interface PocketConfig {
     lastModel?: ModelChoice;
     /** The model and thinking level new sessions start with, as the owner chose; absent: the last one picked. */
     defaultModel?: ModelChoice;
+    /**
+     * Which models each provider offers the pickers, by provider id: the ones the owner turned on. A provider that is
+     * absent shows every model it has; an empty list shows none of them.
+     */
+    visibleModels?: Record<string, string[]>;
     /** Extension modules (file names in `src/server/extensions/`) the owner turned off. */
     disabledExtensions?: string[];
     /** Extension modules the owner turned on. Matters for modules that are off by default, like Lancet Guard. */
@@ -154,6 +159,37 @@ export class ConfigStore {
             delete this.#config.defaultModel;
         } else {
             this.#config.defaultModel = choice;
+        }
+
+        this.save();
+    }
+
+    /**
+     * What a provider offers the pickers: undefined when it shows every model it has, an empty list when it shows
+     * none of them.
+     */
+    visibleModels(provider: string): readonly string[] | undefined {
+        return this.#config.visibleModels?.[provider];
+    }
+
+    /** Whether the pickers offer a model: every model, unless the owner chose for its provider. */
+    showsModel(provider: string, id: string): boolean {
+        const shown = this.#config.visibleModels?.[provider];
+
+        return shown === undefined || shown.includes(id);
+    }
+
+    /** What a provider offers the pickers from now on: model ids, or null for every model it has. */
+    setVisibleModels(provider: string, models: readonly string[] | null): void {
+        if (models === null) {
+            delete this.#config.visibleModels?.[provider];
+
+            if (Object.keys(this.#config.visibleModels ?? {}).length === 0) {
+                delete this.#config.visibleModels;
+            }
+        } else {
+            this.#config.visibleModels ??= {};
+            this.#config.visibleModels[provider] = [...new Set(models)].sort();
         }
 
         this.save();

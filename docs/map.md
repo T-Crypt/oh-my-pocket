@@ -110,11 +110,11 @@ A module split into parts keeps its name for the part others import, with the re
 
 ### Elsewhere
 
-| File                     | Owns                                                                                                                                     |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `providers.ts`, `net.ts` | Provider sign-ins, and those that need signing in again (a subscription its provider will not renew); HTTP settings for provider streams |
-| `lancet.ts`              | Loads Lancet Guard from Pi's install                                                                                                     |
-| `omarchy.ts`             | The Omarchy desktop's current theme and wallpaper, read-only, for Follow desktop (`/api/theme`)                                          |
+| File                     | Owns                                                                                                                                                                     |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `providers.ts`, `net.ts` | Provider sign-ins, those that need signing in again (a subscription its provider will not renew), and which models the pickers offer; HTTP settings for provider streams |
+| `lancet.ts`              | Loads Lancet Guard from Pi's install                                                                                                                                     |
+| `omarchy.ts`             | The Omarchy desktop's current theme and wallpaper, read-only, for Follow desktop (`/api/theme`)                                                                          |
 
 ## Extensions: `src/server/extensions/`
 

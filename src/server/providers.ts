@@ -238,6 +238,7 @@ export class Providers {
                     auth?: { apiKey?: unknown; oauth?: { name?: string; loginLabel?: string } };
                 }
             ).auth;
+            const catalog = models.getModels(provider.id);
 
             return {
                 id: provider.id,
@@ -250,12 +251,61 @@ export class Providers {
                     auth?.oauth === undefined
                         ? null
                         : (auth.oauth.loginLabel ?? auth.oauth.name ?? "Subscription"),
-                models: models.getModels(provider.id).length,
+                models: catalog.length,
+                // The models the pickers offer (`shown` of `models`); the owner narrows them from the sheet.
+                shown: catalog.filter((model) => this.#app.config.showsModel(provider.id, model.id))
+                    .length,
                 ...(expired === undefined
                     ? {}
                     : { needsSignIn: owner ? expired : "its provider would not renew it" }),
             };
         });
+    }
+
+    /** A provider's whole catalog, by id, with whether the pickers offer each model. */
+    modelsFor(providerId: string): { id: string; name: string; shown: boolean }[] {
+        const provider = this.#provider(providerId);
+
+        return this.#app.models
+            .getModels(provider.id)
+            .map((model) => ({
+                id: model.id,
+                name: model.name,
+                shown: this.#app.config.showsModel(provider.id, model.id),
+            }))
+            .sort((a, b) => a.id.localeCompare(b.id));
+    }
+
+    /**
+     * What a provider offers the pickers from now on. `models` are ids from its catalog, or null for every one of
+     * them. Nothing else about a model changes. One that is not offered still runs in a session that has it, and
+     * `/model` still takes it by name.
+     */
+    setVisible(providerId: string, models: readonly string[] | null): void {
+        const provider = this.#provider(providerId);
+
+        if (models !== null) {
+            const known = new Set(this.#app.models.getModels(provider.id).map((each) => each.id));
+            const unknown = models.find((id) => !known.has(id));
+
+            if (unknown !== undefined) {
+                throw new HttpError(400, `No such model: ${provider.id}/${unknown}`);
+            }
+        }
+
+        this.#app.config.setVisibleModels(provider.id, models);
+        this.#sendModels();
+    }
+
+    /** A provider the model runtime knows, by id. */
+    #provider(id: string) {
+        const provider = this.#app.models.getProviders().find((each) => each.id === id);
+
+        if (provider === undefined) {
+            throw new HttpError(404, "No such provider");
+        }
+
+        return provider;
     }
 
     startLogin(user: User, providerId: string, type: "api_key" | "oauth"): string {
@@ -366,7 +416,9 @@ export class Providers {
 
     /** Every tab gets the models available now, marked when their sign-in needs renewing. */
     #sendModels(): void {
-        const models = modelList(this.#app.models, (provider) => this.#expired.has(provider));
+        const models = modelList(this.#app.models, this.#app.config, (provider) =>
+            this.#expired.has(provider),
+        );
 
         for (const client of this.#app.clients) {
             client.send("models", models);

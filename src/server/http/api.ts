@@ -607,6 +607,42 @@ export function createApi(options: HttpOptions, auth: Auth) {
         if (
             first === "providers" &&
             second !== undefined &&
+            third === "models" &&
+            method === "GET"
+        ) {
+            return json(response, 200, { models: app.providers.modelsFor(second) });
+        }
+
+        if (
+            first === "providers" &&
+            second !== undefined &&
+            third === "models" &&
+            method === "POST"
+        ) {
+            requireOwner(user);
+            const body = await readJson<{ models?: unknown }>(request);
+
+            if (body.models !== null && !Array.isArray(body.models)) {
+                throw new HttpError(
+                    400,
+                    "models must be an array of model ids, or null for every model",
+                );
+            }
+
+            // Both lists the sheet shows, so one tap is one round trip.
+            const asked = body.models === null ? null : body.models.map((each) => String(each));
+
+            app.providers.setVisible(second, asked);
+
+            return json(response, 200, {
+                providers: app.providers.list(),
+                models: app.providers.modelsFor(second),
+            });
+        }
+
+        if (
+            first === "providers" &&
+            second !== undefined &&
             third === "login" &&
             method === "POST"
         ) {

@@ -1528,7 +1528,7 @@ export class PocketApp {
                 ...(user.sessions === undefined ? {} : { sessions: user.sessions.map(Number) }),
             },
             users: this.people(user),
-            models: modelList(this.models, this.signInNeeded),
+            models: modelList(this.models, this.config, this.signInNeeded),
             guard: await this.guardStatus(),
             server: {
                 supervised: this.supervised,

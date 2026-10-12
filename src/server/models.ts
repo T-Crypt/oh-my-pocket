@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { AgentState, ModelRef } from "@earendil-works/pi-durable";
+import type { ConfigStore } from "./config.ts";
 
 // A record, so a level Pi adds fails the type check until it is here too.
 const LEVELS: Record<ModelThinkingLevel, true> = {
@@ -68,19 +69,26 @@ function capabilities(model: Model<Api>) {
     };
 }
 
-/** The models people can pick: the ones with a configured sign-in, marked when that sign-in needs renewing. */
+/**
+ * The models people can pick: the ones with a configured sign-in, marked when that sign-in needs renewing; when
+ * `config` is given, only the models the owner offers the pickers in the Providers sheet.
+ */
 export function modelList(
     models: ModelRuntime,
+    config?: Pick<ConfigStore, "showsModel">,
     signInNeeded: SignInNeeded = () => false,
 ): ModelSummary[] {
-    return models.getAvailableSnapshot().map((model) => ({
-        provider: model.provider,
-        id: model.id,
-        name: model.name,
-        contextWindow: model.contextWindow,
-        ...capabilities(model),
-        ...(signInNeeded(model.provider) ? { signIn: true as const } : {}),
-    }));
+    return models
+        .getAvailableSnapshot()
+        .filter((model) => config === undefined || config.showsModel(model.provider, model.id))
+        .map((model) => ({
+            provider: model.provider,
+            id: model.id,
+            name: model.name,
+            contextWindow: model.contextWindow,
+            ...capabilities(model),
+            ...(signInNeeded(model.provider) ? { signIn: true as const } : {}),
+        }));
 }
 
 /** A signed-in model by `provider/id`, or by id alone; undefined when there is none. */

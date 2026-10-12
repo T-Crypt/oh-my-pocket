@@ -120,7 +120,8 @@ after(async () => {
 });
 
 const listed = () => app.providers.list(true).find((provider) => provider.id === "expiring");
-const marked = () => modelList(app.models, app.signInNeeded).find((model) => model.id === "exp-1");
+const marked = () =>
+    modelList(app.models, undefined, app.signInNeeded).find((model) => model.id === "exp-1");
 
 test("only a provider refusing to renew a sign-in counts, not a network that failed", () => {
     const refused = (cause: string) =>
