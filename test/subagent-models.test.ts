@@ -1,5 +1,5 @@
-// Models are a person's to choose. A subagent runs on its session's model: with no models allowed (the default), Pi is
-// offered no model and one it names is refused; the owner may allow others, and Pi may use only those. A subagent on a
+// Models are a person's to choose. A subagent runs on its session's model: with no models allowed (the default), one Pi
+// names is refused; the owner may allow others, and Pi may use only those. A subagent on a
 // model no longer allowed gets no more work. A subagent its model failed is reported as such, with the model, and Pi is
 // told to stop and tell the user rather than try another model; the people in the session are told too.
 import {
@@ -145,7 +145,8 @@ test("with no models allowed, a subagent runs on its session's model, and Pi is 
         "mine",
     );
     assert.ok(offered !== undefined, "the parent was offered the tool");
-    assert.equal("model" in offered, false, "no model parameter");
+    // Always offered, as which models a subagent may use depends on the session; the call checks.
+    assert.ok("model" in offered, "a model parameter");
 
     // One it names anyway is refused, nothing made, and Pi is told to ask the user.
     const refused = await ask(id, "spawn sneaky faux/pricey");
@@ -174,7 +175,6 @@ test("the owner allows models: Pi may use those, and is refused any other with w
     const allowed = await ask(id, "spawn reviewer faux/pricey");
 
     assert.match(allowed.answer, /Started reviewer on faux\/pricey\./);
-    assert.ok(offered !== undefined && "model" in offered, "the tool offers a model now");
     assert.equal(
         (await app.agentState(allowed.agents.reviewer!.conversationId))?.model?.modelId,
         "pricey",
@@ -194,7 +194,6 @@ test("the owner allows models: Pi may use those, and is refused any other with w
         after.answer,
         /reviewer runs on faux\/pricey, which is neither this session's model nor one/,
     );
-    assert.equal("model" in (offered ?? {}), false, "the tool offers no model again");
 });
 
 test("a subagent its model failed is reported with the model, Pi is told to stop and tell the user, and so are people", async () => {

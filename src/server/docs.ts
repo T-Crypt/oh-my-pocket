@@ -15,6 +15,7 @@ import {
 import type { Repeat } from "./when.ts";
 import type { Worktree } from "./worktrees.ts";
 import type { ContextRow } from "./context-meter.ts";
+import type { SubagentPolicy } from "./subagent-policy.ts";
 
 export type SessionMeta = {
     title?: string;
@@ -174,6 +175,17 @@ export const SubagentsDoc = defineDoc<{
     // A fork starts without subagents: they belong to the conversation that spawned them.
     fork: "initial",
     initial: () => ({ agents: {}, reporters: {} }),
+});
+
+/** Which models this session's subagents may run on besides its own (`subagent-policy.ts`): its person's choice. */
+export const SubagentPolicyDoc = defineDoc<SubagentPolicy>({
+    kind: "pocket.subagent-policy",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    // A fork keeps its session's choice, as it keeps the model.
+    fork: "current",
+    initial: () => ({ mode: "auto" }),
 });
 
 export type ChatMessage = {

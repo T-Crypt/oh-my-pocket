@@ -40,6 +40,7 @@ import {
     type Schedule,
     SessionsDoc,
     STOPPED,
+    SubagentPolicyDoc,
     type SubagentRecord,
     SubagentsDoc,
 } from "./docs.ts";
@@ -53,6 +54,7 @@ import { snippet } from "./projection.ts";
 import { expandPromptTemplate, expandSkillCommand, unwrapSkill } from "./prompts.ts";
 import { clientKey, ownRequest, requestFor } from "./requests.ts";
 import { type Resend, resendContent, resendRequest, ResendTask, userContent } from "./resend.ts";
+import { SUBAGENT_MODES, type SubagentMode } from "./subagent-policy.ts";
 import { whyUnanswered } from "./subagent-runs.ts";
 import { wantsTitle, writeTitle } from "./titles.ts";
 import { describeMoment, describeRepeat, knownZone } from "./when.ts";
@@ -1280,6 +1282,90 @@ export class Commands {
                 ? "cleared the instructions for Pi"
                 : "changed the instructions for Pi",
         );
+    }
+
+    /**
+     * Which models a session's subagents may run on besides its own (`subagent-policy.ts`): `auto`, `own`, `local`, or
+     * `custom` with `models` (`provider/modelId`). Set for a whole session, by someone who may steer it.
+     */
+    async setSubagents(
+        id: ConversationId,
+        user: User,
+        request: { mode?: unknown; models?: unknown },
+    ): Promise<void> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        await app.requireDriver(id, user);
+
+        const { mode, models } = request;
+
+        if (typeof mode !== "string" || !(SUBAGENT_MODES as readonly string[]).includes(mode)) {
+            throw new HttpError(400, `mode must be one of ${SUBAGENT_MODES.join(", ")}`);
+        }
+
+        if (app.parentOf(id) !== undefined) {
+            throw new HttpError(
+                400,
+                "Subagents' models are set for the whole session, in its main conversation.",
+            );
+        }
+
+        let chosen: string[] | undefined;
+
+        if (mode === "custom") {
+            if (!Array.isArray(models) || models.some((each) => typeof each !== "string")) {
+                throw new HttpError(400, "models must be a list of provider/modelId");
+            }
+
+            chosen = [];
+
+            for (const spec of models as string[]) {
+                try {
+                    const ref = app.resolveModelSpec(spec);
+
+                    chosen.push(`${ref.provider}/${ref.modelId}`);
+                } catch (error) {
+                    throw new HttpError(400, describe(error));
+                }
+            }
+
+            chosen = [...new Set(chosen)];
+        }
+
+        const changed = await app.harness.commit(async (tx) => {
+            const policy = await tx.doc(SubagentPolicyDoc, id);
+
+            if (
+                policy.mode === mode &&
+                JSON.stringify(policy.models ?? []) === JSON.stringify(chosen ?? [])
+            ) {
+                return false;
+            }
+
+            policy.mode = mode as SubagentMode;
+
+            if (chosen === undefined) {
+                delete policy.models;
+            } else {
+                policy.models = chosen;
+            }
+
+            policy.by = user.id;
+            policy.at = Date.now();
+
+            return true;
+        }, context);
+
+        if (changed) {
+            await app.collab.activity(
+                id,
+                user,
+                mode === "custom"
+                    ? `let subagents run on ${chosen!.length === 0 ? "this session's model only" : chosen!.join(", ")}`
+                    : `set subagents to ${mode}`,
+            );
+        }
     }
 
     /** Turn plan mode on or off: while it is on, Pi reads and proposes a plan, and anything that changes something is blocked. */

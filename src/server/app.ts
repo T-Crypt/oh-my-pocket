@@ -31,6 +31,7 @@ import {
     type HarnessSettings,
     LiveDoc,
     type LiveState,
+    type ModelRef,
     type Registry,
     type Storage,
     UsageDoc,
@@ -39,6 +40,7 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { type AgentDefinition, listAgents } from "./agents.ts";
 import { Alerts } from "./alerts.ts";
 import { Attribution, type Missing } from "./attribution.ts";
 import { Browsers } from "./browser.ts";
@@ -85,6 +87,12 @@ import { loadPromptTemplates, type PromptTemplate, type SkillCommand } from "./p
 import { measureModelStreams } from "./timing.ts";
 import { Providers } from "./providers.ts";
 import { PushStore } from "./push.ts";
+import {
+    policyLabel,
+    policyModels,
+    type SubagentMode,
+    type SubagentPolicy,
+} from "./subagent-policy.ts";
 import { type ExtensionInfo, ExtensionLoader, prepareDropInFolder } from "./reload.ts";
 import { ResendTask } from "./resend.ts";
 import { type Client, reportingOf, Room, ROOM_DOCS, subagentView } from "./room.ts";
@@ -2374,6 +2382,36 @@ export class PocketApp {
      */
     readonly signInNeeded = (provider: string): boolean =>
         this.providers.needsSignIn(provider) !== undefined;
+
+    /** `provider/modelId` (or a bare model id) to a model Pi may use now, or an error that says why not. */
+    resolveModelSpec(spec: string): ModelRef {
+        return resolveModel(this.models, spec, this.signInNeeded);
+    }
+
+    /** Agent definitions, read again at most every few seconds: a room asks for them each time it sends its state. */
+    #definitions: { at: number; list: AgentDefinition[] } | undefined;
+
+    /**
+     * What a session's subagents may run on, for its people: its choice (`SubagentPolicyDoc`), that choice in a word for
+     * the message box's chip, and the models it allows besides the session's own and the owner's.
+     */
+    subagentsView(
+        policy: SubagentPolicy | undefined,
+        own: ModelRef | undefined,
+    ): { mode: SubagentMode; label: string; models: string[]; allowed: string[] } {
+        const now = Date.now();
+
+        if (this.#definitions === undefined || now - this.#definitions.at > 5000) {
+            this.#definitions = { at: now, list: listAgents(this.dataDir) };
+        }
+
+        const mode = policy?.mode ?? "auto";
+        const allowed = policyModels(policy, own, this.#definitions.list, (spec) =>
+            this.resolveModelSpec(spec),
+        ).filter((spec) => own === undefined || spec !== `${own.provider}/${own.modelId}`);
+
+        return { mode, label: policyLabel(mode, allowed), models: policy?.models ?? [], allowed };
+    }
 
     /**
      * The owner picks the models Pi may start subagents on besides their session's own (`provider/modelId`, models Pi

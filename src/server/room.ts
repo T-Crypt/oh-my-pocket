@@ -32,6 +32,7 @@ import {
     type Pin,
     PinsDoc,
     PlanDoc,
+    SubagentPolicyDoc,
     type PrWatch,
     ReactionsDoc,
     type Schedule,
@@ -45,6 +46,7 @@ import {
 } from "./docs.ts";
 import { SHELL_ENTRY } from "./entry-format.ts";
 import { agentInfo } from "./models.ts";
+import type { SubagentPolicy } from "./subagent-policy.ts";
 import {
     type ClientEntry,
     PEEK_LINES,
@@ -71,6 +73,7 @@ export const ROOM_DOCS = new Set(
         TurnsDoc,
         DecisionsDoc,
         PlanDoc,
+        SubagentPolicyDoc,
         ScheduleDoc,
         GoalDoc,
         WatchDoc,
@@ -240,6 +243,7 @@ export class Room {
     turns: Turns = { on: false, asks: [] };
     decisions: Record<string, Decision> = {};
     plan: { on: boolean; by?: string; at?: number } = { on: false };
+    subagentPolicy: SubagentPolicy | undefined;
     schedules: Record<string, Schedule> = {};
     goal: Goal | undefined;
     watch: PrWatch | undefined;
@@ -292,6 +296,7 @@ export class Room {
             ...((await harness.snapshot(DecisionsDoc, this.id, context))?.calls ?? {}),
         };
         this.plan = { ...((await harness.snapshot(PlanDoc, this.id, context)) ?? { on: false }) };
+        this.subagentPolicy = await harness.snapshot(SubagentPolicyDoc, this.id, context);
         this.schedules = {
             ...((await harness.snapshot(ScheduleDoc, this.id, context))?.items ?? {}),
         };
@@ -362,6 +367,8 @@ export class Room {
             this.decisions = { ...((value?.calls as Record<string, Decision>) ?? {}) };
         } else if (kind === PlanDoc.definition.kind) {
             this.plan = { on: false, ...((value as Room["plan"] | null) ?? {}) };
+        } else if (kind === SubagentPolicyDoc.definition.kind) {
+            this.subagentPolicy = (value as SubagentPolicy | null) ?? undefined;
         } else if (kind === ScheduleDoc.definition.kind) {
             this.schedules = { ...((value?.items as Record<string, Schedule>) ?? {}) };
         } else if (kind === GoalDoc.definition.kind) {
@@ -495,6 +502,8 @@ export class Room {
             turns: this.turns,
             decisions: this.decisions,
             plan: this.plan,
+            // Which models its subagents may run on besides its own: the message box's chip.
+            subagentPolicy: this.#app.subagentsView(this.subagentPolicy, agentState.model),
             schedules: Object.values(this.schedules)
                 .sort((a, b) => a.next - b.next)
                 .map(({ id, text, next, every, by, runs }) => ({
