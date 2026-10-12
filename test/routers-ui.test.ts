@@ -69,7 +69,7 @@ before(async () => {
     }
 
     mkdirSync(join(dataDir, "agents"), { recursive: true });
-    mkdirSync(join(dataDir, "hq"), { recursive: true });
+    mkdirSync(join(dataDir, "routers"), { recursive: true });
     writeFileSync(
         join(dataDir, "agents", "planner.md"),
         "---\ndescription: Writes plan.md.\nmodel: faux/faux-2\n---\nPlan.\n",
@@ -79,7 +79,7 @@ before(async () => {
         "---\ndescription: Builds what the plan says.\nmodel: faux/faux-2\n---\nBuild.\n",
     );
     writeFileSync(
-        join(dataDir, "hq", "ROUTER.md"),
+        join(dataDir, "routers", "ROUTER.md"),
         "You route. Spawn `planner`, then `builder`.\n",
     );
     app = await openApp(scriptedModel(), dataDir);
@@ -127,13 +127,13 @@ test(
         await until(
             async () =>
                 await inPage<boolean>(
-                    `return JSON.stringify([...document.querySelectorAll(".routers-list .list-item")].some((each) => each.textContent.includes("router-main")))`,
+                    `return JSON.stringify([...document.querySelectorAll(".routers-list .list-item")].some((each) => each.textContent.includes("pipeline")))`,
                 ),
             "the detected router in the list",
         );
         assert.equal(
             await inPage<string>(
-                `return JSON.stringify([...document.querySelectorAll(".routers-stage .mono")].map((each) => each.textContent).join(","))`,
+                `return JSON.stringify([...document.querySelectorAll(".routers-stage .mono")].map((each) => each.textContent).slice(0, 2).join(","))`,
             ),
             "planner,builder",
             "the roles the prompt names, first",
@@ -246,12 +246,24 @@ test(
             });
         `);
 
-        await until(async () => (await stages()).stages.length === 2, "the stage rows");
+        await until(
+            async () =>
+                await inPage<boolean>(
+                    `return JSON.stringify(document.querySelector(".routers-form input")?.value === "My router")`,
+                ),
+            "the new router's form",
+        );
         const fresh = await stages();
 
         assert.equal(fresh.router, "faux/faux-1", "this session's model");
-        assert.deepEqual(fresh.stages, ["faux/faux-1", "faux/faux-1"]);
-        assert.deepEqual(fresh.thinking, ["", ""], "thinking as each definition, until changed");
+        assert.ok(
+            fresh.stages.every((each) => each === "faux/faux-1"),
+            "every stage on it",
+        );
+        assert.ok(
+            fresh.thinking.every((each) => each === ""),
+            "thinking as each role, until changed",
+        );
 
         await page.evaluate(`
         const el = document.querySelector('select[aria-label="Router model"]');

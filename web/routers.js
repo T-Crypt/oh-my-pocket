@@ -167,11 +167,9 @@ export function RouterEditor() {
             id,
             label: from ? `${from.label} copy` : "My router",
             promptMode: from ? base.promptMode : "file",
-            // router-main's steps, as harnesses render them: a new router changes models, not the pipeline.
-            promptFile: from
-                ? base.promptFile
-                : ((prompts.find((router) => router.id === "router-main") ?? prompts[0])
-                      ?.promptFile ?? ""),
+            // The first detected prompt (a main ROUTER.md first, the built-in pipeline last): a new router changes
+            // models, not the steps.
+            promptFile: from ? base.promptFile : (prompts[0]?.promptFile ?? ""),
             isNew: true,
         });
         setSaved("");

@@ -5,8 +5,8 @@
  * only the model comes from the router.
  *
  * Two kinds, one list:
- * - detected: router prompts already on this machine, read where harnesses keep them (Pi Pocket's `hq/ROUTER*.md`,
- *   Oh My Pi's `~/.omp/agent/router/ROUTER*.md`). Their stages are the agent definitions the prompt names in
+ * - detected: router prompts already on this machine: `~/.pi-pocket/routers/*.md`, Oh My Pi's
+ *   `~/.omp/agent/router/ROUTER*.md`, and Pi Pocket's built-in pipeline (`defaults/routers/`). Their stages are the agent definitions the prompt names in
  *   backticks, each on its definition's model, and their model is the model whose id is the router's
  *   (`router-fast`, ...). The prompt is read from its file at every request, so a harness that renders it again
  *   changes it in place.
@@ -17,7 +17,8 @@
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ModelRef } from "@earendil-works/pi-durable";
 import { type AgentDefinition, listAgents } from "./agents.ts";
 
@@ -50,16 +51,41 @@ const MAX_PROMPT = 200_000;
 /** The places detected routers come from, Pi Pocket's own first: the first of an id wins. */
 export function promptPlaces(dataDir: string, home = homedir()) {
     return [
-        { dir: join(dataDir, "hq"), from: "Pi Pocket" },
+        { dir: routersDir(dataDir), from: "Pi Pocket" },
         { dir: join(home, ".omp", "agent", "router"), from: "Oh My Pi" },
+        { dir: BUILT_IN_ROUTERS, from: "built in" },
     ];
 }
 
-/** `ROUTER.md` is the main router (`router-main`); `ROUTER-FAST.md` is `router-fast`. */
+/** Pi Pocket's own router prompts. */
+const BUILT_IN_ROUTERS = join(dirname(fileURLToPath(import.meta.url)), "defaults", "routers");
+
+/** `ROUTER.md` is `router`, `ROUTER-FAST.md` is `router-fast`, and `pipeline.md` is `pipeline`. */
 function idOfFile(file: string): string | undefined {
     const match = /^ROUTER(?:-([A-Za-z0-9-]+))?\.md$/.exec(file);
 
-    return match === null ? undefined : `router-${(match[1] ?? "main").toLowerCase()}`;
+    if (match !== null) {
+        return match[1] === undefined ? "router" : `router-${match[1].toLowerCase()}`;
+    }
+
+    const id = file.endsWith(".md") ? file.slice(0, -3).toLowerCase() : "";
+
+    return ROUTER_ID.test(id) ? id : undefined;
+}
+
+/** A main `ROUTER.md` before the rest, so it is the one a new router starts from. */
+const mainFirst = (a: string, b: string) =>
+    Number(b === "ROUTER.md") - Number(a === "ROUTER.md") || a.localeCompare(b);
+
+/** Whether `file` is a router prompt in one of `places`: the only files a router's prompt may be read from. */
+export function isRouterPrompt(file: string, places: readonly { dir: string }[]): boolean {
+    const full = resolvePath(file);
+
+    return (
+        full.endsWith(".md") &&
+        places.some((place) => dirname(full) === resolvePath(place.dir)) &&
+        existsSync(full)
+    );
 }
 
 /** The agent definitions a prompt names in backticks, in the order it names them first. */
@@ -93,7 +119,7 @@ export function detectRouters(
         let files: string[];
 
         try {
-            files = readdirSync(dir).sort();
+            files = readdirSync(dir).sort(mainFirst);
         } catch {
             continue;
         }
@@ -114,8 +140,7 @@ export function detectRouters(
                 continue;
             }
 
-            // The main router answers to `router` as well as `router-main`.
-            const ref = modelFor(id) ?? (id === "router-main" ? modelFor("router") : undefined);
+            const ref = modelFor(id);
             const stages: Record<string, string> = {};
 
             for (const name of namedStages(prompt, definitions)) {
@@ -221,6 +246,7 @@ export function checkRouter(
     input: unknown,
     resolve: (spec: string) => ModelRef,
     thinkingLevels: readonly string[],
+    places: readonly { dir: string }[] = [],
 ): RouterConfig {
     const fail = (message: string): never => {
         throw new Error(message);
@@ -259,8 +285,11 @@ export function checkRouter(
         fail("prompt must be text");
     }
 
-    if (promptFile !== undefined && (typeof promptFile !== "string" || !existsSync(promptFile))) {
-        fail("promptFile must be a router prompt on this machine");
+    if (
+        promptFile !== undefined &&
+        (typeof promptFile !== "string" || !isRouterPrompt(promptFile, places))
+    ) {
+        fail("promptFile must be one of the detected router prompts");
     }
 
     if (prompt === undefined && promptFile === undefined) {

@@ -72,12 +72,12 @@ let app: App;
 before(async () => {
     rmSync(dataDir, { recursive: true, force: true });
     mkdirSync(join(dataDir, "agents"), { recursive: true });
-    mkdirSync(join(dataDir, "hq"), { recursive: true });
+    mkdirSync(join(dataDir, "routers"), { recursive: true });
     mkdirSync(ompDir, { recursive: true });
     writeFileSync(join(dataDir, "agents", "planner.md"), "---\nmodel: faux/faux-2\n---\nPlan.\n");
     writeFileSync(join(dataDir, "agents", "builder.md"), "---\nmodel: faux/faux-2\n---\nBuild.\n");
     writeFileSync(
-        join(dataDir, "hq", "ROUTER.md"),
+        join(dataDir, "routers", "ROUTER.md"),
         "You are MAINROUTER. Spawn `planner`, then `builder`. Never `nobody`.\n",
     );
     writeFileSync(join(ompDir, "ROUTER.md"), "OMP's main router, shadowed by Pi Pocket's.\n");
@@ -117,12 +117,18 @@ async function go(id: ConversationId, name: string, args: JsonObject) {
 
 test("prompts on the machine are detected, Pi Pocket's first, with the stages they name", () => {
     const routers = app.routers(true);
-    const main = routers.find((router) => router.id === "router-main");
+    const main = routers.find((router) => router.id === "router");
     const fast = routers.find((router) => router.id === "router-fast");
 
     assert.equal(main?.from, "Pi Pocket", "Pi Pocket's ROUTER.md wins over Oh My Pi's");
     assert.deepEqual(main?.stages, { planner: "faux/faux-2", builder: "faux/faux-2" });
     assert.equal(fast?.from, "Oh My Pi");
+    // Pi Pocket's own pipeline, with its own roles: no one's skills or models needed.
+    assert.deepEqual(routers.find((router) => router.id === "pipeline")?.from, "built in");
+    assert.deepEqual(
+        Object.keys(routers.find((router) => router.id === "pipeline")?.stages ?? {}),
+        [],
+    );
     assert.deepEqual(Object.keys(fast?.stages ?? {}), ["builder"]);
     assert.deepEqual(
         namedStages("`a` `planner` `planner`", [{ name: "planner", instructions: "" }]),
@@ -168,9 +174,20 @@ test("a router from the editor is checked, saved, takes a detected one's place, 
     const guest = app.config.addUser("Router guest", "guest").user;
 
     assert.throws(() => app.saveRouter(guest, { id: "x" }), { status: 403 });
+    // A prompt file outside the router prompt folders is refused.
+    assert.throws(
+        () =>
+            app.saveRouter(owner(app), {
+                id: "leak",
+                model: "faux/faux-1",
+                promptFile: join(dataDir, "agents", "planner.md"),
+                stages: {},
+            }),
+        { status: 400 },
+    );
 
     const over = app.saveRouter(owner(app), {
-        id: "router-main",
+        id: "router",
         label: "Main, edited",
         model: "faux/faux-1",
         prompt: "You are EDITEDMAIN.",
@@ -178,13 +195,10 @@ test("a router from the editor is checked, saved, takes a detected one's place, 
     });
 
     assert.equal(over.overrides, true);
-    assert.equal(
-        app.routers().find((router) => router.id === "router-main")?.label,
-        "Main, edited",
-    );
-    app.deleteRouter(owner(app), "router-main");
-    assert.equal(app.routers().find((router) => router.id === "router-main")?.source, "detected");
-    assert.throws(() => app.deleteRouter(owner(app), "router-main"), { status: 404 });
+    assert.equal(app.routers().find((router) => router.id === "router")?.label, "Main, edited");
+    app.deleteRouter(owner(app), "router");
+    assert.equal(app.routers().find((router) => router.id === "router")?.source, "detected");
+    assert.throws(() => app.deleteRouter(owner(app), "router"), { status: 404 });
 });
 
 test("a session running as a router gets its model and prompt, and its stages run on the router's models", async () => {

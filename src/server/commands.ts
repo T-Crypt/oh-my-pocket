@@ -1405,16 +1405,10 @@ export class Commands {
             throw new HttpError(404, `No router named ${String(router)}`);
         }
 
-        if (chosen !== undefined) {
-            const slash = chosen.model.indexOf("/");
+        // A router with no model here (a detected one whose model this machine does not serve) keeps the session's.
+        const slash = chosen?.model.indexOf("/") ?? -1;
 
-            if (slash < 1) {
-                throw new HttpError(
-                    409,
-                    `Router ${chosen.id} has no model Pi can use: give it one in the router editor.`,
-                );
-            }
-
+        if (chosen !== undefined && slash > 0) {
             await this.configure(id, user, {
                 model: {
                     provider: chosen.model.slice(0, slash),

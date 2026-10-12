@@ -35,7 +35,7 @@ Use a template for a message people send often; use a skill for steps Pi should 
 
 ## Routers: pipelines of stage roles
 
-A router (`~/.pi-pocket/routers/<id>.json`, made in the router editor: the rail's Routers button) is a prompt, the model a session runs on, and a map from stage role (an agent definition's name) to the model that stage runs on. A session running as a router gets the prompt with every message, and a role it spawns runs on the router's model and thinking level for it (`stages`, `stageThinking`), not its definition's. Router prompts that harnesses render (`~/.pi-pocket/hq/ROUTER*.md`, `~/.omp/agent/router/ROUTER*.md`) are detected and listed; their stages are the agent definitions the prompt names in backticks.
+A router (`~/.pi-pocket/routers/<id>.json`, made in the router editor: the rail's Routers button) is a prompt, the model a session runs on, and a map from stage role (an agent definition's name) to the model that stage runs on. A session running as a router gets the prompt with every message, and a role it spawns runs on the router's model and thinking level for it (`stages`, `stageThinking`), not its definition's. Router prompts that harnesses render (`~/.pi-pocket/routers/*.md`, `~/.omp/agent/router/ROUTER*.md`, and the built-in pipeline) are detected and listed; their stages are the agent definitions the prompt names in backticks.
 
 ## Agent definitions: roles a subagent starts as
 

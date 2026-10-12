@@ -92,6 +92,7 @@ import {
     allRouters,
     checkRouter,
     deleteRouter,
+    promptPlaces,
     promptOf,
     type RouterConfig,
     saveRouter,
@@ -2438,7 +2439,12 @@ export class PocketApp {
         let router: RouterConfig;
 
         try {
-            router = checkRouter(input, (spec) => this.resolveModelSpec(spec), THINKING_LEVELS);
+            router = checkRouter(
+                input,
+                (spec) => this.resolveModelSpec(spec),
+                THINKING_LEVELS,
+                promptPlaces(this.dataDir, this.#home),
+            );
         } catch (error) {
             throw new HttpError(400, describe(error));
         }

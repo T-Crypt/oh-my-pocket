@@ -136,7 +136,9 @@ async function go(args: Record<string, unknown>) {
 
 test("definitions parse: front matter optional, tools as a list, the body as instructions", () => {
     assert.deepEqual(
-        listAgents(dataDir).map((agent) => agent.name),
+        listAgents(dataDir)
+            .filter((agent) => agent.builtIn !== true)
+            .map((agent) => agent.name),
         ["odd", "plain", "reviewer"],
     );
     assert.deepEqual(loadAgent(dataDir, "reviewer"), {
@@ -152,7 +154,10 @@ test("definitions parse: front matter optional, tools as a list, the body as ins
         instructions: "Just a role, no front matter.",
     });
     assert.throws(() => loadAgent(dataDir, "../reviewer"), /Available: odd, plain, reviewer/);
-    assert.deepEqual(listAgents(join(root, "no-such-folder")), []);
+    assert.deepEqual(
+        listAgents(join(root, "no-such-folder")).filter((agent) => agent.builtIn !== true),
+        [],
+    );
 });
 
 test("a subagent spawned as a definition gets its role, model, and tools", async () => {
