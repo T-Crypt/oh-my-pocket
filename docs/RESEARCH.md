@@ -14,11 +14,11 @@ names the A/B that would decide it.
 
 **Evidence tiers**, marked on every claim:
 
-| Tier | Means |
-|---|---|
-| **measured** | A number from a named benchmark or run, with the harness/model named. |
-| **vendor** | The project's own claim. Directional, not independent. |
-| **unverified** | Design reasoning only, no number. |
+| Tier           | Means                                                                 |
+| -------------- | --------------------------------------------------------------------- |
+| **measured**   | A number from a named benchmark or run, with the harness/model named. |
+| **vendor**     | The project's own claim. Directional, not independent.                |
+| **unverified** | Design reasoning only, no number.                                     |
 
 **The harness is a pairing, not a winner.** Harness-Bench measured a rank correlation of about
 **-0.05** between harness rankings on different models: the best harness for one model says almost
@@ -39,33 +39,33 @@ Stars captured 2026-10-11 from the best-of-Agent-Harnesses index (a curated list
 The rows are the ones that matter to a local-model harness: Pi and its forks, the terminal agents,
 the always-on runtimes, and the two harnesses whose design facts we already borrow from.
 
-| Harness | Stars | License | Autonomy | Recovery | What people value it for |
-|---|---|---|---|---|---|
-| [opencode](https://github.com/anomalyco/opencode) | 213k | MIT | headless | resumable | Biggest community; 75+ providers, local included; client/server split. Replaced our CT 303. |
-| [Codex](https://github.com/openai/codex) | 129k | Apache-2.0 | bounded | resumable | Sandboxed execution as the default posture. |
-| [pi](https://github.com/earendil-works/pi) | 114k | unclear | bounded | resumable | The upstream toolkit behind Pi Pocket and oh-my-pi: one multi-provider API, agent loop, TUI. |
-| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | 107k | Apache-2.0 | bounded | resumable | Generous free tier; Qwen Code forks its loop for open-weight models. |
-| [OpenHands](https://github.com/OpenHands/OpenHands) | 90.6k | multi | headless | resumable | Dockerized SWE agent; the self-host reference. |
-| [Cline](https://github.com/cline/cline) | 70.2k | Apache-2.0 | step-gated | resumable | Plan-then-act with per-step approval and cost transparency. |
-| [goose](https://github.com/aaif-goose/goose) | 55.2k | Apache-2.0 | headless | resumable | Linux Foundation; MCP/ACP extension model with recipes. |
-| [oh-my-pi](https://github.com/can1357/oh-my-pi) | 35k | MIT | bounded | resumable | The fork we mine: hash-anchored edits, per-model tool loop, LSP/DAP, AST edits, subagents. |
-| [crush](https://github.com/charmbracelet/crush) | 28.6k | FSL-1.1-MIT | bounded | resumable | Session persistence and the nicest terminal UI. |
-| [qwen-code](https://github.com/QwenLM/qwen-code) | 28.4k | unclear | bounded | resumable | Gemini CLI's loop retuned for Qwen — closest upstream to our models. |
-| [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 21.9k | Apache-2.0 | headless | resumable | Self-improving harness; 95.5% on ARC-AGI-3 with Opus 5. Budgets, REPL, programmatic subagents. |
-| [Hermes](https://github.com/NousResearch/hermes-agent) | 253k | Apache-2.0 | headless | resumable | Self-improving, checkpoints to disk with rollback; lean. |
-| [OpenClaw](https://github.com/openclaw/openclaw) | 392k | Apache-2.0 | headless | resumable | The always-on personal agent; one input queue for messages, crons, webhooks. |
-| [QM](https://github.com/yc-software/qm) | 15.4k | Apache-2.0 | headless | durable | YC's: three core tools, scoped memory, Postgres-backed durable sandbox. |
-| [OpenJarvis](https://github.com/open-jarvis/OpenJarvis) | 11k | Apache-2.0 | headless | none | Local-first; evals that count energy, latency, and dollars. |
+| Harness                                                         | Stars | License     | Autonomy   | Recovery  | What people value it for                                                                       |
+| --------------------------------------------------------------- | ----- | ----------- | ---------- | --------- | ---------------------------------------------------------------------------------------------- |
+| [opencode](https://github.com/anomalyco/opencode)               | 213k  | MIT         | headless   | resumable | Biggest community; 75+ providers, local included; client/server split. Replaced our CT 303.    |
+| [Codex](https://github.com/openai/codex)                        | 129k  | Apache-2.0  | bounded    | resumable | Sandboxed execution as the default posture.                                                    |
+| [pi](https://github.com/earendil-works/pi)                      | 114k  | unclear     | bounded    | resumable | The upstream toolkit behind Pi Pocket and oh-my-pi: one multi-provider API, agent loop, TUI.   |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli)       | 107k  | Apache-2.0  | bounded    | resumable | Generous free tier; Qwen Code forks its loop for open-weight models.                           |
+| [OpenHands](https://github.com/OpenHands/OpenHands)             | 90.6k | multi       | headless   | resumable | Dockerized SWE agent; the self-host reference.                                                 |
+| [Cline](https://github.com/cline/cline)                         | 70.2k | Apache-2.0  | step-gated | resumable | Plan-then-act with per-step approval and cost transparency.                                    |
+| [goose](https://github.com/aaif-goose/goose)                    | 55.2k | Apache-2.0  | headless   | resumable | Linux Foundation; MCP/ACP extension model with recipes.                                        |
+| [oh-my-pi](https://github.com/can1357/oh-my-pi)                 | 35k   | MIT         | bounded    | resumable | The fork we mine: hash-anchored edits, per-model tool loop, LSP/DAP, AST edits, subagents.     |
+| [crush](https://github.com/charmbracelet/crush)                 | 28.6k | FSL-1.1-MIT | bounded    | resumable | Session persistence and the nicest terminal UI.                                                |
+| [qwen-code](https://github.com/QwenLM/qwen-code)                | 28.4k | unclear     | bounded    | resumable | Gemini CLI's loop retuned for Qwen — closest upstream to our models.                           |
+| [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent) | 21.9k | Apache-2.0  | headless   | resumable | Self-improving harness; 95.5% on ARC-AGI-3 with Opus 5. Budgets, REPL, programmatic subagents. |
+| [Hermes](https://github.com/NousResearch/hermes-agent)          | 253k  | Apache-2.0  | headless   | resumable | Self-improving, checkpoints to disk with rollback; lean.                                       |
+| [OpenClaw](https://github.com/openclaw/openclaw)                | 392k  | Apache-2.0  | headless   | resumable | The always-on personal agent; one input queue for messages, crons, webhooks.                   |
+| [QM](https://github.com/yc-software/qm)                         | 15.4k | Apache-2.0  | headless   | durable   | YC's: three core tools, scoped memory, Postgres-backed durable sandbox.                        |
+| [OpenJarvis](https://github.com/open-jarvis/OpenJarvis)         | 11k   | Apache-2.0  | headless   | none      | Local-first; evals that count energy, latency, and dollars.                                    |
 
 **Why the harness matters more than the model** (the evidence people quote, all **measured**):
 
-| Finding | Number | Source |
-|---|---|---|
-| Bare model vs harness, same weights, ARC-AGI-3 | ~30% → **95.5%** (Opus 5, Prime Agent) | [arXiv:2608.23552](https://arxiv.org/abs/2608.23552) |
-| Harness-only swap, SWE-bench Pro | GLM-5.2 **23% → 52%**; Gemma 4 26B **15% → 36%** | [@joelniklaus](https://x.com/joelniklaus/status/2085725862142623875) |
-| Same model, two harnesses (Cursor's benchmark) | **46% vs 80%** | [MindStudio](https://www.mindstudio.ai/blog/agent-harness-scaffolding-matters-more-than-model) |
-| Rank correlation across models | **≈ -0.05** (rankings do not transfer) | [arXiv:2605.27922](https://arxiv.org/abs/2605.27922) |
-| Harness search vs hand design | **+7.7 pts**, **4× fewer** context tokens | [arXiv:2603.28052](https://arxiv.org/abs/2603.28052) |
+| Finding                                        | Number                                           | Source                                                                                         |
+| ---------------------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| Bare model vs harness, same weights, ARC-AGI-3 | ~30% → **95.5%** (Opus 5, Prime Agent)           | [arXiv:2608.23552](https://arxiv.org/abs/2608.23552)                                           |
+| Harness-only swap, SWE-bench Pro               | GLM-5.2 **23% → 52%**; Gemma 4 26B **15% → 36%** | [@joelniklaus](https://x.com/joelniklaus/status/2085725862142623875)                           |
+| Same model, two harnesses (Cursor's benchmark) | **46% vs 80%**                                   | [MindStudio](https://www.mindstudio.ai/blog/agent-harness-scaffolding-matters-more-than-model) |
+| Rank correlation across models                 | **≈ -0.05** (rankings do not transfer)           | [arXiv:2605.27922](https://arxiv.org/abs/2605.27922)                                           |
+| Harness search vs hand design                  | **+7.7 pts**, **4× fewer** context tokens        | [arXiv:2603.28052](https://arxiv.org/abs/2603.28052)                                           |
 
 The two lessons that matter here: **expose what the model cannot do for itself** (compaction, a
 persistent REPL, programmatic subagents) and **drop imposed procedure** the model now runs on its
@@ -79,12 +79,12 @@ own (fixed plan-act-critique loops). The right amount of harness shrinks as mode
 needed. Bloat enters through three doors — instructions, tool schemas, and tool output — and each
 has a fix.
 
-| Layer | Loaded | Guards | Scales by |
-|---|---|---|---|
-| `AGENTS.md` | every session | instructions | nesting (one file per directory) |
-| `CLAUDE.md` | every session (Claude-only) | instructions | global/project/local files stack |
-| Skills (`SKILL.md`) | when the task matches | instructions | adding skills is nearly free until triggered |
-| MCP tool search | when the agent searches | tool schemas | automatically |
+| Layer               | Loaded                      | Guards       | Scales by                                    |
+| ------------------- | --------------------------- | ------------ | -------------------------------------------- |
+| `AGENTS.md`         | every session               | instructions | nesting (one file per directory)             |
+| `CLAUDE.md`         | every session (Claude-only) | instructions | global/project/local files stack             |
+| Skills (`SKILL.md`) | when the task matches       | instructions | adding skills is nearly free until triggered |
+| MCP tool search     | when the agent searches     | tool schemas | automatically                                |
 
 Built-in tool search (shipped in Claude Code, January 2026) is the platform absorbing this
 category: Anthropic claims **~85% fewer tool-definition tokens** (**vendor**). Our own move is the
@@ -162,7 +162,7 @@ The field has converged on one shape, getting progressively more careful:
 - The API's server-side strategy `compact_20260112` defaults to a **150,000-token** trigger with a
   **50,000-token** minimum, and can `pause_after_compaction`.
 - Reported failure mode (**measured**, field reports): auto-compact firing when it should not
-  (e.g. at session start) and leaving *less* usable context than before. The fix is a real
+  (e.g. at session start) and leaving _less_ usable context than before. The fix is a real
   threshold, not compaction on a hair-trigger.
 
 **DeepSeek Harness (DSH)** — **unverified** design, from its `AGENTS.md` and package map:
@@ -207,13 +207,13 @@ eating the window before compaction ever runs.
 
 ### Edit formats
 
-| Format | One line | Evidence | For local Qwen |
-|---|---|---|---|
-| Search/replace (Pi's `edit`) | exact old→new blocks, layered fuzzy matching | Aider: format swung GPT-4 Turbo **26%→59%**; helped decide whole-file for 3.5, diff for 4 | Current default; keep |
-| Whole-file rewrite | model re-emits the file | Cursor: better for files **under 400 lines** | Too expensive here |
-| `apply_patch` (OpenAI diff blob) | strict freeform diff | Failure **50.7%** (Grok 4), **46.2%** (GLM-4.7) | Avoid |
-| Hashline / content-hash anchors | model cites line hashes; stale rejects | **6.7%→68.3%** on Grok Code Fast 1, **+15 pts** avg over patch (16 models), **−61%** output tokens | A/B before porting |
-| 4-char tokenizer-friendly anchors | anchors not content-derived | Explicit Edit Benchmark **99.3%** (226 tasks) | Same caveat |
+| Format                            | One line                                     | Evidence                                                                                           | For local Qwen        |
+| --------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------- | --------------------- |
+| Search/replace (Pi's `edit`)      | exact old→new blocks, layered fuzzy matching | Aider: format swung GPT-4 Turbo **26%→59%**; helped decide whole-file for 3.5, diff for 4          | Current default; keep |
+| Whole-file rewrite                | model re-emits the file                      | Cursor: better for files **under 400 lines**                                                       | Too expensive here    |
+| `apply_patch` (OpenAI diff blob)  | strict freeform diff                         | Failure **50.7%** (Grok 4), **46.2%** (GLM-4.7)                                                    | Avoid                 |
+| Hashline / content-hash anchors   | model cites line hashes; stale rejects       | **6.7%→68.3%** on Grok Code Fast 1, **+15 pts** avg over patch (16 models), **−61%** output tokens | A/B before porting    |
+| 4-char tokenizer-friendly anchors | anchors not content-derived                  | Explicit Edit Benchmark **99.3%** (226 tasks)                                                      | Same caveat           |
 
 **The honest caveat** (from the prior verification pass): the big hashline numbers are
 **vs `apply_patch`**, not vs search/replace. Against replace, hashline's long-standing comparison
@@ -275,8 +275,8 @@ reports it would try to fix (**all unverified**).
 Our version is already pointer-based (roles.yaml: "context passed as FILE POINTERS (plan.md,
 review.md)"), plus agent definitions and `wait: true` to keep one stage resident.
 
-**The cheapest measured loop fix.** Adding one line — *"NEVER repeat the same failing tool call more
-than once. If it failed, change your approach…"* — took a local qwen3:14b from **~30,000 tokens /
+**The cheapest measured loop fix.** Adding one line — _"NEVER repeat the same failing tool call more
+than once. If it failed, change your approach…"_ — took a local qwen3:14b from **~30,000 tokens /
 10+ calls / <20% tool success / task failed** to **8,946 tokens / 3 calls / 100% success / task
 completed** (**measured**, dev.to local-LLM test). A deterministic guard is the same idea enforced
 by the runtime: DSH ships `guard/`; OMP aborts a stream mid-token on a regex and injects a
@@ -304,32 +304,32 @@ context 19,395 → 13,133 tokens`).
 
 These are not features to port; they are setup audits worth running, each with a number and a script:
 
-| Skill | What it gives you |
-|---|---|
-| `harness-test-drive` | Runs agents on tasks from your own git history, scored by your own tests: pass rate, minutes, cost. |
-| `agents-md-checker` | Which instruction files each agent loads, what gets cut, whether the commands still work. |
-| `tool-design-checker` | Grades each MCP tool the way a model reads it; token load per server; colliding tools. |
-| `sandbox-check` | What the agent can reach (secrets, hooks, Docker, sudo, network) vs what settings claim. |
-| `guardrail-tester` | How many of ~90 dangerous commands your rules block vs only ask. |
-| `runaway-guard` | Stops a live session on repeat calls, repeated failure, or a dollar cap. |
-| `claim-check` | How often the agent claimed tests passed without a passing run; whether tests were weakened. |
-| `rules-to-guards` | Finds the AGENTS.md rules your agent breaks and turns each into a tested hook. |
-| `session-waste-report` | Where tokens go: re-reads, huge tool outputs, polling, cache-expiring pauses. |
-| `regression-finder` | Splits sessions by version/model/week and finds where behaviour changed. |
+| Skill                  | What it gives you                                                                                   |
+| ---------------------- | --------------------------------------------------------------------------------------------------- |
+| `harness-test-drive`   | Runs agents on tasks from your own git history, scored by your own tests: pass rate, minutes, cost. |
+| `agents-md-checker`    | Which instruction files each agent loads, what gets cut, whether the commands still work.           |
+| `tool-design-checker`  | Grades each MCP tool the way a model reads it; token load per server; colliding tools.              |
+| `sandbox-check`        | What the agent can reach (secrets, hooks, Docker, sudo, network) vs what settings claim.            |
+| `guardrail-tester`     | How many of ~90 dangerous commands your rules block vs only ask.                                    |
+| `runaway-guard`        | Stops a live session on repeat calls, repeated failure, or a dollar cap.                            |
+| `claim-check`          | How often the agent claimed tests passed without a passing run; whether tests were weakened.        |
+| `rules-to-guards`      | Finds the AGENTS.md rules your agent breaks and turns each into a tested hook.                      |
+| `session-waste-report` | Where tokens go: re-reads, huge tool outputs, polling, cache-expiring pauses.                       |
+| `regression-finder`    | Splits sessions by version/model/week and finds where behaviour changed.                            |
 
 Install one with `npx skills add <repo>/tree/main/skills/<name>`, or point the best-of MCP server's
 `get_skill` at it.
 
 ### Skill packs people like
 
-| Pack | Stars | What it is |
-|---|---|---|
-| [superpowers](https://github.com/obra/superpowers) | 298k | Performance-oriented harness pack for Claude Code + 13 others: skills, instincts, memory, security, research-first workflows. |
-| [Anthropic Skills](https://github.com/anthropics/skills) | 180k | The reference for `SKILL.md` progressive disclosure. |
-| [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills) | 105k | 24 senior-dev workflow skills across 70+ agents. |
-| [wshobson/agents](https://github.com/wshobson/agents) | 40.4k | Cross-harness marketplace of drop-in subagents and skills. |
-| [planning-with-files](https://github.com/OthmanAdi/planning-with-files) | 27.4k | Crash-proof markdown plans, recovery after `/clear`/compaction, a deterministic completion gate. |
-| [get-shit-done](https://github.com/open-gsd/gsd-core) | 10.4k | Goal-backward planning over fresh context windows; avoids context rot by design. |
+| Pack                                                                    | Stars | What it is                                                                                                                    |
+| ----------------------------------------------------------------------- | ----- | ----------------------------------------------------------------------------------------------------------------------------- |
+| [superpowers](https://github.com/obra/superpowers)                      | 298k  | Performance-oriented harness pack for Claude Code + 13 others: skills, instincts, memory, security, research-first workflows. |
+| [Anthropic Skills](https://github.com/anthropics/skills)                | 180k  | The reference for `SKILL.md` progressive disclosure.                                                                          |
+| [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills)   | 105k  | 24 senior-dev workflow skills across 70+ agents.                                                                              |
+| [wshobson/agents](https://github.com/wshobson/agents)                   | 40.4k | Cross-harness marketplace of drop-in subagents and skills.                                                                    |
+| [planning-with-files](https://github.com/OthmanAdi/planning-with-files) | 27.4k | Crash-proof markdown plans, recovery after `/clear`/compaction, a deterministic completion gate.                              |
+| [get-shit-done](https://github.com/open-gsd/gsd-core)                   | 10.4k | Goal-backward planning over fresh context windows; avoids context rot by design.                                              |
 
 **Pitfalls (measured for OMP):** auto-discovering a whole `~/.claude` or `~/.agents` skill library
 is context bloat; OMP users explicitly disable `enableClaudeUser`, and our OMP config sets
@@ -368,19 +368,19 @@ tune, with evals as the signal (LangChain's "better harness" recipe: hill-climb 
 Effort: **S** = config/wiring only, **M** = small extension, **L** = new subsystem. Status: **next**
 = already on the README "Next", **new** = not yet written down.
 
-| # | Change | Effort | Status | Evidence | Where it lands |
-|---|---|---|---|---|---|
-| 1 | **Deterministic tool-output pruner at compaction** — mask old observations to placeholders, keep the last M in full; summarise only if still over | S | next | masking halves cost, equal/better solve (**measured**) | compaction setting + `session_before_compact` hook |
-| 2 | **Loop guard + no-repeat line + lenient tool-JSON repair** | S | new | 30K→8.9K tokens, <20%→100% success (**measured**) | `_rules.md` + a `beforeTool` hook |
-| 3 | **Lower default `read` limit with a structural summary; supersede stale reads; drop useless turns pre-compaction** | S/M | next | ast-grep outline −35–55% (**measured**); 2–10× smaller reads (**unverified**) | `read` wrapper + compaction hook |
-| 4 | **KV-prefix discipline**: byte-stable system prompt, append-only, volatile data last, one model per run | S | new (mostly holds) | 85% vs 0% cache hit; 15k–25k re-prefill from one field (**measured**) | prompt sections / router recipe |
-| 5 | **Per-stage thinking budget verified on NInfer** | S | new | 60–90% thinking-token cut (**vendor**) | roles.yaml (already set) + verify token |
-| 6 | **Context meter: per-section attribution across an A/B** (name the row a change touched, before/after) | S/M | partially built | DSH `contextBreakdown` (**unverified**); meter exists (**measured**) | `context-meter.ts` + `/context` UI |
-| 7 | **Handoff hygiene**: child gets file pointers + a typed result schema; brief/plan/review are the only injected artifacts | S | new (mostly holds) | DSH cold-start; Anthropic condensed-summary guidance (**unverified**) | agent definitions + subagent tool |
-| 8 | **`pi-readcache`-style repeat-read suppression / DSH-style spill of huge outputs** | M | new | no number (**unverified**); targets re-read cost | `read`/`bash` wrappers |
-| 9 | **Hash-anchored edits** — A/B only, do not port blind | M | new | vs replace: −1.7 to +11.3 pts incl. Qwen Turbo −1.7 (**measured**) | `edit` wrapper |
-| 10 | **LSP diagnostics after edits** (diagnostics only) | M | new | LSP never missed, helps weaker models most; one N=1 inconclusive (**mixed**) | `afterTool` hook, optional |
-| 11 | **N-gram / lookup speculative decoding** (draft model only if VRAM allows) | S | new | 1.5–3× (**vendor**); competes for VRAM | llama-swap config (not the harness) |
+| #   | Change                                                                                                                                            | Effort | Status             | Evidence                                                                      | Where it lands                                     |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------ | ----------------------------------------------------------------------------- | -------------------------------------------------- |
+| 1   | **Deterministic tool-output pruner at compaction** — mask old observations to placeholders, keep the last M in full; summarise only if still over | S      | next               | masking halves cost, equal/better solve (**measured**)                        | compaction setting + `session_before_compact` hook |
+| 2   | **Loop guard + no-repeat line + lenient tool-JSON repair**                                                                                        | S      | new                | 30K→8.9K tokens, <20%→100% success (**measured**)                             | `_rules.md` + a `beforeTool` hook                  |
+| 3   | **Lower default `read` limit with a structural summary; supersede stale reads; drop useless turns pre-compaction**                                | S/M    | next               | ast-grep outline −35–55% (**measured**); 2–10× smaller reads (**unverified**) | `read` wrapper + compaction hook                   |
+| 4   | **KV-prefix discipline**: byte-stable system prompt, append-only, volatile data last, one model per run                                           | S      | new (mostly holds) | 85% vs 0% cache hit; 15k–25k re-prefill from one field (**measured**)         | prompt sections / router recipe                    |
+| 5   | **Per-stage thinking budget verified on NInfer**                                                                                                  | S      | new                | 60–90% thinking-token cut (**vendor**)                                        | roles.yaml (already set) + verify token            |
+| 6   | **Context meter: per-section attribution across an A/B** (name the row a change touched, before/after)                                            | S/M    | partially built    | DSH `contextBreakdown` (**unverified**); meter exists (**measured**)          | `context-meter.ts` + `/context` UI                 |
+| 7   | **Handoff hygiene**: child gets file pointers + a typed result schema; brief/plan/review are the only injected artifacts                          | S      | new (mostly holds) | DSH cold-start; Anthropic condensed-summary guidance (**unverified**)         | agent definitions + subagent tool                  |
+| 8   | **`pi-readcache`-style repeat-read suppression / DSH-style spill of huge outputs**                                                                | M      | new                | no number (**unverified**); targets re-read cost                              | `read`/`bash` wrappers                             |
+| 9   | **Hash-anchored edits** — A/B only, do not port blind                                                                                             | M      | new                | vs replace: −1.7 to +11.3 pts incl. Qwen Turbo −1.7 (**measured**)            | `edit` wrapper                                     |
+| 10  | **LSP diagnostics after edits** (diagnostics only)                                                                                                | M      | new                | LSP never missed, helps weaker models most; one N=1 inconclusive (**mixed**)  | `afterTool` hook, optional                         |
+| 11  | **N-gram / lookup speculative decoding** (draft model only if VRAM allows)                                                                        | S      | new                | 1.5–3× (**vendor**); competes for VRAM                                        | llama-swap config (not the harness)                |
 
 ### Notes on the top items
 
