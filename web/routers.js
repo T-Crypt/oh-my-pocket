@@ -422,7 +422,7 @@ export function RouterEditor() {
                                             },
                                         })}
                                 >
-                                    <option value="">thinking: as its definition</option>
+                                    <option value="">role's thinking</option>
                                     ${(data?.thinkingLevels ?? []).map(
                                         (level) => html`<option value=${level} key=${level}>
                                             ${level}
