@@ -22,8 +22,8 @@ test("a closing tag loses its <, whatever stands between it and the /", () => {
 test("a closing tag loses its < behind every category of invisible character the class names", () => {
     // One representative per category, 81 of them, so the 80-character branch cannot defang it and only the class
     // can: a control character, a format character, a lone surrogate, a private-use character, an unassigned code
-    // point, a variation selector supplement, the braille blank, the Hangul fillers, and the combining grapheme
-    // joiner. Narrowing the class fails here.
+    // point, a variation selector and its supplement, the braille blank, three Hangul fillers, the combining
+    // grapheme joiner, a Khmer inherent vowel, and a Mongolian free variation selector. Narrowing the class fails.
     const hides = (character: string, what: string) => {
         const invisible = character.repeat(81);
 
@@ -40,6 +40,10 @@ test("a closing tag loses its < behind every category of invisible character the
     hides("\u3164", "the Hangul filler");
     hides("\uFFA0", "the halfwidth Hangul filler");
     hides("\u034F", "the combining grapheme joiner");
+    hides("\uFE00", "a variation selector");
+    hides("\u115F", "the Hangul choseong filler");
+    hides("\u17B4", "a Khmer inherent vowel");
+    hides("\u180B", "a Mongolian free variation selector");
 });
 
 test("a closing tag with more than 80 characters between < and / is defanged only by the invisible run", () => {
