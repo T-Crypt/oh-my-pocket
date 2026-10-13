@@ -571,6 +571,12 @@ function PeekApproval({ approval, me, rule, whole }) {
  */
 class PeekTile extends Component {
     state = { clipped: false };
+    /**
+     * The tile's own element, taken in the render. Preact gives a component no node of its own, so
+     * `measure` cannot read one off the component.
+     * @type {Element | null}
+     */
+    root = null;
 
     shouldComponentUpdate(next, state) {
         return (
@@ -589,18 +595,19 @@ class PeekTile extends Component {
 
     /** Whether the command waiting on this tile is cut off anywhere, by a clamp or by the tile's edge. */
     measure() {
-        const what = this.base?.querySelector(".peek-ask-what");
+        const tile = this.root;
+        const what = tile?.querySelector(".peek-ask-what");
         let clipped = false;
 
-        if (what) {
+        if (tile && what) {
             const box = what.getBoundingClientRect();
-            const tile = this.base.getBoundingClientRect();
+            const edge = tile.getBoundingClientRect();
 
             clipped =
                 what.scrollHeight > what.clientHeight + 1 ||
                 what.scrollWidth > what.clientWidth + 1 ||
-                box.bottom > tile.bottom + 1 ||
-                box.right > tile.right + 1;
+                box.bottom > edge.bottom + 1 ||
+                box.right > edge.right + 1;
         }
 
         if (clipped !== this.state.clipped) {
@@ -622,7 +629,16 @@ class PeekTile extends Component {
                   ? html`<span class="mini-sweep"><i></i><i></i><i></i></span>`
                   : html`<span class="state-idle"></span>`;
 
-        return html`<div class=${`peek ${status}`} data-peek=${session.id}>
+        return html`<div
+            class=${`peek ${status}`}
+            data-peek=${session.id}
+            ref=${
+                /** @param {Element | null} node */
+                (node) => {
+                    this.root = node;
+                }
+            }
+        >
             <button class="peek-head" title=${`Open ${title}`} onClick=${open}>
                 <span class="session-state">${mark}</span>
                 <span class="peek-name">
