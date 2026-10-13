@@ -253,6 +253,44 @@ test("a session running as a router gets its stages' prompt, and each stage its 
     await assert.rejects(app.commands.setRouter(id, owner(app), "ghost"), { status: 404 });
 });
 
+test("a router saved with a model moves the sessions running as it; picked again it sets the model again; it spawns only its stages", async () => {
+    // Picked while it had no model: the session keeps its own.
+    app.saveRouter(owner(app), { id: "late", label: "Late", pipeline: [stage("plan", "plan")] });
+    const id = await newSession(app);
+
+    await app.commands.configure(id, owner(app), {
+        model: { provider: "faux", modelId: "faux-1" },
+    });
+    await app.commands.setRouter(id, owner(app), "late");
+    assert.equal((await app.agentState(id))?.model?.modelId, "faux-1");
+
+    // Saved with a model: the session runs on it, and still as the router.
+    app.saveRouter(owner(app), {
+        id: "late",
+        label: "Late",
+        model: "faux/faux-think",
+        pipeline: [stage("plan", "plan")],
+    });
+    await app.commands.followRouter(owner(app), "late");
+    assert.equal((await app.agentState(id))?.model?.modelId, "faux-think");
+    assert.equal((await app.harness.snapshot(RouterDoc, id, context))?.router, "late");
+
+    // Picked again after the model moved off it: back on the router's model.
+    await app.commands.configure(id, owner(app), {
+        model: { provider: "faux", modelId: "faux-1" },
+    });
+    await app.commands.setRouter(id, owner(app), "late");
+    await app.commands.setRouter(id, owner(app), "late");
+    assert.equal((await app.agentState(id))?.model?.modelId, "faux-think");
+    assert.equal((await app.harness.snapshot(RouterDoc, id, context))?.router, "late");
+
+    // A role file that is not one of its stages is refused.
+    assert.match(
+        await go(id, "subagent", { action: "spawn", name: "x1", agent: "planner", message: "x" }),
+        /planner is not a stage of the router Late\. Its stages: plan/,
+    );
+});
+
 test("a detected router runs its prompt, its roles on their models; one with no model here keeps the session's", async () => {
     const id = await newSession(app);
 

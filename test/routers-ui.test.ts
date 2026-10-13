@@ -250,3 +250,50 @@ test("on a phone, the list and one router take the screen in turn", real, async 
     await until(async () => await shown(".routers-list"), "back to the list");
     assert.equal(await shown(".routers-form"), false);
 });
+
+test(
+    "on a phone, the model picker shows the routers first, and a router picked there is the one checked",
+    real,
+    async () => {
+        await app.commands.setRouter(id, owner(app), null);
+        await page.setViewport(VIEWPORTS.mobile);
+        await page.navigate(`${base}/s/${id}`);
+        await until(async () => await shown(".model-chip"), "the session", 20_000);
+
+        const openPicker = async () => {
+            await inPage<null>(`document.querySelector(".model-chip").click(); return "null"`);
+            await until(async () => await shown(".router-row"), "the picker's routers");
+        };
+
+        const checked = () =>
+            inPage<string[]>(
+                `return JSON.stringify([...document.querySelectorAll('.pop-menu-list [aria-selected="true"]')].map((row) => row.querySelector(".pop-menu-row-name").textContent))`,
+            );
+
+        await openPicker();
+        assert.equal(
+            await inPage<boolean>(
+                `const list = document.querySelector(".pop-menu-list"); const first = list.querySelector(".pop-menu-row"); return JSON.stringify(first?.classList.contains("router-row") === true)`,
+            ),
+            true,
+            "routers sit above the models",
+        );
+        await clickText(".router-row", "Standard");
+        await until(
+            async () => (await app.routerFor(id))?.id === "standard",
+            "the session's router",
+        );
+        await until(async () => !(await shown(".router-row")), "the picker closed");
+
+        // Standard has no model of its own here: the session keeps faux-1, but Standard is what is checked.
+        await openPicker();
+        assert.deepEqual(await checked(), ["Standard"]);
+        await shot("phone-picker-router");
+
+        // The same model picked as a plain model: the session is plain again.
+        await inPage<null>(
+            `[...document.querySelectorAll(".pop-menu-list .pop-menu-row:not(.router-row)")].find((row) => row.title.startsWith("faux/faux-1 "))?.click(); return "null"`,
+        );
+        await until(async () => (await app.routerFor(id)) === undefined, "no router");
+    },
+);
