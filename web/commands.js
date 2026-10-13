@@ -3,9 +3,20 @@ import { browserAvailable, openInBrowser, toggleBrowser } from "./browser.js";
 import { filesAvailable, toggleFiles } from "./files-panel.js";
 import { branchAvailable } from "./sheets/branch.js";
 import { memoryAvailable, remember } from "./sheets/memory.js";
+import { subagentsRequest } from "./sheets/subagents.js";
 import { togglePeeks } from "./peeks.js";
 import { askPip, openPip, pipAvailable } from "./pip.js";
-import { actions, collab, navigate, notify, openSheet, scoped, store } from "./store.js";
+import {
+    actions,
+    api,
+    attempt,
+    collab,
+    navigate,
+    notify,
+    openSheet,
+    scoped,
+    store,
+} from "./store.js";
 import { chooseTheme, THEMES } from "./theme.js";
 import { trustAvailable } from "./trust.js";
 import { copyText, formatTokens, formatWhen, modelLabel, replyText, shortPath } from "./ui.js";
@@ -217,6 +228,88 @@ function showSession() {
     notify("info", parts.join(" · "));
 }
 
+/** Where the context goes: each group's total and its largest rows, measured against the newest answer's prompt. With a baseline taken, the rows a change moved, before and after. */
+export async function showContext(arg) {
+    const id = store.state.view.conversation?.id;
+
+    if (id === undefined) {
+        return;
+    }
+
+    if (arg === "baseline") {
+        const taken = await attempt(() =>
+            api(`c/${id}/context/baseline`, undefined, { method: "POST" }),
+        );
+
+        if (taken !== undefined) {
+            notify(
+                "info",
+                `Context baseline taken: ${formatTokens(taken.tokens)} across ${taken.rows.length} rows`,
+            );
+        }
+
+        return;
+    }
+
+    if (arg === "clear") {
+        const cleared = await attempt(() =>
+            api(`c/${id}/context/baseline`, undefined, { method: "DELETE" }),
+        );
+
+        if (cleared !== undefined) {
+            notify("info", "Context baseline cleared");
+        }
+
+        return;
+    }
+
+    const meter = await attempt(() => api(`c/${id}/context`));
+
+    if (meter === undefined) {
+        return;
+    }
+
+    const lines = ["system", "tools", "history"].flatMap((group) => {
+        const rows = meter.rows
+            .filter((row) => row.group === group)
+            .sort((a, b) => b.tokens - a.tokens);
+        const total = rows.reduce((sum, row) => sum + row.tokens, 0);
+
+        return total === 0
+            ? []
+            : [
+                  `${group} ${formatTokens(total)}: ${rows
+                      .slice(0, 3)
+                      .map((row) => `${row.name} ${formatTokens(row.tokens)}`)
+                      .join(", ")}${rows.length > 3 ? `, +${rows.length - 3} more` : ""}`,
+              ];
+    });
+
+    // The rows that moved since the baseline, biggest moves first: where the change landed.
+    if (meter.baseline !== undefined && Array.isArray(meter.diff)) {
+        const moved = meter.diff.filter((row) => row.delta !== 0).slice(0, 8);
+
+        if (moved.length > 0) {
+            const total = moved.reduce((sum, row) => sum + row.delta, 0);
+
+            lines.push(
+                `vs baseline, ${new Date(meter.baseline.takenAt).toLocaleDateString()}: ${total >= 0 ? "+" : "\u2212"}${formatTokens(Math.abs(total))} across ${moved.length} rows`,
+            );
+
+            for (const row of moved) {
+                lines.push(
+                    `  ${row.name} ${formatTokens(row.baseline)} \u2192 ${formatTokens(row.tokens)} (${row.delta >= 0 ? "+" : "\u2212"}${formatTokens(Math.abs(row.delta))})`,
+                );
+            }
+        }
+    }
+
+    notify(
+        "info",
+        `${meter.measured ? "" : "~"}${formatTokens(meter.tokens)} in context\n${lines.join("\n")}`,
+    );
+}
+
 /** `args` in brackets is optional. `available` hides a command where it does not apply. */
 const COMMANDS = [
     {
@@ -240,6 +333,22 @@ const COMMANDS = [
             arg === "" ? openSheet({ type: "instructions" }) : actions.setInstructions(arg),
     },
     { name: "model", args: "[name]", description: "Switch the model", run: switchModel },
+    {
+        name: "subagents",
+        args: "[auto|own|local|provider/model…]",
+        description: "Which models this session's subagents may run on",
+        available: isSession,
+        run: async (arg) => {
+            if (arg === "") {
+                openSheet({ type: "subagents" });
+
+                return;
+            }
+
+            await actions.setSubagents(subagentsRequest(arg));
+            notify("info", `Subagents: ${arg.trim()}.`);
+        },
+    },
     { name: "thinking", args: "[level]", description: "Set the thinking level", run: setThinking },
     {
         name: "new",
@@ -350,6 +459,14 @@ const COMMANDS = [
         run: (arg) => openSheet({ type: "find", query: arg }),
     },
     { name: "session", description: "Show the model, context use, and cost", run: showSession },
+    {
+        name: "context",
+        args: "[baseline | clear]",
+        description:
+            "Show where the context goes: prompt sections, tools, and history; baseline takes a reference point to diff the next view against",
+        run: (arg) => showContext(arg || undefined),
+        available: isSession,
+    },
     {
         name: "export",
         description: "Download this conversation as Markdown",
@@ -482,15 +599,31 @@ export function parseTemplate(text) {
     return templates().find((template) => template.name === match[1]) ?? null;
 }
 
-/** Commands to offer while someone types a command name: "/" lists them all, then Pi's prompt templates and skills. */
-export function suggestCommands(text) {
-    const match = /^\/([\w:-]*)$/.exec(text);
+/**
+ * The slash command being typed at the caret, if any: a "/" at the start or after whitespace, with the word
+ * characters, colons, and hyphens after it. Paths like a/b and words like and/or stay out. Like an @mention
+ * (`mentionAt` in files.js),
+ * it works mid-text: "/review" at the start, or "ask pi to /skill" later in the message.
+ */
+export function slashAt(text, caret = text.length) {
+    const match = /(?:^|[\s([{])\/([\w:-]*)$/.exec(text.slice(0, caret));
 
     if (!match) {
+        return null;
+    }
+
+    return { start: caret - match[1].length - 1, prefix: match[1].toLowerCase() };
+}
+
+/** Commands to offer for the slash fragment at the caret: "/" lists them all, then Pi's prompt templates and skills. */
+export function suggestCommands(text, caret = text.length) {
+    const slash = slashAt(text, caret);
+
+    if (slash === null) {
         return [];
     }
 
-    const prefix = match[1].toLowerCase();
+    const { prefix } = slash;
     const own = available();
     const commands = [
         ...own,

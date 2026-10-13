@@ -33,15 +33,21 @@ A Markdown file in `~/.pi/agent/prompts/` (or a project's `.pi/prompts/`, unless
 
 Use a template for a message people send often; use a skill for steps Pi should know how to take.
 
+## Routers: stages a task runs through
+
+A router (made in the router editor, saved to `~/.pi-pocket/routers/<id>.json`) is the model a session runs on and its stages, in order (`pipeline`): each with an `id`, a `template` (plan, implement, review, fix, ship, custom), its `instructions`, the `skills` it reads first (installed skills, by name), and optionally a `model`, a `thinking` level, or a `role` (an agent definition run in its place). The router's prompt is written from its stages, plus `extra` if set. A session running as a router spawns each stage with `agent: <stage id>`. Router prompt files (`~/.pi-pocket/routers/*.md`, `~/.omp/agent/router/ROUTER*.md`) are listed read-only; their stages are the agent definitions the prompt names in backticks.
+
 ## Agent definitions: roles a subagent starts as
 
-A Markdown file in the data folder's `agents/` (`~/.pi-pocket/agents/reviewer.md`) is a role Pi can start a subagent as: `subagent` spawn with `agent: reviewer`. Simple `key: value` front matter (all optional) sets its `description`, `model` (`provider/modelId`), `thinking` level, and `tools` (comma-separated); the body is its instructions, after the subagent's own. Options given to the spawn win over the file's. Their names and descriptions are listed in Pi's prompt, and each spawn reads the file again, so an edit applies to the next one.
+A Markdown file in the data folder's `agents/` (`~/.pi-pocket/agents/reviewer.md`) is a role Pi can start a subagent as: `subagent` spawn with `agent: reviewer`. Simple `key: value` front matter (all optional) sets its `description`, `model` (`provider/modelId`), `thinking` level, and `tools` (comma-separated); the body is its instructions, after the subagent's own. Options given to the spawn win over the file's. Its `model` is used where the session allows it (`/subagents`: on auto, a model on the session's own provider); elsewhere the role runs on the session's model. Their names and descriptions are listed in Pi's prompt, and each spawn reads the file again, so an edit applies to the next one.
 
 Use one for a role with its own model or rules: a planner on a large model, a reviewer that only reads.
 
 ## Models and providers
 
 People sign in to providers from Menu → **Providers**, and pick a model per session from the model chip in the message box. Pi Pocket uses Pi's sign-ins (`~/.pi/agent/auth.json`) and Pi's model list: to add a model or a provider Pi does not know, follow Pi's `models.md` and `custom-provider.md`.
+
+Models are the person's to choose, never Pi's: a subagent runs on its session's model unless the session's person allows others with the Subagents chip or `/subagents`, or the owner allows them everywhere under **Models for subagents** at the top of the Providers sheet (none by default), and PiP passes a model only when its person named it. Instructions, skills, or `AGENTS.md` cannot widen that; tell the person where the setting is instead.
 
 ## Other switches people have
 

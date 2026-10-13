@@ -32,6 +32,8 @@ import {
     type Pin,
     PinsDoc,
     PlanDoc,
+    RouterDoc,
+    SubagentPolicyDoc,
     type PrWatch,
     ReactionsDoc,
     type Schedule,
@@ -45,6 +47,7 @@ import {
 } from "./docs.ts";
 import { SHELL_ENTRY } from "./entry-format.ts";
 import { agentInfo } from "./models.ts";
+import type { SubagentPolicy } from "./subagent-policy.ts";
 import {
     type ClientEntry,
     PEEK_LINES,
@@ -71,6 +74,8 @@ export const ROOM_DOCS = new Set(
         TurnsDoc,
         DecisionsDoc,
         PlanDoc,
+        SubagentPolicyDoc,
+        RouterDoc,
         ScheduleDoc,
         GoalDoc,
         WatchDoc,
@@ -170,9 +175,20 @@ export function reportingOf(
     );
 }
 
+/** Whether a subagent failed (not stopped), and a person dealt with that failure: the one it has now. */
+function failureDealtWith(record: SubagentRecord): boolean {
+    return (
+        record.failed === true &&
+        record.error !== STOPPED &&
+        record.dealtAt !== undefined &&
+        record.dealtAt === (record.answeredAt ?? 0)
+    );
+}
+
 /**
  * One subagent as the web app shows it, in its parent's subagents bar and on the subagents board: what it was asked and
- * when, whether it works, and how it ended (`stopped` is a `failed` that was stopped).
+ * when, whether it works, and how it ended (`stopped` is a `failed` that was stopped; `dealt`, a failure a person
+ * dealt with, which needs nobody now).
  */
 export function subagentView(
     name: string,
@@ -192,6 +208,7 @@ export function subagentView(
         ...(record.failed === true && record.error !== undefined && record.error !== STOPPED
             ? { error: record.error }
             : {}),
+        ...(failureDealtWith(record) ? { dealt: true } : {}),
         ...(reporting ? { reporting: true } : {}),
     };
 }
@@ -228,6 +245,8 @@ export class Room {
     turns: Turns = { on: false, asks: [] };
     decisions: Record<string, Decision> = {};
     plan: { on: boolean; by?: string; at?: number } = { on: false };
+    subagentPolicy: SubagentPolicy | undefined;
+    router: string | undefined;
     schedules: Record<string, Schedule> = {};
     goal: Goal | undefined;
     watch: PrWatch | undefined;
@@ -280,6 +299,8 @@ export class Room {
             ...((await harness.snapshot(DecisionsDoc, this.id, context))?.calls ?? {}),
         };
         this.plan = { ...((await harness.snapshot(PlanDoc, this.id, context)) ?? { on: false }) };
+        this.subagentPolicy = await harness.snapshot(SubagentPolicyDoc, this.id, context);
+        this.router = (await harness.snapshot(RouterDoc, this.id, context))?.router;
         this.schedules = {
             ...((await harness.snapshot(ScheduleDoc, this.id, context))?.items ?? {}),
         };
@@ -350,6 +371,10 @@ export class Room {
             this.decisions = { ...((value?.calls as Record<string, Decision>) ?? {}) };
         } else if (kind === PlanDoc.definition.kind) {
             this.plan = { on: false, ...((value as Room["plan"] | null) ?? {}) };
+        } else if (kind === RouterDoc.definition.kind) {
+            this.router = (value?.router as string | undefined) ?? undefined;
+        } else if (kind === SubagentPolicyDoc.definition.kind) {
+            this.subagentPolicy = (value as SubagentPolicy | null) ?? undefined;
         } else if (kind === ScheduleDoc.definition.kind) {
             this.schedules = { ...((value?.items as Record<string, Schedule>) ?? {}) };
         } else if (kind === GoalDoc.definition.kind) {
@@ -411,6 +436,16 @@ export class Room {
         }
 
         return projected;
+    }
+
+    /** The router this session runs as, as the message box shows it; null when it runs as none. */
+    #routerView(): { id: string; label: string } | null {
+        const router =
+            this.router === undefined
+                ? undefined
+                : this.#app.routers().find((each) => each.id === this.router);
+
+        return router === undefined ? null : { id: router.id, label: router.label };
     }
 
     /** Send this client what changed since its last update, or everything with `full`. */
@@ -483,6 +518,10 @@ export class Room {
             turns: this.turns,
             decisions: this.decisions,
             plan: this.plan,
+            // Which models its subagents may run on besides its own: the message box's chip.
+            subagentPolicy: this.#app.subagentsView(this.subagentPolicy, agentState.model),
+            // The router it runs as, for the message box's model chip: its id and label, or null.
+            router: this.#routerView(),
             schedules: Object.values(this.schedules)
                 .sort((a, b) => a.next - b.next)
                 .map(({ id, text, next, every, by, runs }) => ({
@@ -564,7 +603,12 @@ export class Room {
                           ...this.#app.attribution.submitterOf(item.id as unknown as number, this),
                       },
             ),
-            agent: agentInfo(this.#app.models, agentState, this.#app.defaultCwd),
+            agent: agentInfo(
+                this.#app.models,
+                agentState,
+                this.#app.defaultCwd,
+                this.#app.signInNeeded,
+            ),
             stats: projectStats(view.docs["pi.usage"] as UsageState | undefined, view.entries),
             clients: [...new Set([...this.clients].map((each) => each.id))].length,
             viewers: [...new Set([...this.clients].map((each) => each.user.name))],

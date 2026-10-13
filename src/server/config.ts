@@ -61,6 +61,11 @@ interface PocketConfig {
     lastModel?: ModelChoice;
     /** The model and thinking level new sessions start with, as the owner chose; absent: the last one picked. */
     defaultModel?: ModelChoice;
+    /**
+     * Which models each provider offers the pickers, by provider id: the ones the owner turned on. A provider that is
+     * absent shows every model it has; an empty list shows none of them.
+     */
+    visibleModels?: Record<string, string[]>;
     /** Extension modules (file names in `src/server/extensions/`) the owner turned off. */
     disabledExtensions?: string[];
     /** Extension modules the owner turned on. Matters for modules that are off by default, like Lancet Guard. */
@@ -69,6 +74,11 @@ interface PocketConfig {
     approvals?: ApprovalRule;
     /** The tokens of context above which PiP compacts itself once idle; 0: only as sessions do. Absent: the default. */
     pipCompactAt?: number;
+    /**
+     * The models (`provider/modelId`) Pi may start subagents on besides their session's own, as the owner allowed them.
+     * Absent or empty: none, and subagents always run on their session's model.
+     */
+    subagentModels?: string[];
 }
 
 /** Who may allow a risky tool call: anyone who can steer, or (for guests) only someone other than who asked. */
@@ -154,6 +164,37 @@ export class ConfigStore {
         this.save();
     }
 
+    /**
+     * What a provider offers the pickers: undefined when it shows every model it has, an empty list when it shows
+     * none of them.
+     */
+    visibleModels(provider: string): readonly string[] | undefined {
+        return this.#config.visibleModels?.[provider];
+    }
+
+    /** Whether the pickers offer a model: every model, unless the owner chose for its provider. */
+    showsModel(provider: string, id: string): boolean {
+        const shown = this.#config.visibleModels?.[provider];
+
+        return shown === undefined || shown.includes(id);
+    }
+
+    /** What a provider offers the pickers from now on: model ids, or null for every model it has. */
+    setVisibleModels(provider: string, models: readonly string[] | null): void {
+        if (models === null) {
+            delete this.#config.visibleModels?.[provider];
+
+            if (Object.keys(this.#config.visibleModels ?? {}).length === 0) {
+                delete this.#config.visibleModels;
+            }
+        } else {
+            this.#config.visibleModels ??= {};
+            this.#config.visibleModels[provider] = [...new Set(models)].sort();
+        }
+
+        this.save();
+    }
+
     /** The owner's choice of when PiP compacts itself (`pip-compact.ts`); undefined: its default. */
     get pipCompactAt(): number | undefined {
         return this.#config.pipCompactAt;
@@ -164,6 +205,24 @@ export class ConfigStore {
             delete this.#config.pipCompactAt;
         } else {
             this.#config.pipCompactAt = tokens;
+        }
+
+        this.save();
+    }
+
+    /** The models Pi may start subagents on besides their session's own (`provider/modelId`); empty: none. */
+    get subagentModels(): readonly string[] {
+        const models = this.#config.subagentModels;
+
+        // Read from a file people may have edited: only strings count.
+        return Array.isArray(models) ? models.filter((each) => typeof each === "string") : [];
+    }
+
+    set subagentModels(models: readonly string[]) {
+        if (models.length === 0) {
+            delete this.#config.subagentModels;
+        } else {
+            this.#config.subagentModels = [...models];
         }
 
         this.save();

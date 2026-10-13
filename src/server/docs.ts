@@ -14,6 +14,8 @@ import {
 } from "@earendil-works/pi-durable";
 import type { Repeat } from "./when.ts";
 import type { Worktree } from "./worktrees.ts";
+import type { ContextRow } from "./context-meter.ts";
+import type { SubagentPolicy } from "./subagent-policy.ts";
 
 export type SessionMeta = {
     title?: string;
@@ -111,10 +113,18 @@ export type SubagentRecord = {
     /** What the parent asked it last, the start of it, and when. */
     asked?: string;
     askedAt?: number;
-    /** When it last answered, or failed to (`failed`), what the parent asked; and why it failed, or that it was stopped. */
+    /**
+     * When it last answered, or failed to (`failed`), what the parent asked, or, once it failed, a person's own message to
+     * it; and why it failed, or that it was stopped.
+     */
     answeredAt?: number;
     failed?: boolean;
     error?: string;
+    /**
+     * The failure a person dealt with (seen, or dismissed), by its `answeredAt`: it needs nobody now. A later failure has
+     * a later time, so it needs them again.
+     */
+    dealtAt?: number;
 };
 
 /** A subagent's report waiting to go to its parent: all those waiting go together, as one message. */
@@ -165,6 +175,28 @@ export const SubagentsDoc = defineDoc<{
     // A fork starts without subagents: they belong to the conversation that spawned them.
     fork: "initial",
     initial: () => ({ agents: {}, reporters: {} }),
+});
+
+/** Which models this session's subagents may run on besides its own (`subagent-policy.ts`): its person's choice. */
+export const SubagentPolicyDoc = defineDoc<SubagentPolicy>({
+    kind: "pocket.subagent-policy",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    // A fork keeps its session's choice, as it keeps the model.
+    fork: "current",
+    initial: () => ({ mode: "auto" }),
+});
+
+/** The router this session runs as (`routers.ts`), by id; none for a plain session. Its people choose it. */
+export const RouterDoc = defineDoc<{ router?: string; by?: string; at?: number }>({
+    kind: "pocket.router",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    // A fork runs as its session did, as it keeps the model.
+    fork: "current",
+    initial: () => ({}),
 });
 
 export type ChatMessage = {
@@ -438,6 +470,22 @@ export const FollowsDoc = defineDoc<{
 });
 
 /**
+ * Which provider pays, as PiP was last told to ask its person (`pip.ts`): the models their words named, at more than one
+ * provider, and the newest entry of PiP's conversation then (`at`). Their next message answers it when it is just one of
+ * those providers' whole name or id, in the same context.
+ */
+export const PipAskedDoc = defineDoc<{
+    asked?: { models: { provider: string; id: string }[]; at: number };
+}>({
+    kind: "pocket.pip-asked",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    initial: () => ({}),
+});
+
+/**
  * PiP's compactions whose summary PiP wrote itself (`pip-compact.ts`), by task id: their cost is in `pi.usage`, added
  * once. The newest few are kept.
  */
@@ -604,4 +652,23 @@ export const RepoWatchesDoc = defineDoc<{ items: Record<string, RepoWatch> }>({
     version: 1,
     scope: "session",
     initial: () => ({ items: {} }),
+});
+
+/**
+ * A snapshot of the context meter, which the owner takes before changing something - a prompt line, a tool, a skill
+ * list - so the later meter can line its rows up against it: the row the change touched, before and after. `takenAt`
+ * is zero until one is taken.
+ */
+export const ContextBaselineDoc = defineDoc<{
+    takenAt: number;
+    measured: boolean;
+    tokens: number;
+    rows: ContextRow[];
+}>({
+    kind: "pocket.context-baseline",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    fork: "current",
+    initial: () => ({ takenAt: 0, measured: false, tokens: 0, rows: [] }),
 });

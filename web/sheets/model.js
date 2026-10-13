@@ -1,7 +1,8 @@
 // The model picker: a menu over the model chip, searchable once there are many models; and the same menu for the model
 // and thinking level new sessions start with.
 import { useEffect, useRef, useState } from "preact/hooks";
-import { actions, attempt, closeSheet, openSheet, store } from "../store.js";
+import { toggleRouters } from "../routers.js";
+import { actions, api, attempt, closeSheet, openSheet, store } from "../store.js";
 import { anchorStyle, formatTokens, html, Icon, popAnchor } from "../ui.js";
 
 /** Models past this many get a search box in the picker. */
@@ -25,12 +26,13 @@ export function defaultLabel(chosen, models) {
         (each) => each.provider === chosen.provider && each.id === chosen.modelId,
     );
 
-    // Not signed in any more, or gone from its provider: new sessions start with the last model picked instead.
+    // Not in the list: signed out at its provider, or the owner does not offer it to the pickers. New sessions
+    // start with it anyway, and say so, rather than with a model nobody chose for them.
     if (!model) {
-        return `${chosen.modelId} (not available: the last model picked)`;
+        return `${chosen.modelId} (not in the model list)`;
     }
 
-    return `${model.name}${model.reasoning ? ` · ${chosen.thinkingLevel ?? "off"}` : ""}`;
+    return `${model.name}${model.reasoning ? ` · ${chosen.thinkingLevel ?? "off"}` : ""}${model.signIn ? " (needs sign-in)" : ""}`;
 }
 
 /**
@@ -53,6 +55,8 @@ export function ModelPicker() {
     const list = useRef(null);
     // Arrows scroll the list to the model they reach; the mouse does not, or the list would run away under it.
     const keyed = useRef(false);
+    // The Routers group: a session runs as one, its model and stage models with it. Not for the default's picker.
+    const [routers, setRouters] = useState([]);
     const agent = view.agent;
     const owner = me?.role === "owner";
     const chosen = server?.defaultModel ?? null;
@@ -63,6 +67,9 @@ export function ModelPicker() {
     const current = forDefault ? chosen : agent?.model;
     const isCurrent = (model) =>
         current?.provider === model.provider && current?.modelId === model.id;
+    // A session running as a router shows the router as its pick, not the model under it.
+    const routed = !forDefault && Boolean(view.router);
+    const isPicked = (model) => !routed && isCurrent(model);
     const levels = (forDefault ? defaultModel?.levels : agent?.levels) ?? ["off"];
     // Before there is a default, the first one picked thinks as hard as this session does.
     const level = forDefault
@@ -113,6 +120,13 @@ export function ModelPicker() {
         };
     }, []);
     useEffect(() => {
+        if (!forDefault && view.conversation) {
+            api("routers")
+                .then((answer) => setRouters(answer?.routers ?? []))
+                .catch(() => {});
+        }
+    }, []);
+    useEffect(() => {
         if (!keyed.current) {
             return;
         }
@@ -130,6 +144,9 @@ export function ModelPicker() {
         attempt(async () => {
             if (!isCurrent(model)) {
                 await actions.configure({ model: { provider: model.provider, modelId: model.id } });
+            } else if (routed) {
+                // The router's own model, picked as a plain model: the session stops running as the router.
+                await actions.setRouter(null);
             }
 
             closeSheet();
@@ -204,7 +221,7 @@ export function ModelPicker() {
                 ${
                     models.length === 0 &&
                     html`<p class="muted pop-menu-note">
-                        No models are available. Add a provider first.
+                        No models to pick. Add a provider, or turn its models on in Providers.
                     </p>`
                 }
                 ${
@@ -212,12 +229,54 @@ export function ModelPicker() {
                     shown.length === 0 &&
                     html`<p class="muted pop-menu-note">No model matches “${query.trim()}”.</p>`
                 }
+                ${
+                    routers.length > 0 &&
+                    needle === "" &&
+                    html`<div class="pop-menu-group" role="group" aria-label="Routers">
+                        <div class="pop-menu-group-head">
+                            <span>Routers</span>
+                            <button
+                                class="pop-menu-link"
+                                onClick=${() => {
+                                    closeSheet();
+                                    toggleRouters();
+                                }}
+                            >
+                                Edit
+                            </button>
+                        </div>
+                        ${routers.map(
+                            (router) => html`<button
+                                key=${`router:${router.id}`}
+                                class="pop-menu-row router-row"
+                                role="option"
+                                aria-selected=${view.router?.id === router.id}
+                                title=${`${router.id} on ${router.model || "no model yet"}`}
+                                onClick=${() =>
+                                    attempt(async () => {
+                                        // Picked again, it sets the router's model again: the router may have changed.
+                                        await actions.setRouter(router.id);
+                                        closeSheet();
+                                    })}
+                            >
+                                <span class="pop-menu-row-text">
+                                    <span class="pop-menu-row-name">${router.label}</span>
+                                    <span class="pop-menu-row-sub">
+                                        router · ${router.model || "no model yet"}
+                                    </span>
+                                </span>
+                                ${view.router?.id === router.id && html`<${Icon} name="check" size=${14} />`}
+                            </button>`,
+                        )}
+                        <div class="pop-menu-group-head"><span>Models</span></div>
+                    </div>`
+                }
                 ${shown.map(
                     (model, index) => html`<button
                         key=${`${model.provider}/${model.id}`}
                         class=${`pop-menu-row ${index === active ? "on" : ""}`}
                         role="option"
-                        aria-selected=${isCurrent(model)}
+                        aria-selected=${isPicked(model)}
                         title=${`${model.provider}/${model.id} · ${formatTokens(model.contextWindow)} context${model.images ? " · images" : ""}`}
                         onMouseMove=${() => index !== active && setPicked(index)}
                         onClick=${() => pick(model)}
@@ -225,10 +284,10 @@ export function ModelPicker() {
                         <span class="pop-menu-row-text">
                             <span class="pop-menu-row-name">${model.name}</span>
                             <span class="pop-menu-row-sub">
-                                ${model.provider}${!forDefault && isDefault(model) ? " · default" : ""}
+                                ${model.provider}${!forDefault && isDefault(model) ? " · default" : ""}${model.signIn ? " · needs sign-in" : ""}
                             </span>
                         </span>
-                        ${isCurrent(model) && html`<${Icon} name="check" size=${14} />`}
+                        ${isPicked(model) && html`<${Icon} name="check" size=${14} />`}
                     </button>`,
                 )}
             </div>

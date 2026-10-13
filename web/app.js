@@ -6,7 +6,7 @@ import { canGoBack, goBack, goHome, replaceAddress, startHistory, useBack } from
 import { BrowserButton, BrowserPanel } from "./browser-panel.js";
 import { browserAvailable, toggleBrowser } from "./browser.js";
 import { PeopleButton, PeoplePanel } from "./chat.js";
-import { Composer } from "./composer.js";
+import { Composer, openingByAlt } from "./composer.js";
 import { useChanges } from "./diff.js";
 import {
     FilesButton,
@@ -37,6 +37,7 @@ import { Sheets } from "./sheets.js";
 import { branchAvailable, headLabel } from "./sheets/branch.js";
 import { SignIn } from "./signin.js";
 import { openSubagents } from "./subagents.js";
+import { RouterEditor } from "./routers.js";
 import { SubagentsBoard } from "./subagents-board.js";
 import {
     actions,
@@ -319,7 +320,8 @@ function App() {
     const inConversation = state.conversationId !== null;
     const rail = prefs().sidebar === "rail";
     // The subagents board takes the conversation's place, and the panels beside it give it their room.
-    const board = state.board;
+    // The router editor takes the same place.
+    const board = state.board || state.routersOpen;
     const browsing =
         inConversation && !board && state.browserOpen && browserAvailable() && !state.missing;
     const filing = !board && filesShown(state);
@@ -342,10 +344,12 @@ function App() {
         </aside>
         <div class=${`pane window ${board ? "boarded" : ""}`}>
             ${
-                board
-                    ? html`<${SubagentsBoard} />`
-                    : inConversation
-                      ? html`<${Topbar} />
+                state.routersOpen
+                    ? html`<${RouterEditor} />`
+                    : board
+                      ? html`<${SubagentsBoard} />`
+                      : inConversation
+                        ? html`<${Topbar} />
                     ${
                         peeking &&
                         tiles.length > 0 &&
@@ -358,7 +362,7 @@ function App() {
                         !state.missing &&
                         html`<${Composer} key=${state.conversationId} />`
                     }`
-                      : html`<div class="home-list">
+                        : html`<div class="home-list">
                           <${RailNav} />
                           <${SessionList} />
                       </div>
@@ -431,7 +435,10 @@ function step(by) {
 
     const at = order.findIndex((session) => session.id === store.state.conversationId);
 
-    navigate(order[(at + by + order.length) % order.length].id);
+    const next = order[(at + by + order.length) % order.length].id;
+
+    openingByAlt(next);
+    navigate(next);
 }
 
 addEventListener("keydown", (event) => {
@@ -498,6 +505,7 @@ addEventListener("keydown", (event) => {
             event.preventDefault();
 
             if (session) {
+                openingByAlt(session.id);
                 navigate(session.id);
             }
 

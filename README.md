@@ -1,11 +1,12 @@
 <div align="center">
 
-# Pi Pocket
+# Oh-My-Pocket
 
-**Your Pi coding agent, in your pocket.**
+**Pi Pocket, tuned for local models.**
 
 A durable, multiplayer, mobile-first web app for Pi agents, built on [Pi Durable](https://earendil.com/posts/pi-durable/).<br>
-Runs on your own machine or directly on your phone. No cloud VM.
+Runs on your own machine or directly on your phone. No cloud VM.<br>
+A fork of [TannerMidd/pi-pocket](https://github.com/TannerMidd/pi-pocket) with the context batteries from [oh-my-pi](https://github.com/can1357/oh-my-pi) ported in.
 
 [![Release](https://img.shields.io/github/v/release/TannerMidd/pi-pocket?color=7aa2f7)](https://github.com/TannerMidd/pi-pocket/releases)
 [![Node.js 22.19+](https://img.shields.io/badge/node-%E2%89%A5%2022.19-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org)
@@ -17,13 +18,84 @@ Runs on your own machine or directly on your phone. No cloud VM.
 
 </div>
 
+## What this fork adds
+
+Oh-My-Pocket keeps Pi Pocket whole and adds what a self-hosted model on one GPU needs: a small, stable prompt prefix, no
+surprise model swaps, and a plan mode that can read the project board. Each change ships with tests, and each one that
+touches the prompt is measured against oh-my-pi (OMP) on the same task, model, and server.
+
+`oh-my-pocket` is the default branch. `main` mirrors Pi Pocket: upstream changes land there first, get reviewed, and
+only then merge into `oh-my-pocket`.
+
+### Batteries
+
+| Battery                         | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                     | Measured                                                                       |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
+| Agent definitions               | `subagent` spawn takes `agent: <name>` and loads `~/.pi-pocket/agents/<name>.md`: role instructions, model, thinking level, and tools. Pipelines (plan, implement, review) run each stage as its own role.                                                                                                                                                                                                                                       | 5 tests                                                                        |
+| Background compaction off       | `compaction.backgroundTokens` in Pi's settings now reaches Pi Durable; `0` turns it off. A local server answers one request at a time, so a background summary only queues behind the turn it was meant to overlap.                                                                                                                                                                                                                              | 3 tests                                                                        |
+| Titles on the session's model   | A session's own model writes its title, never a cheaper one picked on the side: nobody chose that one, and it may cost what nobody agreed to. It started as a free-model carve-out (on a one-GPU server, a `*-mini` load pushed the session's model out of VRAM for a six-word title); upstream's 0.13.1 made it the rule for every session.                                                                                                     | no model swap before the first turn (about 40 s each way here)                 |
+| Plan mode reads the board       | Tools can mark which calls only read (`host.readOnlyCalls`), and plan mode lets those through: listing and reading board tickets, say. `git -C <dir>`, `git branch -a`, and output sent to `/dev/null` count as reads too.                                                                                                                                                                                                                       | 19 new test cases; the 4 calls a real plan session got blocked on now pass     |
+| Per-role skill catalog (recipe) | A drop-in wraps the `skills` section (Pi Durable's `wrapSection`) and renders it from the session role's own list. Pi otherwise sends its whole catalog on every request.                                                                                                                                                                                                                                                                        | router start context 19,395 to 13,133 tokens                                   |
+| Context meter                   | `/context`, a tap on the status-line meter, or `GET /api/c/:id/context`: the context split into prompt sections, tool schemas, and history by kind, scaled to the newest measured prompt. Every A/B reads its own numbers.                                                                                                                                                                                                                       | within 0.1% of the measured prompt; 3 tests                                    |
+| Waiting subagents               | `subagent` spawn and send take `wait: true` and return the answer as the call's result. The parent writes nothing while a stage runs, so on a one-slot server the stage keeps its cache. A stopped waiting call still gets its answer as a report.                                                                                                                                                                                               | cached share 60% to 90%; 2 tests                                               |
+| Prune before summarising        | Compaction first replaces its range with a note that costs no model call: old tool output masked to one line each, the newest results kept in full, stale re-reads and loops dropped; the LLM summary runs only when the note would still leave the context over its limit. `compaction.pruneToolOutput` and `pruneKeepLast` in Pi's settings.                                                                                                   | 9 tests; no second model call in the common case                               |
+| Loop guard                      | The third identical tool call in one turn is blocked (the block says so when the earlier runs failed), and the system prompt says the same in one line; a file edit re-arms reads and shell checks, so test, fix, test is not a loop; a restart-interrupted call is not a failure, and a fresh person's message re-arms it. Call arguments a model wrote slightly wrong (a JSON string where the object belongs) are repaired before validation. | 10 tests; research measured 30K to 8.9K prompt tokens, under 20% to 100% solve |
+| Read economy                    | A read without an explicit limit returns at most five hundred lines, and the result carries a structural map of the part it did not read: how many lines remain and where the sections sit. To see more, the model reads on with an offset and a limit.                                                                                                                                                                                          | 6 tests; keeps whole-file dumps out of a small model's context                 |
+| KV-prefix discipline            | The system prompt is byte-stable and append-friendly: the one line that changes on its own (the day) sits in the last section of each pack, behind drop-ins' sections too, so a cache hit stays a hit through the day instead of re-prefilling the tail. Pinned by test for sessions, PiP, and drop-ins.                                                                                                                                         | the date's flip re-prefills one short line, not the pack                       |
+| Context baseline                | `/context baseline` (or a tap on the status line) takes a meter of where the context goes; the next `/context` lines it up against that and names the rows a change touched, before and after, biggest moves first. `/context clear` puts the meter back on its own.                                                                                                                                                                             | 4 tests; names the row a prompt, tool, or skill change lands on                |
+
+Router start context, the tokens sent before the first word of every request: Pi Pocket with a router prompt 22,726;
+OMP 15,900; Oh-My-Pocket 13,226 (llama-swap `/api/metrics/activity`, probe "Reply with just: ok", 2026-10-11).
+
+Same T2 job (add `subtract(a, b)` with a pytest test: plan, implement, review, one model, one GPU), 2026-10-11:
+
+| Harness                     | Wall  | Requests | Prompt tokens | Cached | Prefilled | Output | Result                 |
+| --------------------------- | ----- | -------- | ------------- | ------ | --------- | ------ | ---------------------- |
+| OMP                         | 213 s | 41       | 685,014       | 81%    | 130K      | 20,009 | 2 passed, review clean |
+| Oh-My-Pocket, before `wait` | 187 s | 34       | 468,160       | 60%    | 186K      | 13,880 | 2 passed, review clean |
+| Oh-My-Pocket, `wait`        | 179 s | 36       | 470,091       | 90%    | 47K       | 14,252 | 2 passed, review ship  |
+| Oh-My-Pocket, batteries     | 145 s | 31       | 397,605       | 75%    | 99K       | 13,395 | 3 passed, review clean |
+
+The batteries row is the median of three runs on NInfer v3 (2026-10-11 evening; 136, 145 and 181 s), alternating with
+the build before the batteries on the same engine: 166, 184 and 256 s, median 476K prompt, 104K prefilled, 18.4K
+output. On a three-file repository the batteries barely fire, so the gap sits inside run-to-run noise: they cost
+nothing here. With a 1,007-line file to edit, read economy fires (4 maps over two runs) and the median prefill falls
+from 156K to 139K tokens (298 s against 307 s); two runs each, so a direction, not a result.
+
+### Building a router on it
+
+A router setup lives in drop-ins in `~/.pi-pocket/extensions/`, so Oh-My-Pocket itself stays general:
+
+- **Router prompt.** A `section` that adds the router's instructions when the session's model is the router model,
+  and stays out of subagents.
+- **Board tools.** One tool per MCP server (`ome {call, args}`) costs a fraction of one schema per call. The drop-in
+  puts its read-only calls in `host.readOnlyCalls`, so plan mode can read the board.
+- **Skills per role.** A `wrapSection("skills", ...)` that filters `host.skills(cwd)` to the role's list and renders it
+  with Pi's `formatSkillsForPrompt`. `/skill:<name>` still loads any skill.
+- **Stage roles.** Agent definitions, one per stage, each naming its model and tools, spawned with `wait: true`.
+
+[docs/extensions.md](docs/extensions.md) covers the host members and hooks these use.
+
+### Measuring a change
+
+Run the same task in OMP and in Oh-My-Pocket against the same llama-swap server, then read
+`/api/metrics/activity` (paged, newest first) for prompt tokens, cache hits, output, and wall time. A battery stays only
+if it holds or improves those numbers without lowering the result.
+
+### Next
+
+Ported from OMP and DeepSeek Harness (both MIT), ranked by measured cost on local models: hash-anchored `edit`
+(A/B only, never ported blind), LSP diagnostics after an edit, suppression of a file read a second time this turn,
+and subagent handoff hygiene - the child gets file pointers and a typed result schema, nothing else.
+[docs/RESEARCH.md](docs/RESEARCH.md) holds the full survey with its measurements.
+
 ## Quick start
 
 Requires Node.js 22.19 or newer. Runs on Linux, macOS, Windows, and Android (Termux); Linux is the most tested. Sign in to a provider with Pi first (`pi`, then `/login`), or later from the app's Providers sheet.
 
 ```bash
-git clone https://github.com/TannerMidd/pi-pocket.git
-cd pi-pocket
+git clone -b oh-my-pocket https://github.com/T-Crypt/oh-my-pocket.git
+cd oh-my-pocket
 npm install
 npm start
 ```
@@ -44,7 +116,7 @@ While it runs: **q** quit · **r** restart server · **a** change access · **o*
 - **Forks.** Fork from any reply, edit a message and send it again, or retry it with another model. Each fork is a session of its own, optionally in a git worktree of its own.
 - **Works while you're away.** Schedule messages to Pi (`/schedule every weekday 8:00 summarize CI`), and `/until npm test` keeps Pi going until the check passes.
 - **Plan mode.** Pi reads and proposes a plan; nothing changes until someone approves it.
-- **Any provider, any model.** Uses Pi's own model runtime and sign-ins, skills, and prompt templates, with the model and thinking level chosen per session.
+- **Any provider, any model.** Uses Pi's own model runtime and sign-ins, skills, and prompt templates, with the model and thinking level chosen per session, and the models a provider offers the pickers chosen (and switched one by one) in the Providers sheet.
 - **Omarchy themes.** Every Omarchy theme, or follow your desktop's live; tiled Hyprland-style windows, a Walker-style launcher (Ctrl/⌘+K) with live theme previews, and Hyprland's motion.
 - **Peek tiles.** One click (or Alt+P) shows your other sessions working beside the one you are in: approve their calls from there, and swap between them with a click. Only the tiles on screen stay live, so a long list scrolls cheaply.
 - **Built for phones.** Streaming answers, Pi's tool calls folded into a timeline with diffs and live output, push notifications you can allow or deny from, sharing into Pi from other apps, and a home-screen app.
