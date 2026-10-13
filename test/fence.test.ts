@@ -19,6 +19,29 @@ test("a closing tag loses its <, whatever stands between it and the /", () => {
     assert.equal(defang("< \u200b \uFE0F /x>"), "‹ \u200b \uFE0F /x>");
 });
 
+test("a closing tag loses its < behind every category of invisible character the class names", () => {
+    // One representative per category, 81 of them, so the 80-character branch cannot defang it and only the class
+    // can: a control character, a format character, a lone surrogate, a private-use character, an unassigned code
+    // point, a variation selector supplement, the braille blank, the Hangul fillers, and the combining grapheme
+    // joiner. Narrowing the class fails here.
+    const hides = (character: string, what: string) => {
+        const invisible = character.repeat(81);
+
+        assert.equal(defang(`<${invisible}/x>`), `‹${invisible}/x>`, what);
+    };
+
+    hides("\u0007", "a control character");
+    hides("\u00ad", "a format character");
+    hides("\uD800", "a lone surrogate");
+    hides("\uE000", "a private-use character");
+    hides("\u0378", "an unassigned code point");
+    hides("\u{E0100}", "a variation selector supplement");
+    hides("\u2800", "the braille blank");
+    hides("\u3164", "the Hangul filler");
+    hides("\uFFA0", "the halfwidth Hangul filler");
+    hides("\u034F", "the combining grapheme joiner");
+});
+
 test("a closing tag with more than 80 characters between < and / is defanged only by the invisible run", () => {
     const long = `<${ZERO_WIDTH.repeat(81)}/x>`;
 
