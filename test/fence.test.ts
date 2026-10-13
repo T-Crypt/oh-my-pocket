@@ -19,6 +19,13 @@ test("a closing tag loses its <, whatever stands between it and the /", () => {
     assert.equal(defang("< \u200b \uFE0F /x>"), "‹ \u200b \uFE0F /x>");
 });
 
+test("a closing tag with more than 80 characters between < and / is defanged only by the invisible run", () => {
+    const long = `<${ZERO_WIDTH.repeat(81)}/x>`;
+
+    assert.equal(defang(long), `‹${ZERO_WIDTH.repeat(81)}/x>`);
+    assert.equal(defang(`<${ZERO_WIDTH.repeat(80)}/x>`), `‹${ZERO_WIDTH.repeat(80)}/x>`);
+});
+
 test("a < that is not a closing tag keeps its <", () => {
     assert.equal(defang("Vec<T> and <div> stay"), "Vec<T> and <div> stay");
     assert.equal(defang("<b>bold</b>"), "<b>bold‹/b>");
