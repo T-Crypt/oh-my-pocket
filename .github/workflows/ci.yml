@@ -2,6 +2,9 @@ name: CI
 
 on:
     push:
+        branches:
+            - main
+            - oh-my-pocket
     pull_request:
 
 permissions:
