@@ -930,10 +930,13 @@ test(
                 open.list >= open.agentRow,
                 `${at}: unfolded, the list shows a whole row (${open.list}px)`,
             );
-            assert.ok(
-                open.queueShown || open.count === "5 messages waiting for Pi",
-                `${at}: the queue, or how many wait`,
-            );
+            // The dock fits itself a frame after what changed it, later on a loaded machine, so this waits for the
+            // state rather than reading it once: at 844x390 the run measured the dock before it had settled.
+            await until(async () => {
+                const now = await dock();
+
+                return now.queueShown || now.count === "5 messages waiting for Pi";
+            }, `${at}: the queue, or how many wait`);
             assert.ok(open.lastInView, `${at}: the newest message stays in view`);
             await app.commands.abort(id, owner(app));
         }
