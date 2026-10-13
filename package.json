@@ -27,6 +27,7 @@
         "check": "tsc --noEmit -p .",
         "check:web": "node scripts/check-web.mjs",
         "test": "node --test test/*.test.ts",
+        "coverage": "node --test --experimental-test-coverage --test-coverage-lines=60 test/*.test.ts",
         "site:publish": "git subtree push --prefix site origin gh-pages",
         "format": "eslint --fix . && prettier --write .",
         "format:check": "prettier --check . && eslint .",
