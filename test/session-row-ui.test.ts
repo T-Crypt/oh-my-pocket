@@ -550,65 +550,59 @@ test(
     },
 );
 
-test(
-    "a focused text field takes Escape before the session selection",
-    real,
-    async () => {
-        await fresh();
-        // Open a session so the composer is rendered.
-        await page.click({ selector: `${row(active)} > .session` });
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(${JSON.stringify(".composer-wrap textarea")}) !== null)`,
-                ),
-            "the composer textarea",
-        );
-        // Ctrl+click the open row to select it (it stays open, we just add it to the selection).
-        await tabTo(`${row(active)} > .session`);
-        // Native Control+Enter does not carry the modifier through headless clicks;
-        // dispatch a MouseEvent with ctrlKey as the reliable fallback.
-        await page.evaluate(
-            `document.querySelector(${JSON.stringify(row(active) + " > .session")}).dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }))`,
-        );
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(${JSON.stringify(".select-bar")}) !== null)`,
-                ),
-            "the select bar appears",
-        );
-        // Focus the composer textarea, then press Escape.
-        await page.evaluate(
-            "document.querySelector('.composer-wrap textarea').focus();",
-        );
-        // Verify textarea is focused
-        assert.ok(
+test("a focused text field takes Escape before the session selection", real, async () => {
+    await fresh();
+    // Open a session so the composer is rendered.
+    await page.click({ selector: `${row(active)} > .session` });
+    await until(
+        async () =>
             await inPage<boolean>(
-                `return JSON.stringify(document.activeElement?.tagName === "TEXTAREA")`,
+                `return JSON.stringify(document.querySelector(${JSON.stringify(".composer-wrap textarea")}) !== null)`,
             ),
-            "textarea is focused before Escape",
-        );
-        await page.press("Escape");
-        // The select bar must still be present: the textarea took Escape.
-        assert.ok(
+        "the composer textarea",
+    );
+    // Ctrl+click the open row to select it (it stays open, we just add it to the selection).
+    await tabTo(`${row(active)} > .session`);
+    // Native Control+Enter does not carry the modifier through headless clicks;
+    // dispatch a MouseEvent with ctrlKey as the reliable fallback.
+    await page.evaluate(
+        `document.querySelector(${JSON.stringify(row(active) + " > .session")}).dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }))`,
+    );
+    await until(
+        async () =>
             await inPage<boolean>(
                 `return JSON.stringify(document.querySelector(${JSON.stringify(".select-bar")}) !== null)`,
             ),
-            "select bar stays while a text field is focused",
-        );
-        // Blur the field, then press Escape again: the selection clears.
-        await page.evaluate("document.activeElement?.blur();");
-        await page.press("Escape");
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(${JSON.stringify(".select-bar")}) === null)`,
-                ),
-            "the select bar disappears after blur + Escape",
-        );
-    },
-);
+        "the select bar appears",
+    );
+    // Focus the composer textarea, then press Escape.
+    await page.evaluate("document.querySelector('.composer-wrap textarea').focus();");
+    // Verify textarea is focused
+    assert.ok(
+        await inPage<boolean>(
+            `return JSON.stringify(document.activeElement?.tagName === "TEXTAREA")`,
+        ),
+        "textarea is focused before Escape",
+    );
+    await page.press("Escape");
+    // The select bar must still be present: the textarea took Escape.
+    assert.ok(
+        await inPage<boolean>(
+            `return JSON.stringify(document.querySelector(${JSON.stringify(".select-bar")}) !== null)`,
+        ),
+        "select bar stays while a text field is focused",
+    );
+    // Blur the field, then press Escape again: the selection clears.
+    await page.evaluate("document.activeElement?.blur();");
+    await page.press("Escape");
+    await until(
+        async () =>
+            await inPage<boolean>(
+                `return JSON.stringify(document.querySelector(${JSON.stringify(".select-bar")}) === null)`,
+            ),
+        "the select bar disappears after blur + Escape",
+    );
+});
 
 type Touched = {
     sheet: string | null;
