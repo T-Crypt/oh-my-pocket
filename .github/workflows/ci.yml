@@ -1,0 +1,41 @@
+name: CI
+
+on:
+    push:
+        branches:
+            - main
+            - oh-my-pocket
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    checks:
+        runs-on: ubuntu-latest
+        strategy:
+            fail-fast: false
+            matrix:
+                node: ["22.19", "24"]
+        env:
+            # The image's own `chromium` is a snapshot build with none of its dependencies installed and no
+            # AppArmor profile, so Ubuntu 24.04's restriction on unprivileged user namespaces kills it as it
+            # starts, and the browser tests die with "The browser closed." (run 38350258246). Naming the deb's
+            # Google Chrome takes the browser out of PATH order and leaves the choice readable here.
+            PI_POCKET_BROWSER: /usr/bin/google-chrome
+            # The flag the README documents for a machine with no sandbox, which a CI runner is.
+            PI_POCKET_BROWSER_ARGS: --no-sandbox
+        steps:
+            - uses: actions/checkout@v7
+            - uses: actions/setup-node@v7
+              with:
+                  node-version: ${{ matrix.node }}
+            - run: npm ci
+            - run: npm run check
+            - run: npm run lint
+            - run: npm run format:check
+            # With PI_POCKET_BROWSER naming something that is not a file, findBrowser() returns undefined and
+            # every browser test skips itself: a green run with those tests doing nothing. This step names the
+            # browser the job uses and fails when the image stops shipping it.
+            - run: test -x /usr/bin/google-chrome
+            - run: npm test

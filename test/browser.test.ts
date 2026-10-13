@@ -828,88 +828,80 @@ test("the browser tool says so when this machine has no browser", async () => {
 
 // ─── 12-c1: screenshot size contract at the unzoomed baseline ───
 
-test(
-    "screenshot width/height matches the JPEG size at baseline (12-c1)",
-    real,
-    async () => {
-        const saved = new Map<number, { url?: string }>();
-        const browsers = new Browsers({
-            dataDir: mkdtempSync(join(root, "screenshot-")),
-            load: async (id) => saved.get(id),
-            save: (id, value) => saved.set(id, value),
-        });
+test("screenshot width/height matches the JPEG size at baseline (12-c1)", real, async () => {
+    const saved = new Map<number, { url?: string }>();
+    const browsers = new Browsers({
+        dataDir: mkdtempSync(join(root, "screenshot-")),
+        load: async (id) => saved.get(id),
+        save: (id, value) => saved.set(id, value),
+    });
 
-        try {
-            const page = await browsers.open(1);
+    try {
+        const page = await browsers.open(1);
 
-            await page.navigate(`${base}/`);
-            await until(() => page.title === "Smoke test", "the title");
+        await page.navigate(`${base}/`);
+        await until(() => page.title === "Smoke test", "the title");
 
-            // Probe the baseline CSS layout size.
-            const probeStr = await page.evaluate(
+        // Probe the baseline CSS layout size.
+        const probeStr = await page.evaluate(
+            "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
+        );
+        const probe = JSON.parse(probeStr) as { w: number; cw: number; d: number; v: number };
+
+        // Zoom actions: in headless Chromium these are unreachable, but we probe
+        // to document why only the baseline contract is asserted.
+        await page.press("Control+Shift+-");
+        const afterZoomIn = JSON.parse(
+            await page.evaluate(
                 "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
-            );
-            const probe = JSON.parse(probeStr) as { w: number; cw: number; d: number; v: number };
+            ),
+        ) as { w: number; cw: number; d: number; v: number };
 
-            // Zoom actions: in headless Chromium these are unreachable, but we probe
-            // to document why only the baseline contract is asserted.
-            await page.press("Control+Shift+-");
-            const afterZoomIn = JSON.parse(
-                await page.evaluate(
-                    "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
-                ),
-            ) as { w: number; cw: number; d: number; v: number };
+        await page.press("Control+-");
+        const afterZoomOut = JSON.parse(
+            await page.evaluate(
+                "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
+            ),
+        ) as { w: number; cw: number; d: number; v: number };
 
-            await page.press("Control+-");
-            const afterZoomOut = JSON.parse(
-                await page.evaluate(
-                    "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
-                ),
-            ) as { w: number; cw: number; d: number; v: number };
+        // Zoom readings are identical to baseline — keyboard zoom is unreachable
+        // in headless Chromium on this machine. The test therefore only asserts
+        // the baseline contract.
+        assert.deepEqual(
+            afterZoomIn,
+            probe,
+            "zoom-in did not change readings (unreachable in headless)",
+        );
+        assert.deepEqual(
+            afterZoomOut,
+            probe,
+            "zoom-out did not change readings (unreachable in headless)",
+        );
 
-            // Zoom readings are identical to baseline — keyboard zoom is unreachable
-            // in headless Chromium on this machine. The test therefore only asserts
-            // the baseline contract.
-            assert.deepEqual(
-                afterZoomIn,
-                probe,
-                "zoom-in did not change readings (unreachable in headless)",
-            );
-            assert.deepEqual(
-                afterZoomOut,
-                probe,
-                "zoom-out did not change readings (unreachable in headless)",
-            );
+        // Take the screenshot and measure its JPEG.
+        const shot = await page.screenshot();
+        const img = jpegSize(shot.data);
 
-            // Take the screenshot and measure its JPEG.
-            const shot = await page.screenshot();
-            const img = jpegSize(shot.data);
+        // Core contract: bitmap width/height equals reported width/height × scale.
+        assert.equal(
+            img.width,
+            Math.round(shot.width * shot.scale),
+            "JPEG width must equal reported width × scale",
+        );
+        assert.equal(
+            img.height,
+            Math.round(shot.height * shot.scale),
+            "JPEG height must equal reported height × scale",
+        );
 
-            // Core contract: bitmap width/height equals reported width/height × scale.
-            assert.equal(
-                img.width,
-                Math.round(shot.width * shot.scale),
-                "JPEG width must equal reported width × scale",
-            );
-            assert.equal(
-                img.height,
-                Math.round(shot.height * shot.scale),
-                "JPEG height must equal reported height × scale",
-            );
+        // The reported width is the true CSS layout width (clientWidth at capture,
+        // excluding the scrollbar). This is the fix from pr-12 Branch B.
+        assert.equal(shot.width, probe.cw, "reported width must be the page's CSS clientWidth");
 
-            // The reported width is the true CSS layout width (clientWidth at capture,
-            // excluding the scrollbar). This is the fix from pr-12 Branch B.
-            assert.equal(
-                shot.width,
-                probe.cw,
-                "reported width must be the page's CSS clientWidth",
-            );
-
-            // Record zoom readings for the PR (soft assertions, not hard fails).
-            // zoom: innerWidth=${afterZoomIn.w} dpr=${afterZoomIn.d} vscale=${afterZoomIn.v}
-            // zoom-out: innerWidth=${afterZoomOut.w} dpr=${afterZoomOut.d} vscale=${afterZoomOut.v}
-        } finally {
-            await browsers.closeAll();
-        }
-    },
-);
+        // Record zoom readings for the PR (soft assertions, not hard fails).
+        // zoom: innerWidth=${afterZoomIn.w} dpr=${afterZoomIn.d} vscale=${afterZoomIn.v}
+        // zoom-out: innerWidth=${afterZoomOut.w} dpr=${afterZoomOut.d} vscale=${afterZoomOut.v}
+    } finally {
+        await browsers.closeAll();
+    }
+});

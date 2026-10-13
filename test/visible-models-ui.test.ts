@@ -1,6 +1,6 @@
 // The Providers sheet's model switches in a real browser at phone size, where this machine has Chromium: the owner
 // turns some of a provider's models on, so only those reach the model menu in a session, and a provider they did not
-// touch still offers every model it has.
+// touch still offers every model it has. The menu also lists the routers above the models, which this test does not count.
 import { type App, cleanUp, home, newSession, root, until, work } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
@@ -136,7 +136,7 @@ async function menu(): Promise<string[]> {
         "the model menu",
     );
     const rows = await inPage<string[]>(
-        `return JSON.stringify([...document.querySelectorAll(".pop-menu-list .pop-menu-row")].map((row) => row.title.split(" · ")[0]))`,
+        `return JSON.stringify([...document.querySelectorAll(".pop-menu-list .pop-menu-row:not(.router-row)")].map((row) => row.title.split(" · ")[0]))`,
     );
 
     await tap(`document.querySelector(".pop-overlay")`, "the menu's backdrop");
