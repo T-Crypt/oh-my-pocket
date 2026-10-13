@@ -326,10 +326,8 @@ test(
             const page = await browsers.open(1);
 
             assert.deepEqual(await page.navigate(`${base}/`), { status: 200 });
-            // A freshly launched browser on a loaded two-core runner answered this wait at 10.6 s and timed out at
-            // 13.9 s, and the page's title is static, so the wait is for the browser to answer at all: thirty
-            // seconds is more than twice the slowest run, and `until` still returns on the first poll that sees it.
-            await until(() => page.title === "Smoke test", "the title", 30_000);
+            // The page's title is static, so this waits for a freshly launched browser to answer at all.
+            await until(() => page.title === "Smoke test", "the title");
 
             const outline = await page.snapshot();
 
@@ -844,7 +842,7 @@ test("screenshot width/height matches the JPEG size at baseline (12-c1)", real, 
 
         await page.navigate(`${base}/`);
         // As above: a browser that has just started answers late on a loaded machine.
-        await until(() => page.title === "Smoke test", "the title", 30_000);
+        await until(() => page.title === "Smoke test", "the title");
 
         // Probe the baseline CSS layout size.
         const probeStr = await page.evaluate(

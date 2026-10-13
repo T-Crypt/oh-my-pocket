@@ -84,11 +84,15 @@ export function openApp(
     });
 }
 
-/** Wait until `check` holds, polling. */
+/**
+ * Wait until `check` holds, polling. Thirty seconds, not ten: the whole browser suite runs on a loaded two-core
+ * runner, where a freshly launched browser answered its first page at 10.6 s and the same wait timed out at 13.9 s.
+ * The budget only decides how long a wait that is going to fail takes to fail.
+ */
 export async function until(
     check: () => Promise<boolean> | boolean,
     what: string,
-    timeoutMs = 10_000,
+    timeoutMs = 30_000,
 ): Promise<void> {
     const started = Date.now();
 
