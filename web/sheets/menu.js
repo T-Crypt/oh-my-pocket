@@ -6,6 +6,7 @@ import { filesAvailable, setFilesOpen } from "../files-panel.js";
 import { peeksOn, togglePeeks } from "../peeks.js";
 import { openPip, pipAvailable, pipUnread } from "../pip.js";
 import { setArchived } from "../sessions.js";
+import { toggleRouters } from "../routers.js";
 import { openSubagent } from "../subagents.js";
 import {
     actions,
@@ -55,6 +56,16 @@ function Places() {
             icon: "diff",
             label: "Changes",
             run: () => setFilesOpen(true, "changes"),
+        },
+        {
+            // Phones have no rail inside a session: the router editor is a place too.
+            id: "routers",
+            icon: "route",
+            label: "Routers",
+            run: () => {
+                closeSheet();
+                toggleRouters();
+            },
         },
         browserAvailable() && {
             id: "browser",
