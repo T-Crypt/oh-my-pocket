@@ -179,11 +179,29 @@ export function fakeTab(id: ConversationId | undefined, user: User) {
     return { client, events, last, field };
 }
 
+/** Block this thread for `ms`: `Atomics.wait` on a buffer nobody else has is the synchronous sleep Node offers. */
+function sleep(ms: number): void {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /**
- * Remove the temporary folder: call from `after`, once the app is closed. A browser that has just been closed
- * can still be writing its profile, which leaves the folder non-empty, so the removal retries: Node waits a
- * little longer on each of these errors, and the folder is gone a moment later.
+ * Remove the temporary folder: call from `after`, once the app is closed. A browser that has just been closed can
+ * still be writing its profile, so a sweep can find the folder refilled. Node's own retry stays on the same `rmdir`
+ * and re-reads nothing, so one file written after its single sweep fails every attempt; every attempt here sweeps a
+ * freshly read tree, and the pause between attempts lets the browser finish.
  */
 export function cleanUp(): void {
-    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+    for (let attempt = 0; ; attempt++) {
+        try {
+            rmSync(root, { recursive: true, force: true });
+
+            return;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || attempt === 19) {
+                throw error;
+            }
+        }
+
+        sleep(250);
+    }
 }
