@@ -41,6 +41,7 @@ import { describe } from "../errors.ts";
 import type { PocketHost } from "../host.ts";
 import { levelAtMost, sameModel, THINKING_LEVELS } from "../models.ts";
 import { requestFor } from "../requests.ts";
+import { stageDefinition, stageModels, stageOf } from "../routers.ts";
 import { definitionModel, keyOf, policyModels, type SubagentMode } from "../subagent-policy.ts";
 import { whyUnanswered } from "../subagent-runs.ts";
 
@@ -695,7 +696,7 @@ async function allowedFor(
     const chosen = policyModels(policy, own, listAgents(host.dataDir), resolve);
     // A router's stages run where its person set them: choosing the router chose those models.
     const router = await host.routerFor?.(id);
-    const stages = router === undefined ? [] : Object.values(router.stages);
+    const stages = stageModels(router);
     const allowed = [...new Set([...ownerModels(host), ...chosen, ...stages])].filter(
         (spec) => own === undefined || spec !== keyOf(own),
     );
@@ -938,12 +939,12 @@ export default function createSubagents(host: PocketHost) {
             const router = await host.routerFor?.(api.conversationId);
             const higher = (a: ModelThinkingLevel, b: ModelThinkingLevel) =>
                 rank(a) >= rank(b) ? a : b;
-            const routerMost = Object.values(
-                router?.stageThinking ?? {},
-            ).reduce<ModelThinkingLevel>(
-                (most, level) => higher(most, level as ModelThinkingLevel),
-                parent.thinkingLevel ?? "off",
-            );
+            const routerMost = (router?.pipeline ?? [])
+                .flatMap((stage) => (stage.thinking ? [stage.thinking] : []))
+                .reduce<ModelThinkingLevel>(
+                    (most, level) => higher(most, level as ModelThinkingLevel),
+                    parent.thinkingLevel ?? "off",
+                );
             const { allowed } = await allowedFor(
                 host,
                 api,
@@ -992,10 +993,35 @@ export default function createSubagents(host: PocketHost) {
             }
 
             // Resolve spawn options before the commit, so a bad agent name or refused model fails without side effects.
-            const definition =
+            // A router's own stage first: its template and skills, or the person's role file it names.
+            const pipelineStage =
                 action === "spawn" && args.agent !== undefined
-                    ? loadAgent(host.dataDir, args.agent)
+                    ? router?.pipeline?.find((stage) => stage.id === args.agent)
                     : undefined;
+            const skillFile = (name: string) =>
+                typeof host.skills === "function"
+                    ? host.skills(parent.cwd ?? process.cwd()).find((skill) => skill.name === name)
+                          ?.filePath
+                    : undefined;
+            const definition =
+                pipelineStage !== undefined
+                    ? pipelineStage.role === undefined
+                        ? stageDefinition(pipelineStage, skillFile)
+                        : (() => {
+                              const role = loadAgent(host.dataDir, pipelineStage.role);
+
+                              return {
+                                  ...role,
+                                  ...stageDefinition(
+                                      { ...pipelineStage, instructions: role.instructions },
+                                      skillFile,
+                                  ),
+                                  ...(role.tools === undefined ? {} : { tools: role.tools }),
+                              };
+                          })()
+                    : action === "spawn" && args.agent !== undefined
+                      ? loadAgent(host.dataDir, args.agent)
+                      : undefined;
 
             if (
                 definition?.thinking !== undefined &&
@@ -1011,12 +1037,9 @@ export default function createSubagents(host: PocketHost) {
             // A model passed to spawn is Pi's choice, refused unless allowed. A definition's model is its role's: used
             // where this session allows it, and otherwise the role runs on this session's model, and Pi is told so.
             // In a router session, a stage role runs on the model the router gives it, not its definition's.
-            const stageModel =
-                definition === undefined ? undefined : router?.stages[definition.name];
-            const stageThinking =
-                definition === undefined
-                    ? undefined
-                    : (router?.stageThinking?.[definition.name] as ModelThinkingLevel | undefined);
+            const stage = definition === undefined ? undefined : stageOf(router, definition.name);
+            const stageModel = stage?.model;
+            const stageThinking = stage?.thinking as ModelThinkingLevel | undefined;
             const fromDefinition =
                 action === "spawn" && askedModel === undefined && definition !== undefined
                     ? definitionModel(
@@ -1222,7 +1245,14 @@ export default function createSubagents(host: PocketHost) {
                 );
 
                 // Where each runs, so Pi knows which share this session's model and which another (one GPU, say).
-                const stages = (await host.routerFor?.(input.conversationId))?.stages ?? {};
+                const router = await host.routerFor?.(input.conversationId);
+
+                // A router from the editor spawns its own stages, which its prompt lists: no one's role files.
+                if (router?.pipeline !== undefined) {
+                    return undefined;
+                }
+
+                const stages = router?.stages ?? {};
 
                 const where = (agent: AgentDefinition) => {
                     const stage = stages[agent.name];

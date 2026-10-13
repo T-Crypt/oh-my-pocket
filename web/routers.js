@@ -1,6 +1,7 @@
-// The router editor, in the conversation's place (the rail's Routers button): every router, detected on this machine
-// or saved here, and a form for one: its model, its prompt, and which model each stage role runs on. The owner saves;
-// anyone may run a session as one.
+// The router editor, in the conversation's place (the rail's Routers button, or the Routers place on a phone). A
+// router is its fit check (the router's own model) and its stages, in order: each a card with its job, the skills it
+// reads first, its model, and its effort. Routers found on this machine show read-only, and only where they exist.
+// On a phone the list and one router take the screen in turn.
 import { useEffect, useState } from "preact/hooks";
 import { actions, api, attempt, canSteer, store } from "./store.js";
 import { html, Icon } from "./ui.js";
@@ -15,26 +16,6 @@ export const toggleRouters = () =>
 
 const closeRouters = () => store.set({ routersOpen: false });
 
-/** The roles a prompt names in backticks, as the server detects a router's stages. */
-const named = (prompt, roles) => {
-    const names = new Set(roles.map((role) => role.name));
-
-    return new Set(
-        [...(prompt ?? "").matchAll(/`([a-z0-9][a-z0-9_-]*)`/gi)]
-            .map((match) => match[1])
-            .filter((name) => names.has(name)),
-    );
-};
-
-/** What the list says of where a router came from. */
-function origin(router) {
-    if (router.overrides) {
-        return "edited";
-    }
-
-    return router.source === "detected" ? `detected · ${router.from}` : "custom";
-}
-
 /** A model picker as a select: every model people can pick, by provider, and the value even when not among them. */
 function ModelSelect({ value, onChange, empty, label, disabled }) {
     const { models } = store.state;
@@ -47,13 +28,12 @@ function ModelSelect({ value, onChange, empty, label, disabled }) {
     const known = models.some((model) => `${model.provider}/${model.id}` === value);
 
     return html`<select
-        class="router-model"
         aria-label=${label}
         value=${value ?? ""}
         disabled=${disabled}
         onChange=${(event) => onChange(event.currentTarget.value)}
     >
-        ${empty !== undefined && html`<option value="">${empty}</option>`}
+        <option value="">${empty}</option>
         ${value && !known && html`<option value=${value}>${value} (not signed in)</option>`}
         ${[...groups].map(
             ([provider, list]) => html`<optgroup label=${provider} key=${provider}>
@@ -67,20 +47,222 @@ function ModelSelect({ value, onChange, empty, label, disabled }) {
     </select>`;
 }
 
-/** A router as the form edits it: its prompt as text or as a detected file, its stages as a copy. */
+function EffortSelect({ value, onChange, levels, label, empty, disabled }) {
+    return html`<select
+        aria-label=${label}
+        value=${value ?? ""}
+        disabled=${disabled}
+        onChange=${(event) => onChange(event.currentTarget.value)}
+    >
+        <option value="">${empty}</option>
+        ${levels.map((level) => html`<option value=${level} key=${level}>${level}</option>`)}
+    </select>`;
+}
+
+/** The skills a stage reads first, as chips; `/` in the box lists the installed ones that match what follows it. */
+function SkillPicker({ value, skills, onChange, disabled, label }) {
+    const [text, setText] = useState("");
+    const query = text.startsWith("/") ? text.slice(1).toLowerCase() : null;
+    const matches =
+        query === null
+            ? []
+            : skills
+                  .filter((skill) => !value.includes(skill.name))
+                  .filter((skill) => skill.name.toLowerCase().includes(query))
+                  .slice(0, 8);
+
+    const add = (name) => {
+        onChange([...value, name]);
+        setText("");
+    };
+
+    return html`<div class="router-skills">
+        <div class="router-skill-chips">
+            ${value.map(
+                (name) => html`<span class="router-skill" key=${name}>
+                    /${name}
+                    ${
+                        !disabled &&
+                        html`<button
+                            type="button"
+                            aria-label=${`Remove ${name}`}
+                            onClick=${() => onChange(value.filter((each) => each !== name))}
+                        >
+                            <${Icon} name="close" size=${11} />
+                        </button>`
+                    }
+                </span>`,
+            )}
+        </div>
+        ${
+            !disabled &&
+            html`<input
+                aria-label=${label}
+                placeholder=${skills.length === 0 ? "No skills installed" : "Type / to add a skill"}
+                disabled=${skills.length === 0}
+                value=${text}
+                onInput=${(event) => setText(event.currentTarget.value)}
+                onKeyDown=${(event) => {
+                    if (event.key === "Enter" && matches[0]) {
+                        event.preventDefault();
+                        add(matches[0].name);
+                    } else if (event.key === "Escape") {
+                        setText("");
+                    }
+                }}
+            />`
+        }
+        ${
+            matches.length > 0 &&
+            html`<div class="router-skill-menu" role="listbox" aria-label="Installed skills">
+                ${matches.map(
+                    (skill) => html`<button
+                        type="button"
+                        role="option"
+                        key=${skill.name}
+                        onClick=${() => add(skill.name)}
+                    >
+                        <span class="mono">/${skill.name}</span>
+                        <span class="muted small">${skill.description}</span>
+                    </button>`,
+                )}
+            </div>`
+        }
+    </div>`;
+}
+
+/** A router as the form edits it. */
 const draftOf = (router) => ({
     id: router.id,
     label: router.label,
-    model: router.model,
+    model: router.model ?? "",
     thinking: router.thinking ?? "",
     dispatcher: router.dispatcher === true,
-    promptMode: router.promptFile && router.prompt === undefined ? "file" : "text",
-    promptFile: router.promptFile ?? "",
-    prompt: router.prompt ?? router.promptText ?? "",
-    stages: { ...router.stages },
-    stageThinking: { ...(router.stageThinking ?? {}) },
+    extra: router.extra ?? "",
+    pipeline: (router.pipeline ?? []).map((stage) => ({ ...stage, skills: stage.skills ?? [] })),
     isNew: false,
 });
+
+/** A stage id not yet taken in the pipeline: the template's name, then numbered. */
+const freeId = (pipeline, base) => {
+    let id = base;
+
+    for (let n = 2; pipeline.some((stage) => stage.id === id); n++) {
+        id = `${base}-${n}`;
+    }
+
+    return id;
+};
+
+/** One stage's card: its name, job, skills, model, effort, and (advanced) a role file to run instead. */
+function StageCard({ stage, index, count, editable, data, levels, setStage, move, remove }) {
+    return html`<div class="router-card">
+        <div class="router-card-head">
+            <b>${index + 1}</b>
+            <input
+                class="router-stage-name"
+                aria-label=${`Stage ${index + 1} name`}
+                value=${stage.name}
+                disabled=${!editable}
+                onInput=${(event) => setStage({ name: event.currentTarget.value })}
+            />
+            <span class="muted small">${stage.template}</span>
+            ${
+                editable &&
+                html`<span class="router-card-tools">
+                    <button
+                        type="button"
+                        class="icon-button"
+                        aria-label="Move up"
+                        disabled=${index === 0}
+                        onClick=${() => move(-1)}
+                    >
+                        <${Icon} name="down" size=${14} class="router-up" />
+                    </button>
+                    <button
+                        type="button"
+                        class="icon-button"
+                        aria-label="Move down"
+                        disabled=${index === count - 1}
+                        onClick=${() => move(1)}
+                    >
+                        <${Icon} name="down" size=${14} />
+                    </button>
+                    <button
+                        type="button"
+                        class="icon-button"
+                        aria-label=${`Remove ${stage.name}`}
+                        disabled=${count === 1}
+                        onClick=${remove}
+                    >
+                        <${Icon} name="close" size=${14} />
+                    </button>
+                </span>`
+            }
+        </div>
+        <label>
+            <span class="label">What it does</span>
+            <textarea
+                rows="3"
+                aria-label=${`${stage.name}: what it does`}
+                value=${stage.instructions}
+                disabled=${!editable || Boolean(stage.role)}
+                onInput=${(event) => setStage({ instructions: event.currentTarget.value })}
+            ></textarea>
+        </label>
+        <div>
+            <span class="label">Skills it reads first</span>
+            <${SkillPicker}
+                value=${stage.skills}
+                skills=${data?.skills ?? []}
+                label=${`${stage.name}: add a skill`}
+                disabled=${!editable}
+                onChange=${(skills) => setStage({ skills })}
+            />
+        </div>
+        <div class="routers-row">
+            <label>
+                <span class="label">Model</span>
+                <${ModelSelect}
+                    value=${stage.model ?? ""}
+                    label=${`Model for ${stage.name}`}
+                    empty="The router's model"
+                    disabled=${!editable}
+                    onChange=${(model) => setStage({ model })}
+                />
+            </label>
+            <label>
+                <span class="label">Effort</span>
+                <${EffortSelect}
+                    value=${stage.thinking ?? ""}
+                    levels=${levels}
+                    label=${`Effort for ${stage.name}`}
+                    empty="Default"
+                    disabled=${!editable}
+                    onChange=${(thinking) => setStage({ thinking })}
+                />
+            </label>
+        </div>
+        ${
+            (data?.roles ?? []).length > 0 &&
+            html`<details class="router-advanced" open=${Boolean(stage.role)}>
+                <summary class="muted small">Advanced: run one of your role files instead</summary>
+                <select
+                    aria-label=${`${stage.name}: role file`}
+                    value=${stage.role ?? ""}
+                    disabled=${!editable}
+                    onChange=${(event) => setStage({ role: event.currentTarget.value })}
+                >
+                    <option value="">None: the words above</option>
+                    ${data.roles.map(
+                        (role) =>
+                            html`<option value=${role.name} key=${role.name}>${role.name}</option>`,
+                    )}
+                </select>
+            </details>`
+        }
+    </div>`;
+}
 
 export function RouterEditor() {
     const { me, view, conversationId } = store.state;
@@ -89,17 +271,16 @@ export function RouterEditor() {
     const [chosen, setChosen] = useState(null);
     const [draft, setDraft] = useState(null);
     const [saved, setSaved] = useState("");
+    const [adding, setAdding] = useState("custom");
 
     const load = async (pick) => {
         const answer = await attempt(() => api("routers"));
 
         if (answer) {
             setData(answer);
-            const next =
-                answer.routers.find((router) => router.id === (pick ?? chosen)) ??
-                answer.routers[0];
+            const next = pick && answer.routers.find((router) => router.id === pick);
 
-            setChosen(next?.id ?? null);
+            setChosen(next ? next.id : null);
             setDraft(next ? draftOf(next) : null);
         }
     };
@@ -117,22 +298,32 @@ export function RouterEditor() {
     }, []);
 
     const routers = data?.routers ?? [];
-    const roles = data?.roles ?? [];
+    const levels = data?.thinkingLevels ?? [];
+    const templates = data?.templates ?? {};
+    const yours = routers.filter((router) => router.source !== "detected");
+    const found = routers.filter((router) => router.source === "detected");
     const current = routers.find((router) => router.id === chosen);
-    const prompts = routers.filter((router) => router.promptFile);
-    const promptText =
-        draft?.promptMode === "file"
-            ? (prompts.find((router) => router.promptFile === draft.promptFile)?.promptText ?? "")
-            : (draft?.prompt ?? "");
-    const inPrompt = named(promptText, roles);
-    // The roles the prompt names first, in the order it names them (a Set keeps it), then the rest.
-    const rank = [...inPrompt];
-    const place = (role) => (inPrompt.has(role.name) ? rank.indexOf(role.name) : rank.length);
-    const ordered = [...roles].sort((a, b) => place(a) - place(b));
+    const readOnly = draft !== null && !draft.isNew && current?.pipeline === undefined;
+    const editable = owner && draft !== null && !readOnly;
 
     const set = (change) => {
         setSaved("");
         setDraft((was) => ({ ...was, ...change }));
+    };
+
+    const setStage = (index, change) =>
+        set({
+            pipeline: draft.pipeline.map((stage, at) =>
+                at === index ? { ...stage, ...change } : stage,
+            ),
+        });
+
+    const move = (index, step) => {
+        const pipeline = [...draft.pipeline];
+        const [stage] = pipeline.splice(index, 1);
+
+        pipeline.splice(index + step, 0, stage);
+        set({ pipeline });
     };
 
     const pick = (router) => {
@@ -141,35 +332,19 @@ export function RouterEditor() {
         setSaved("");
     };
 
+    // A new router, or an editable copy: the built-in pipeline's stages (or the copied router's), every stage on the
+    // router's model until changed. The router's model starts as the copied one's, or this session's.
     const fresh = (from) => {
-        // A new router starts with every stage on one model: this session's, or else the first there is. Each stage's
-        // model and thinking are then the person's to change.
+        const standard = routers.find((router) => router.id === "standard");
+        const base = from?.pipeline ? from : standard;
         const own = view.agent?.model;
-        const first = store.state.models[0];
-        const model = own
-            ? `${own.provider}/${own.modelId}`
-            : first
-              ? `${first.provider}/${first.id}`
-              : "";
-        const base = from
-            ? draftOf(from)
-            : draftOf({
-                  id: "",
-                  label: "",
-                  model,
-                  stages: Object.fromEntries(roles.map((role) => [role.name, model])),
-              });
-        const id = from ? `${from.id}-copy` : "my-router";
 
         setChosen(null);
         setDraft({
-            ...base,
-            id,
+            ...draftOf(base ?? { id: "", label: "", pipeline: [] }),
+            id: from ? `${from.id}-copy` : "my-router",
             label: from ? `${from.label} copy` : "My router",
-            promptMode: from ? base.promptMode : "file",
-            // The first detected prompt (a main ROUTER.md first, the built-in pipeline last): a new router changes
-            // models, not the steps.
-            promptFile: from ? base.promptFile : (prompts[0]?.promptFile ?? ""),
+            model: from?.model || (own ? `${own.provider}/${own.modelId}` : ""),
             isNew: true,
         });
         setSaved("");
@@ -182,13 +357,17 @@ export function RouterEditor() {
             model: draft.model,
             ...(draft.thinking ? { thinking: draft.thinking } : {}),
             ...(draft.dispatcher ? { dispatcher: true } : {}),
-            ...(draft.promptMode === "file"
-                ? { promptFile: draft.promptFile }
-                : { prompt: draft.prompt }),
-            stages: Object.fromEntries(Object.entries(draft.stages).filter(([, model]) => model)),
-            stageThinking: Object.fromEntries(
-                Object.entries(draft.stageThinking).filter(([, level]) => level),
-            ),
+            ...(draft.extra.trim() ? { extra: draft.extra } : {}),
+            pipeline: draft.pipeline.map((stage) => ({
+                id: stage.id,
+                name: stage.name,
+                template: stage.template,
+                instructions: stage.instructions,
+                ...(stage.skills.length > 0 ? { skills: stage.skills } : {}),
+                ...(stage.model ? { model: stage.model } : {}),
+                ...(stage.thinking ? { thinking: stage.thinking } : {}),
+                ...(stage.role ? { role: stage.role } : {}),
+            })),
         };
         const answer = await attempt(() => api("routers", { router }));
 
@@ -210,16 +389,49 @@ export function RouterEditor() {
         }
     };
 
-    const editable = owner;
+    const back = () => {
+        setChosen(null);
+        setDraft(null);
+    };
+
     const running = view.router?.id;
+    const useButton =
+        current &&
+        !draft?.isNew &&
+        conversationId !== null &&
+        canSteer() &&
+        html`<button class="button" type="button" onClick=${use}>Use in this session</button>`;
+    const item = (router) => html`<button
+        key=${router.id}
+        class=${`list-item ${router.id === chosen ? "on" : ""}`}
+        aria-current=${router.id === chosen ? "true" : undefined}
+        onClick=${() => pick(router)}
+    >
+        <span>
+            ${router.label}
+            ${running === router.id && html` <span class="ok small">· this session</span>`}
+        </span>
+        <span class="muted small">
+            ${
+                router.pipeline
+                    ? router.pipeline.map((stage) => stage.name).join(" → ")
+                    : `${router.from} · ${router.id}`
+            }
+        </span>
+    </button>`;
 
     return html`<section class="board routers" aria-label="Routers">
         <header class="board-head">
+            ${
+                draft &&
+                html`<button class="icon-button routers-back" aria-label="All routers" onClick=${back}>
+                    <${Icon} name="back" />
+                </button>`
+            }
             <div class="board-title">
-                <h2>Routers</h2>
+                <h2>${draft ? draft.label || "Router" : "Routers"}</h2>
                 <div class="board-sub">
-                    A router plans, implements, and reviews through stage subagents, each stage on the model you
-                    choose.
+                    A router checks each task, then runs it through its stages, each on the model you pick.
                 </div>
             </div>
             <button
@@ -231,34 +443,60 @@ export function RouterEditor() {
                 <${Icon} name="close" />
             </button>
         </header>
-        <div class="routers-body">
+        <div class=${`routers-body ${draft ? "picked" : ""}`}>
             <nav class="routers-list" aria-label="Routers">
                 ${data === null && html`<p class="muted small">Looking for routers…</p>`}
-                ${routers.map(
-                    (router) => html`<button
-                        key=${router.id}
-                        class=${`list-item ${router.id === chosen ? "on" : ""}`}
-                        aria-current=${router.id === chosen ? "true" : undefined}
-                        onClick=${() => pick(router)}
-                    >
-                        <span>
-                            ${router.label}
-                            ${running === router.id && html` <span class="ok small">· this session</span>`}
-                        </span>
-                        <span class="muted small">${router.id} · ${origin(router)}</span>
-                    </button>`,
-                )}
+                ${yours.map(item)}
                 ${
-                    // Only once the routers are in: a load that lands after would replace the new router's form.
-                    editable &&
+                    owner &&
                     data !== null &&
                     html`<button class="button" onClick=${() => fresh()}>
                         <${Icon} name="plus" size=${14} /> New router
                     </button>`
                 }
+                ${
+                    found.length > 0 &&
+                    html`<details class="routers-found">
+                        <summary class="muted small">From this machine (${found.length})</summary>
+                        ${found.map(item)}
+                    </details>`
+                }
             </nav>
             ${
+                readOnly &&
+                html`<div class="routers-form">
+                    <p class="muted small">
+                        Found in ${current.from}: its prompt file sets its steps, and it runs as it is. Make an
+                        editable router from it to change stages, models, and skills.
+                    </p>
+                    <div class="label">Prompt</div>
+                    <p class="mono small">${current.promptFile}</p>
+                    <div class="label">Model</div>
+                    <p class="small">${current.model || "this session's model"}</p>
+                    ${
+                        Object.keys(current.stages).length > 0 &&
+                        html`<div class="label">Roles its prompt uses</div>
+                            ${Object.entries(current.stages).map(
+                                ([role, model]) => html`<div key=${role} class="small">
+                                    <span class="mono">${role}</span><span class="muted"> · ${model}</span>
+                                </div>`,
+                            )}`
+                    }
+                    <div class="routers-actions">
+                        ${
+                            owner &&
+                            html`<button class="button" type="button" onClick=${() => fresh(current)}>
+                                Make an editable router from it
+                            </button>`
+                        }
+                        ${useButton}
+                        ${saved && html`<span class="muted small" role="status">${saved}</span>`}
+                    </div>
+                </div>`
+            }
+            ${
                 draft &&
+                !readOnly &&
                 html`<form
                     class="routers-form"
                     onSubmit=${(event) => {
@@ -275,191 +513,155 @@ export function RouterEditor() {
                                 onInput=${(event) => set({ label: event.currentTarget.value })}
                             />
                         </label>
-                        <label>
-                            <span class="label">Id</span>
-                            <input
-                                class="mono"
-                                value=${draft.id}
-                                disabled=${!editable || !draft.isNew}
-                                title=${draft.isNew ? "" : "Saving under this id; duplicate to make another"}
-                                onInput=${(event) => set({ id: event.currentTarget.value })}
-                            />
-                        </label>
+                        ${
+                            draft.isNew &&
+                            html`<label>
+                                <span class="label">Id</span>
+                                <input
+                                    class="mono"
+                                    value=${draft.id}
+                                    onInput=${(event) => set({ id: event.currentTarget.value })}
+                                />
+                            </label>`
+                        }
                     </div>
-                    <div class="routers-row">
-                        <label>
-                            <span class="label">Router model</span>
-                            <${ModelSelect}
-                                value=${draft.model}
-                                label="Router model"
-                                empty=${draft.model ? undefined : "Choose a model"}
-                                disabled=${!editable}
-                                onChange=${(model) =>
-                                    // Stages that were on the router's model move with it.
-                                    set({
-                                        model,
-                                        stages: Object.fromEntries(
-                                            Object.entries(draft.stages).map(([role, each]) => [
-                                                role,
-                                                each === draft.model ? model : each,
-                                            ]),
-                                        ),
-                                    })}
-                            />
-                        </label>
-                        <label>
-                            <span class="label">Thinking</span>
+                    <div class="routers-flow" aria-label="The pipeline">
+                        <span>Prompt</span>
+                        <span>Fit check</span>
+                        ${draft.pipeline.map((stage) => html`<span key=${stage.id}>${stage.name}</span>`)}
+                    </div>
+                    <div class="router-card">
+                        <div class="router-card-head">
+                            <b>Fit check</b>
+                            <span class="muted small">
+                                The router itself: answers questions, or picks the stages a task needs.
+                            </span>
+                        </div>
+                        <div class="routers-row">
+                            <label>
+                                <span class="label">Model</span>
+                                <${ModelSelect}
+                                    value=${draft.model}
+                                    label="Router model"
+                                    empty="This session's model"
+                                    disabled=${!editable}
+                                    onChange=${(model) => set({ model })}
+                                />
+                            </label>
+                            <label>
+                                <span class="label">Effort</span>
+                                <${EffortSelect}
+                                    value=${draft.thinking}
+                                    levels=${levels}
+                                    label="Router effort"
+                                    empty="As the session"
+                                    disabled=${!editable}
+                                    onChange=${(thinking) => set({ thinking })}
+                                />
+                            </label>
+                        </div>
+                    </div>
+                    ${draft.pipeline.map(
+                        (stage, index) => html`<${StageCard}
+                            key=${stage.id}
+                            stage=${stage}
+                            index=${index}
+                            count=${draft.pipeline.length}
+                            editable=${editable}
+                            data=${data}
+                            levels=${levels}
+                            setStage=${(change) => setStage(index, change)}
+                            move=${(step) => move(index, step)}
+                            remove=${() =>
+                                set({ pipeline: draft.pipeline.filter((_, at) => at !== index) })}
+                        />`,
+                    )}
+                    ${
+                        editable &&
+                        draft.pipeline.length < 12 &&
+                        html`<div class="routers-add">
                             <select
-                                value=${draft.thinking}
-                                disabled=${!editable}
-                                onChange=${(event) => set({ thinking: event.currentTarget.value })}
+                                aria-label="New stage's template"
+                                value=${adding}
+                                onChange=${(event) => setAdding(event.currentTarget.value)}
                             >
-                                <option value="">as the session</option>
-                                ${(data?.thinkingLevels ?? []).map(
-                                    (level) =>
-                                        html`<option value=${level} key=${level}>${level}</option>`,
+                                ${Object.entries(templates).map(
+                                    ([
+                                        template,
+                                        info,
+                                    ]) => html`<option value=${template} key=${template}>
+                                        ${info.name}
+                                    </option>`,
                                 )}
                             </select>
-                        </label>
-                    </div>
-                    <label class="routers-check">
-                        <input
-                            type="checkbox"
-                            checked=${draft.dispatcher}
-                            disabled=${!editable}
-                            onChange=${(event) => set({ dispatcher: event.currentTarget.checked })}
-                        />
-                        <span>
-                            Dispatcher only
-                            <span class="muted small">
-                                The router itself may not run commands or change files; its stages do the work.
-                            </span>
-                        </span>
-                    </label>
-                    <div class="label">Prompt</div>
-                    <div class="routers-row">
-                        <label class="routers-check">
-                            <input
-                                type="radio"
-                                name="prompt"
-                                checked=${draft.promptMode === "file"}
-                                disabled=${!editable || prompts.length === 0}
-                                onChange=${() => set({ promptMode: "file", promptFile: draft.promptFile || prompts[0]?.promptFile || "" })}
-                            />
-                            <span>A detected router's prompt</span>
-                        </label>
-                        <label class="routers-check">
-                            <input
-                                type="radio"
-                                name="prompt"
-                                checked=${draft.promptMode === "text"}
-                                disabled=${!editable}
-                                onChange=${() => set({ promptMode: "text", prompt: draft.prompt || promptText })}
-                            />
-                            <span>Its own text</span>
-                        </label>
-                    </div>
-                    ${
-                        draft.promptMode === "file"
-                            ? html`<select
-                                  aria-label="Detected prompt"
-                                  value=${draft.promptFile}
-                                  disabled=${!editable}
-                                  onChange=${(event) => set({ promptFile: event.currentTarget.value })}
-                              >
-                                  ${prompts.map(
-                                      (
-                                          router,
-                                      ) => html`<option value=${router.promptFile} key=${router.promptFile}>
-                                          ${router.id} · ${router.from} · ${router.promptFile}
-                                      </option>`,
-                                  )}
-                              </select>
-                              <p class="muted small">
-                                  Read from its file at every request: when its harness renders it again, this router
-                                  follows.
-                              </p>`
-                            : html`<textarea
-                                  class="mono routers-prompt"
-                                  aria-label="Router prompt"
-                                  rows="12"
-                                  value=${draft.prompt}
-                                  disabled=${!editable}
-                                  onInput=${(event) => set({ prompt: event.currentTarget.value })}
-                              ></textarea>`
-                    }
-                    <div class="label">Stages</div>
-                    <p class="muted small">
-                        Each role keeps its instructions and tools; the model and thinking here are what its stage
-                        runs with. Roles the prompt names come first.
-                    </p>
-                    <div class="routers-stages" role="group" aria-label="Stage models">
-                        ${ordered.map(
-                            (role) => html`<label class="routers-stage" key=${role.name}>
-                                <span>
-                                    <span class="mono">${role.name}</span>
-                                    ${inPrompt.has(role.name) && html` <span class="ok small">in prompt</span>`}
-                                    ${role.description && html`<span class="muted small routers-role">${role.description}</span>`}
-                                </span>
-                                <${ModelSelect}
-                                    value=${draft.stages[role.name] ?? ""}
-                                    label=${`Model for ${role.name}`}
-                                    empty=${`as its definition: ${role.model ?? "the session's model"}`}
-                                    disabled=${!editable}
-                                    onChange=${(model) =>
-                                        set({ stages: { ...draft.stages, [role.name]: model } })}
-                                />
-                                <select
-                                    class="routers-thinking"
-                                    aria-label=${`Thinking for ${role.name}`}
-                                    value=${draft.stageThinking[role.name] ?? ""}
-                                    disabled=${!editable}
-                                    onChange=${(event) =>
-                                        set({
-                                            stageThinking: {
-                                                ...draft.stageThinking,
-                                                [role.name]: event.currentTarget.value,
+                            <button
+                                type="button"
+                                class="button"
+                                onClick=${() =>
+                                    set({
+                                        pipeline: [
+                                            ...draft.pipeline,
+                                            {
+                                                id: freeId(draft.pipeline, adding),
+                                                name: templates[adding].name,
+                                                template: adding,
+                                                instructions: templates[adding].instructions,
+                                                skills: [],
                                             },
-                                        })}
-                                >
-                                    <option value="">role's thinking</option>
-                                    ${(data?.thinkingLevels ?? []).map(
-                                        (level) => html`<option value=${level} key=${level}>
-                                            ${level}
-                                        </option>`,
-                                    )}
-                                </select>
-                            </label>`,
-                        )}
-                    </div>
+                                        ],
+                                    })}
+                            >
+                                <${Icon} name="plus" size=${14} /> Add stage
+                            </button>
+                        </div>`
+                    }
+                    <details class="router-advanced">
+                        <summary class="muted small">Advanced</summary>
+                        <label class="routers-check">
+                            <input
+                                type="checkbox"
+                                checked=${draft.dispatcher}
+                                disabled=${!editable}
+                                onChange=${(event) => set({ dispatcher: event.currentTarget.checked })}
+                            />
+                            <span>
+                                Dispatcher only
+                                <span class="muted small">
+                                    The router runs no commands and changes no files itself.
+                                </span>
+                            </span>
+                        </label>
+                        <label>
+                            <span class="label">More for the router</span>
+                            <textarea
+                                rows="3"
+                                aria-label="More for the router"
+                                placeholder="Anything else the router should always do"
+                                value=${draft.extra}
+                                disabled=${!editable}
+                                onInput=${(event) => set({ extra: event.currentTarget.value })}
+                            ></textarea>
+                        </label>
+                    </details>
                     <div class="routers-actions">
+                        ${editable && html`<button class="button primary" type="submit">Save</button>`}
                         ${
-                            editable &&
-                            html`<button class="button primary" type="submit">Save</button>`
-                        }
-                        ${
-                            editable &&
+                            owner &&
                             current &&
+                            !draft.isNew &&
                             html`<button class="button" type="button" onClick=${() => fresh(current)}>
                                 Duplicate
                             </button>`
                         }
                         ${
-                            editable &&
+                            owner &&
                             current?.source === "custom" &&
-                            html`<button class="button" type="button" onClick=${remove}>
-                                ${current.overrides ? "Back to detected" : "Delete"}
-                            </button>`
-                        }
-                        ${
-                            current &&
                             !draft.isNew &&
-                            conversationId !== null &&
-                            canSteer() &&
-                            html`<button class="button" type="button" onClick=${use}>
-                                Use in this session
+                            html`<button class="button" type="button" onClick=${remove}>
+                                ${current.overrides ? "Back to the original" : "Delete"}
                             </button>`
                         }
+                        ${useButton}
                         ${saved && html`<span class="muted small" role="status">${saved}</span>`}
                     </div>
                 </form>`

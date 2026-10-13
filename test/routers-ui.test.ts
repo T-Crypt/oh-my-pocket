@@ -1,8 +1,10 @@
-// The router editor in a headless browser: the rail opens it with the routers on this machine; a router duplicated,
-// given a stage model, and saved shows in the list and in the model picker's Routers group; a session runs as it.
+// The router editor in a headless browser: a new router starts as Standard's stages on this session's model; `/` adds
+// an installed skill to a stage; stages are added, moved, and removed; it saves, and a session runs as it. On a phone
+// the list and one router take the screen in turn. Routers found on the machine sit apart, read-only.
 import {
     type App,
     cleanUp,
+    home,
     newSession,
     openApp,
     owner,
@@ -11,7 +13,7 @@ import {
     until,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -54,6 +56,27 @@ async function clickText(selector: string, text: string) {
     assert.ok(found, `${selector} with ${text}`);
 }
 
+/** Set a field's value as a person would, so the page hears it. */
+async function fill(selector: string, value: string) {
+    await page.evaluate(`
+        const el = document.querySelector(${JSON.stringify(selector)});
+        const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, "value").set.call(el, ${JSON.stringify(value)});
+        el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? "change" : "input", { bubbles: true }));
+        return "null";
+    `);
+}
+
+const shown = (selector: string) =>
+    inPage<boolean>(
+        `const el = document.querySelector(${JSON.stringify(selector)}); return JSON.stringify(el !== null && el.offsetParent !== null)`,
+    );
+
+const stageNames = () =>
+    inPage<string[]>(
+        `return JSON.stringify([...document.querySelectorAll(".router-stage-name")].map((each) => each.value))`,
+    );
+
 async function shot(name: string) {
     if (shots !== undefined) {
         writeFileSync(
@@ -68,20 +91,13 @@ before(async () => {
         return;
     }
 
-    mkdirSync(join(dataDir, "agents"), { recursive: true });
     mkdirSync(join(dataDir, "routers"), { recursive: true });
+    mkdirSync(join(home, ".agents", "skills", "checklist"), { recursive: true });
     writeFileSync(
-        join(dataDir, "agents", "planner.md"),
-        "---\ndescription: Writes plan.md.\nmodel: faux/faux-2\n---\nPlan.\n",
+        join(home, ".agents", "skills", "checklist", "SKILL.md"),
+        "---\nname: checklist\ndescription: A checklist to follow.\n---\nCheck.\n",
     );
-    writeFileSync(
-        join(dataDir, "agents", "builder.md"),
-        "---\ndescription: Builds what the plan says.\nmodel: faux/faux-2\n---\nBuild.\n",
-    );
-    writeFileSync(
-        join(dataDir, "routers", "ROUTER.md"),
-        "You route. Spawn `planner`, then `builder`.\n",
-    );
+    writeFileSync(join(dataDir, "routers", "ROUTER.md"), "A router of this machine's own.\n");
     app = await openApp(scriptedModel(), dataDir);
     id = await newSession(app);
     await app.commands.configure(id, owner(app), {
@@ -99,7 +115,6 @@ before(async () => {
     });
     page = await browsers.open(1);
     await page.navigate(`${base}/login?token=${encodeURIComponent(app.config.ownerToken)}`);
-    await page.setViewport(DESKTOP);
 });
 
 after(async () => {
@@ -107,65 +122,102 @@ after(async () => {
     server?.closeAllConnections();
     server?.close();
     await app?.close();
+    rmSync(join(home, ".agents"), { recursive: true, force: true });
     cleanUp();
 });
 
+/** The session, with its model on the page, and the editor open on the list. */
+async function openEditor() {
+    await page.navigate(`${base}/s/${id}`);
+    await until(
+        async () =>
+            await inPage<boolean>(
+                `return JSON.stringify((document.querySelector(".model-chip .model-name")?.textContent.trim() ?? "") !== "")`,
+            ),
+        "the session",
+        20_000,
+    );
+    await inPage<null>(
+        `(document.querySelector(".rail-routers") ?? document.querySelector('[data-place="routers"]'))?.click(); return "null"`,
+    );
+    await until(
+        async () =>
+            await inPage<boolean>(
+                `return JSON.stringify([...document.querySelectorAll(".routers-list .button")].some((each) => each.textContent.includes("New router")))`,
+            ),
+        "the editor's list",
+    );
+}
+
 test(
-    "the rail opens the editor; a duplicated router with a stage model saves, and a session runs as it",
+    "a new router: Standard's stages on this session's model, a skill by /, stages added, moved, removed, saved, used",
     real,
     async () => {
-        await page.navigate(`${base}/s/${id}`);
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".rail-routers") !== null)`,
-                ),
-            "the rail's Routers button",
-            20_000,
+        await page.setViewport(DESKTOP);
+        await openEditor();
+        assert.ok(
+            await inPage<boolean>(
+                `return JSON.stringify(document.querySelector(".routers-found summary").textContent.includes("From this machine (1)"))`,
+            ),
+            "the machine's own router, apart",
         );
-        await page.click({ selector: ".rail-routers" });
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify([...document.querySelectorAll(".routers-list .list-item")].some((each) => each.textContent.includes("pipeline")))`,
-                ),
-            "the detected router in the list",
-        );
+
+        await clickText(".routers-list .button", "New router");
+        await until(async () => (await stageNames()).length === 5, "the new router's stages");
+        assert.deepEqual(await stageNames(), ["Plan", "Implement", "Review", "Fix", "Ship"]);
         assert.equal(
             await inPage<string>(
-                `return JSON.stringify([...document.querySelectorAll(".routers-stage .mono")].map((each) => each.textContent).slice(0, 2).join(","))`,
+                `return JSON.stringify(document.querySelector('select[aria-label="Router model"]').value)`,
             ),
-            "planner,builder",
-            "the roles the prompt names, first",
+            "faux/faux-1",
         );
-        await shot("editor");
 
-        await clickText(".routers-actions .button", "Duplicate");
-        await page.evaluate(`
-        const set = (el, value) => {
-            const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
-            Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
-            el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? "change" : "input", { bubbles: true }));
-        };
-        const inputs = document.querySelectorAll(".routers-form input:not([type])");
-        set(inputs[0], "Vision planner");
-        set(inputs[1], "vision-planner");
-        set(document.querySelector('select[aria-label="Router model"]'), "faux/faux-1");
-        set(document.querySelector('select[aria-label="Model for planner"]'), "faux/faux-vision");
-        return "null";
-    `);
+        // `/` lists the installed skills; one picked shows as a chip.
+        await fill('input[aria-label="Plan: add a skill"]', "/che");
+        await until(async () => await shown(".router-skill-menu"), "the skill menu");
+        await shot("skill-menu");
+        await clickText(".router-skill-menu button", "/checklist");
+        await until(
+            async () =>
+                await inPage<boolean>(
+                    `return JSON.stringify(document.querySelector(".router-skill")?.textContent.includes("checklist") === true)`,
+                ),
+            "the skill's chip",
+        );
+
+        await fill('select[aria-label="Model for Plan"]', "faux/faux-vision");
+        await fill('select[aria-label="New stage\'s template"]', "custom");
+        await clickText(".routers-add .button", "Add stage");
+        await until(async () => (await stageNames()).length === 6, "the added stage");
+        await page
+            .click({ selector: '.router-card:last-of-type [aria-label="Move up"]' })
+            .catch(() => {});
+        await inPage<null>(
+            `[...document.querySelectorAll('[aria-label="Move up"]')].at(-1).click(); return "null"`,
+        );
+        await until(async () => (await stageNames())[4] === "Custom", "the stage moved up");
+        await inPage<null>(
+            `document.querySelector('[aria-label="Remove Fix"]').click(); return "null"`,
+        );
+        await until(async () => !(await stageNames()).includes("Fix"), "the stage removed");
+        await fill(".routers-form input", "Vision planner");
+        await shot("new-router");
         await clickText(".routers-actions .button", "Save");
         await until(
-            () => app.routers().some((router) => router.id === "vision-planner"),
+            () => app.routers().some((router) => router.id === "my-router"),
             "the saved router",
         );
-        assert.deepEqual(app.routers().find((router) => router.id === "vision-planner")?.stages, {
-            // Duplicated: the detected router's stages come along, the one changed here with them.
-            planner: "faux/faux-vision",
-            builder: "faux/faux-2",
-        });
 
-        // The editor loads the routers again after a save, then offers the saved one to use.
+        const router = app.routers().find((each) => each.id === "my-router")!;
+
+        assert.equal(router.label, "Vision planner");
+        assert.deepEqual(
+            router.pipeline!.map((each) => each.id),
+            ["plan", "implement", "review", "custom", "ship"],
+        );
+        assert.deepEqual(router.pipeline![0]!.skills, ["checklist"]);
+        assert.equal(router.pipeline![0]!.model, "faux/faux-vision");
+
         await until(
             async () =>
                 await inPage<boolean>(
@@ -175,106 +227,26 @@ test(
         );
         await clickText(".routers-actions .button", "Use in this session");
         await until(
-            async () => (await app.routerFor(id))?.id === "vision-planner",
+            async () => (await app.routerFor(id))?.id === "my-router",
             "the session's router",
         );
-        await page.click({ selector: ".board-head .icon-button" });
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".model-chip .model-name")?.textContent.trim() === "Vision planner")`,
-                ),
-            "the model chip names the router",
-        );
-
-        await page.click({ selector: ".model-chip" });
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify([...document.querySelectorAll(".router-row")].some((each) => each.textContent.includes("Vision planner")))`,
-                ),
-            "the picker's Routers group",
-        );
-        await shot("picker");
-        await page.setViewport(VIEWPORTS.mobile);
-        await page.press("Escape");
-        await page.click({ selector: ".rail-routers" }).catch(() => {});
-        await shot("phone");
     },
 );
 
-test(
-    "a new router starts with every stage on its model, and they follow the router's model",
-    real,
-    async () => {
-        await page.setViewport(DESKTOP);
-        await page.navigate(`${base}/s/${id}`);
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".rail-routers") !== null)`,
-                ),
-            "the rail's Routers button",
-            20_000,
-        );
-        // The session's model has reached the page: a new router starts on it.
-        await app.commands.setRouter(id, owner(app), null);
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify((document.querySelector(".model-chip .model-name")?.textContent.trim() ?? "") === "faux-1")`,
-                ),
-            "the session's model",
-        );
-        await inPage<null>(
-            `if (!document.querySelector(".routers")) document.querySelector(".rail-routers").click(); return "null"`,
-        );
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".routers-list .button") !== null)`,
-                ),
-            "the editor",
-        );
-        await clickText(".routers-list .button", "New router");
-        const stages = () =>
-            inPage<{ router: string; stages: string[]; thinking: string[] }>(`
-            return JSON.stringify({
-                router: document.querySelector('select[aria-label="Router model"]').value,
-                stages: [...document.querySelectorAll('select[aria-label^="Model for "]')].map((each) => each.value),
-                thinking: [...document.querySelectorAll('select[aria-label^="Thinking for "]')].map((each) => each.value),
-            });
-        `);
+test("on a phone, the list and one router take the screen in turn", real, async () => {
+    await app.commands.setRouter(id, owner(app), null);
+    await page.setViewport(VIEWPORTS.mobile);
+    await openEditor();
+    assert.equal(await shown(".routers-list"), true);
+    await shot("phone-list");
 
-        await until(
-            async () =>
-                await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".routers-form input")?.value === "My router")`,
-                ),
-            "the new router's form",
-        );
-        const fresh = await stages();
+    await clickText(".routers-list .list-item", "Standard");
+    await until(async () => await shown(".routers-form"), "the router");
+    assert.equal(await shown(".routers-list"), false, "the list gives the screen up");
+    assert.equal(await shown(".routers-back"), true);
+    await shot("phone-router");
 
-        assert.equal(fresh.router, "faux/faux-1", "this session's model");
-        assert.ok(
-            fresh.stages.every((each) => each === "faux/faux-1"),
-            "every stage on it",
-        );
-        assert.ok(
-            fresh.thinking.every((each) => each === ""),
-            "thinking as each role, until changed",
-        );
-
-        await page.evaluate(`
-        const el = document.querySelector('select[aria-label="Router model"]');
-        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value").set.call(el, "faux/faux-2");
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-        return "null";
-    `);
-        await until(
-            async () => (await stages()).stages.every((each) => each === "faux/faux-2"),
-            "the stages follow the router's model",
-        );
-        await shot("new-router");
-    },
-);
+    await page.click({ selector: ".routers-back" });
+    await until(async () => await shown(".routers-list"), "back to the list");
+    assert.equal(await shown(".routers-form"), false);
+});

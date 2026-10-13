@@ -92,7 +92,7 @@ import {
     allRouters,
     checkRouter,
     deleteRouter,
-    promptPlaces,
+    TEMPLATE_INFO,
     promptOf,
     type RouterConfig,
     saveRouter,
@@ -2443,7 +2443,8 @@ export class PocketApp {
                 input,
                 (spec) => this.resolveModelSpec(spec),
                 THINKING_LEVELS,
-                promptPlaces(this.dataDir, this.#home),
+                listAgents(this.dataDir).map((agent) => agent.name),
+                this.skills(this.defaultCwd).map((skill) => skill.name),
             );
         } catch (error) {
             throw new HttpError(400, describe(error));
@@ -2475,6 +2476,12 @@ export class PocketApp {
                 promptText: promptOf(router) ?? "",
             })),
             thinkingLevels: THINKING_LEVELS,
+            // What a stage can start from, and the skills installed here that a stage can read first.
+            templates: TEMPLATE_INFO,
+            skills: this.skills(this.defaultCwd).map((skill) => ({
+                name: skill.name,
+                description: skill.description,
+            })),
             roles: listAgents(this.dataDir).map((agent) => ({
                 name: agent.name,
                 ...(agent.model === undefined ? {} : { model: agent.model }),

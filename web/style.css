@@ -10848,12 +10848,17 @@ textarea.notes {
     border-bottom: 1px solid var(--line);
 }
 
-/* The router editor, in the conversation's place: the routers down the left, the one chosen in a form. */
+/* The router editor, in the conversation's place: the routers down the left, the one chosen beside them. On a phone the
+   list and one router take the screen in turn. */
 .routers-body {
     flex: 1;
     min-height: 0;
     display: grid;
-    grid-template-columns: minmax(200px, 260px) 1fr;
+    grid-template-columns: minmax(200px, 280px) 1fr;
+}
+
+.routers-back {
+    display: none;
 }
 
 .routers-list {
@@ -10879,54 +10884,180 @@ textarea.notes {
     margin-top: 0.4rem;
 }
 
+.routers-found {
+    margin-top: 0.8rem;
+}
+
+.routers-found summary {
+    cursor: pointer;
+    padding: 0.3rem 0;
+}
+
 .routers-form {
     display: flex;
     flex-direction: column;
-    gap: 0.6rem;
-    padding: 0.8rem 1rem 2rem;
+    gap: 0.7rem;
+    padding: 0.8rem 1rem 2.5rem;
     overflow-y: auto;
     min-width: 0;
-}
-
-.routers-form .label {
-    margin-top: 0.4rem;
 }
 
 .routers-row {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.8rem;
+    gap: 0.7rem;
 }
 
 .routers-row > label {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    flex: 1 1 220px;
+    flex: 1 1 200px;
     min-width: 0;
 }
 
-.routers-form input:not([type]),
-.routers-form select,
-.routers-form textarea {
-    width: 100%;
-    min-width: 0;
-}
-
-.routers-check,
-.routers-row > label.routers-check {
+.router-card > label {
     display: flex;
-    flex-direction: row;
-    flex: 0 1 auto;
-    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.routers-flow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.74rem;
+}
+
+.routers-flow > span {
+    padding: 2px 8px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+}
+
+.routers-flow > span + span::before {
+    content: "→ ";
+    color: var(--muted);
+}
+
+.router-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.7rem;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--card);
+}
+
+.router-card-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     gap: 0.5rem;
 }
 
-/* Inputs fill their row everywhere else (the app's rule): a checkbox or a radio keeps its own size. */
-.routers-check input {
-    flex: none;
+.router-card-head .router-stage-name {
+    flex: 1 1 140px;
     width: auto;
-    margin-top: 0.15rem;
+    min-width: 0;
+    padding: 0.35rem 0.5rem;
+    font-weight: 700;
+}
+
+.router-card-tools {
+    display: flex;
+    margin-left: auto;
+}
+
+.router-up {
+    transform: rotate(180deg);
+}
+
+.router-card textarea {
+    resize: vertical;
+    font-size: 0.8rem;
+}
+
+.router-skills {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.router-skill-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.router-skill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+    font-size: 0.74rem;
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+}
+
+.router-skill button {
+    display: grid;
+    place-items: center;
+}
+
+.router-skill-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 5;
+    max-height: 16rem;
+    overflow-y: auto;
+    background: var(--bg);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+}
+
+.router-skill-menu button {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    width: 100%;
+    padding: 0.4rem 0.6rem;
+    text-align: left;
+    border-bottom: 1px solid var(--line);
+}
+
+.router-advanced summary {
+    cursor: pointer;
+}
+
+.router-advanced[open] {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.routers-add {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.routers-add select {
+    flex: 1;
+}
+
+.routers-add .button {
+    flex: none;
+}
+
+.routers-check {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
 }
 
 .routers-check > span {
@@ -10934,36 +11065,11 @@ textarea.notes {
     flex-direction: column;
 }
 
-.routers-prompt {
-    min-height: 12rem;
-    resize: vertical;
-    font-size: 0.78rem;
-}
-
-.routers-stages {
-    display: flex;
-    flex-direction: column;
-    border: 1px solid var(--line);
-}
-
-.routers-stage {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(180px, 300px) minmax(120px, 180px);
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.45rem 0.6rem;
-    border-bottom: 1px solid var(--line);
-}
-
-.routers-stage:last-child {
-    border-bottom: none;
-}
-
-.routers-role {
-    display: block;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+/* Inputs fill their row everywhere else (the app's rule): a checkbox keeps its own size. */
+.routers-check input {
+    flex: none;
+    width: auto;
+    margin-top: 0.15rem;
 }
 
 .routers-actions {
@@ -10971,24 +11077,28 @@ textarea.notes {
     flex-wrap: wrap;
     align-items: center;
     gap: 0.5rem;
-    margin-top: 0.6rem;
 }
 
 @media (max-width: 699px) {
     .routers-body {
         grid-template-columns: 1fr;
-        grid-template-rows: auto 1fr;
     }
     .routers-list {
-        flex-direction: row;
-        overflow-x: auto;
         border-right: none;
-        border-bottom: 1px solid var(--line);
     }
-    .routers-list .list-item {
-        flex: none;
+    .routers-body.picked .routers-list {
+        display: none;
     }
-    .routers-stage {
-        grid-template-columns: 1fr;
+    .routers-body:not(.picked) .routers-form {
+        display: none;
+    }
+    .routers-back {
+        display: grid;
+    }
+    .routers .board-sub {
+        display: none;
+    }
+    .routers-form {
+        padding: 0.6rem 0.6rem 3rem;
     }
 }
