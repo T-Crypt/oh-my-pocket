@@ -67,6 +67,9 @@ export function ModelPicker() {
     const current = forDefault ? chosen : agent?.model;
     const isCurrent = (model) =>
         current?.provider === model.provider && current?.modelId === model.id;
+    // A session running as a router shows the router as its pick, not the model under it.
+    const routed = !forDefault && Boolean(view.router);
+    const isPicked = (model) => !routed && isCurrent(model);
     const levels = (forDefault ? defaultModel?.levels : agent?.levels) ?? ["off"];
     // Before there is a default, the first one picked thinks as hard as this session does.
     const level = forDefault
@@ -141,6 +144,9 @@ export function ModelPicker() {
         attempt(async () => {
             if (!isCurrent(model)) {
                 await actions.configure({ model: { provider: model.provider, modelId: model.id } });
+            } else if (routed) {
+                // The router's own model, picked as a plain model: the session stops running as the router.
+                await actions.setRouter(null);
             }
 
             closeSheet();
@@ -248,10 +254,8 @@ export function ModelPicker() {
                                 title=${`${router.id} on ${router.model || "no model yet"}`}
                                 onClick=${() =>
                                     attempt(async () => {
-                                        if (view.router?.id !== router.id) {
-                                            await actions.setRouter(router.id);
-                                        }
-
+                                        // Picked again, it sets the router's model again: the router may have changed.
+                                        await actions.setRouter(router.id);
                                         closeSheet();
                                     })}
                             >
@@ -272,7 +276,7 @@ export function ModelPicker() {
                         key=${`${model.provider}/${model.id}`}
                         class=${`pop-menu-row ${index === active ? "on" : ""}`}
                         role="option"
-                        aria-selected=${isCurrent(model)}
+                        aria-selected=${isPicked(model)}
                         title=${`${model.provider}/${model.id} · ${formatTokens(model.contextWindow)} context${model.images ? " · images" : ""}`}
                         onMouseMove=${() => index !== active && setPicked(index)}
                         onClick=${() => pick(model)}
@@ -283,7 +287,7 @@ export function ModelPicker() {
                                 ${model.provider}${!forDefault && isDefault(model) ? " · default" : ""}${model.signIn ? " · needs sign-in" : ""}
                             </span>
                         </span>
-                        ${isCurrent(model) && html`<${Icon} name="check" size=${14} />`}
+                        ${isPicked(model) && html`<${Icon} name="check" size=${14} />`}
                     </button>`,
                 )}
             </div>

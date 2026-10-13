@@ -998,6 +998,19 @@ export default function createSubagents(host: PocketHost) {
                 action === "spawn" && args.agent !== undefined
                     ? router?.pipeline?.find((stage) => stage.id === args.agent)
                     : undefined;
+
+            // A router from the editor runs its own stages and nothing else: no one's role files, which may run elsewhere.
+            if (
+                action === "spawn" &&
+                args.agent !== undefined &&
+                router?.pipeline !== undefined &&
+                pipelineStage === undefined
+            ) {
+                throw new Error(
+                    `${args.agent} is not a stage of the router ${router.label}. Its stages: ${router.pipeline.map((stage) => stage.id).join(", ")}. Spawn one of them, or leave agent out to work on this session's model.`,
+                );
+            }
+
             const skillFile = (name: string) =>
                 typeof host.skills === "function"
                     ? host.skills(parent.cwd ?? process.cwd()).find((skill) => skill.name === name)

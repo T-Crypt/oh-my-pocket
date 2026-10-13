@@ -568,7 +568,11 @@ export function createApi(options: HttpOptions, auth: Auth) {
         if (first === "routers" && second === undefined && method === "POST") {
             const body = await readJson<{ router?: unknown }>(request);
 
-            return json(response, 200, { router: app.saveRouter(user, body.router) });
+            const router = app.saveRouter(user, body.router);
+
+            await app.commands.followRouter(user, router.id);
+
+            return json(response, 200, { router });
         }
 
         if (first === "routers" && second === "delete" && method === "POST") {

@@ -1378,6 +1378,29 @@ export class Commands {
     }
 
     /**
+     * A router saved again: every session running as it takes its model and thinking level now, as picking it would
+     * have. Without this a session picked before its router had a model kept whatever it ran on, while its stages ran
+     * on the router's. A session the saver may not drive is left as it is.
+     */
+    async followRouter(user: User, routerId: string): Promise<void> {
+        const app = this.#app;
+
+        for (const key of Object.keys(app.sessionCatalogue())) {
+            const id = Number(key) as unknown as ConversationId;
+
+            if ((await app.harness.snapshot(RouterDoc, id, context))?.router !== routerId) {
+                continue;
+            }
+
+            try {
+                await this.setRouter(id, user, routerId);
+            } catch {
+                // Not this person's to change: it runs as the router with its own model until picked again.
+            }
+        }
+    }
+
+    /**
      * Run a session as a router (`routers.ts`), or as a plain session again (`router` null): its model becomes the
      * router's, and its prompt and stage models come with it. Set for a whole session.
      */
