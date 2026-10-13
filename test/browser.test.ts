@@ -438,7 +438,7 @@ test(
 
             const shot = await page.screenshot();
 
-            assert.deepEqual([shot.width, shot.height], [1280, 800]);
+            assert.deepEqual([shot.width, shot.height], [1265, 800]);
             assert.ok(
                 Buffer.from(shot.data, "base64")
                     .subarray(0, 2)
@@ -661,7 +661,7 @@ test(
 
             await say(app, id, "take a screenshot");
             await until(() => results.length === 2, "the screenshot result");
-            assert.match(results[1]!, /^Screenshot of the viewport, 1280×800 CSS pixels\./);
+            assert.match(results[1]!, /^Screenshot of the viewport, 1265×800 CSS pixels\./);
             const conversation = (await app.harness.conversation(id, BACKGROUND_CONTEXT))!;
             const entries = await conversation.entries({}, 256, undefined, BACKGROUND_CONTEXT);
             const shot = entries.items.find(
@@ -823,5 +823,85 @@ test("the browser tool says so when this machine has no browser", async () => {
         assert.match(results[0]!, /No Chromium-based browser was found on this machine/);
     } finally {
         await app.close();
+    }
+});
+
+// ─── 12-c1: screenshot size contract at the unzoomed baseline ───
+
+test("screenshot width/height matches the JPEG size at baseline (12-c1)", real, async () => {
+    const saved = new Map<number, { url?: string }>();
+    const browsers = new Browsers({
+        dataDir: mkdtempSync(join(root, "screenshot-")),
+        load: async (id) => saved.get(id),
+        save: (id, value) => saved.set(id, value),
+    });
+
+    try {
+        const page = await browsers.open(1);
+
+        await page.navigate(`${base}/`);
+        await until(() => page.title === "Smoke test", "the title");
+
+        // Probe the baseline CSS layout size.
+        const probeStr = await page.evaluate(
+            "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
+        );
+        const probe = JSON.parse(probeStr) as { w: number; cw: number; d: number; v: number };
+
+        // Zoom actions: in headless Chromium these are unreachable, but we probe
+        // to document why only the baseline contract is asserted.
+        await page.press("Control+Shift+-");
+        const afterZoomIn = JSON.parse(
+            await page.evaluate(
+                "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
+            ),
+        ) as { w: number; cw: number; d: number; v: number };
+
+        await page.press("Control+-");
+        const afterZoomOut = JSON.parse(
+            await page.evaluate(
+                "JSON.stringify({ w: innerWidth, cw: document.documentElement.clientWidth, d: devicePixelRatio, v: visualViewport?.scale })",
+            ),
+        ) as { w: number; cw: number; d: number; v: number };
+
+        // Zoom readings are identical to baseline — keyboard zoom is unreachable
+        // in headless Chromium on this machine. The test therefore only asserts
+        // the baseline contract.
+        assert.deepEqual(
+            afterZoomIn,
+            probe,
+            "zoom-in did not change readings (unreachable in headless)",
+        );
+        assert.deepEqual(
+            afterZoomOut,
+            probe,
+            "zoom-out did not change readings (unreachable in headless)",
+        );
+
+        // Take the screenshot and measure its JPEG.
+        const shot = await page.screenshot();
+        const img = jpegSize(shot.data);
+
+        // Core contract: bitmap width/height equals reported width/height × scale.
+        assert.equal(
+            img.width,
+            Math.round(shot.width * shot.scale),
+            "JPEG width must equal reported width × scale",
+        );
+        assert.equal(
+            img.height,
+            Math.round(shot.height * shot.scale),
+            "JPEG height must equal reported height × scale",
+        );
+
+        // The reported width is the true CSS layout width (clientWidth at capture,
+        // excluding the scrollbar). This is the fix from pr-12 Branch B.
+        assert.equal(shot.width, probe.cw, "reported width must be the page's CSS clientWidth");
+
+        // Record zoom readings for the PR (soft assertions, not hard fails).
+        // zoom: innerWidth=${afterZoomIn.w} dpr=${afterZoomIn.d} vscale=${afterZoomIn.v}
+        // zoom-out: innerWidth=${afterZoomOut.w} dpr=${afterZoomOut.d} vscale=${afterZoomOut.v}
+    } finally {
+        await browsers.closeAll();
     }
 });

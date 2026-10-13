@@ -179,7 +179,11 @@ export function fakeTab(id: ConversationId | undefined, user: User) {
     return { client, events, last, field };
 }
 
-/** Remove the temporary folder: call from `after`, once the app is closed. */
+/**
+ * Remove the temporary folder: call from `after`, once the app is closed. A browser that has just been closed
+ * can still be writing its profile, which leaves the folder non-empty, so the removal retries: Node waits a
+ * little longer on each of these errors, and the folder is gone a moment later.
+ */
 export function cleanUp(): void {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 }
