@@ -24,6 +24,7 @@
         "start": "node bin/pi-pocket.js",
         "dev": "node bin/pi-pocket.js --cwd .",
         "check": "tsc --noEmit -p .",
+        "check:web": "tsc --noEmit -p tsconfig.web.json",
         "test": "node --test test/*.test.ts",
         "site:publish": "git subtree push --prefix site origin gh-pages",
         "format": "eslint --fix . && prettier --write .",
