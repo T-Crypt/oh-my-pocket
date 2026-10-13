@@ -64,7 +64,8 @@ from 156K to 139K tokens (298 s against 307 s); two runs each, so a direction, n
 
 ### Building a router on it
 
-A router setup lives in drop-ins in `~/.pi-pocket/extensions/`, so Oh-My-Pocket itself stays general:
+A router is made in the editor, and its prompt is written from its stages. Drop-ins in
+`~/.pi-pocket/extensions/` add to that, so Oh-My-Pocket itself stays general:
 
 - **Router prompt.** A `section` that adds the router's instructions when the session's model is the router model,
   and stays out of subagents.
@@ -123,7 +124,8 @@ While it runs: **q** quit · **r** restart server · **a** change access · **o*
 - **Files and review.** The Files tile (Alt+E) shows the session's folder beside the conversation, and Changes reviews every uncommitted change: word-level diffs, split or unified, and files you mark viewed. Code in Pi's replies is colored, and an HTML block previews inline, running on a tap in a sandbox.
 - **Branches.** The git branch shows in the top bar, under the session's title, and follows any switch; tap it to switch to another branch, follow a remote one, or make a new one.
 - **A built-in browser.** Pi opens, reads, clicks through, and screenshots pages in a real Chromium on the server, and you watch and use the same page in the Browser panel, from a phone too: your dev server on `localhost` included.
-- **Artifacts and subagents.** Sandboxed HTML, Markdown, and SVG artifacts, and background subagents you can open and talk to.
+- **Artifacts and subagents.** Sandboxed HTML, Markdown, and SVG artifacts, and background subagents you can open and talk to. The Subagents chip in the message box, or `/subagents`, sets which models they may run on besides the session's own.
+- **Routers.** A router checks each task and runs it through its stages, each a fresh subagent on the model and effort you choose. The rail's **Routers** button (Menu → Routers, and the Routers place on a phone) opens the editor: a stage is a card with its template, its words, the skills it reads first, its model, and its effort, and the router's prompt is written from them. Pi Pocket ships **Standard** (Plan, Implement, Review, Fix, Ship), saved routers live in `~/.pi-pocket/routers/<id>.json`, routers already on this machine show read-only under **From this machine**, and **Use in this session** or the model picker's **Routers** group runs a session on the router's model until a plain model is picked.
 - **Codemode.** On by default: Pi writes short scripts that call its tools, and every call still goes through the same checks.
 - **Lancet Guard.** Off by default; turn it on in Menu → Extensions. With the [specpi-lancet-guard](https://github.com/TannerMidd/SpecPi) Pi package installed and on, risky bash, write, and edit calls wait for someone in the session to approve.
 - **Roles, invites, and limits.** Steer or view-only access, to every session or just one, through one-time links and QR codes, with spend limits per person and per session.
@@ -201,10 +203,12 @@ Browsers render only committed state. Each session's Pi Durable view is coalesce
 ## Development
 
 ```bash
-npm run check   # type-check
-npm test        # server tests with a scripted model
-npm run format  # ESLint's layout fixes, then Prettier
-npm run lint    # check the layout rules
+npm run check       # type-check
+npm test            # server tests with a scripted model
+npm run check:web   # type-check web/; the files marked clean must stay clean
+npm run coverage    # the tests with line coverage, held at 60%
+npm run format      # ESLint's layout fixes, then Prettier
+npm run lint        # check the layout rules
 ```
 
 Changes to `web/` reload every open browser. Changes to `src/server/extensions/` are reinstalled into the running server. Other server changes need **Restart server** from the menu, and running work resumes afterward. [AGENTS.md](AGENTS.md) covers editing Pi Pocket safely from inside itself, and `node test/serve.ts` runs a throwaway copy, with its own data and a scripted model, to check a change on.
