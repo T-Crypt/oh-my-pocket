@@ -18,11 +18,12 @@ jobs:
             matrix:
                 node: ["22.19", "24"]
         env:
-            # A path that is not a file makes findBrowser() return undefined, so the 137 tests that need a browser
-            # skip themselves and say why; the other 503 tests, and the checks above, still fail the job. The
-            # reason is the runner's browser, not the suite: the deb's Chrome 154 starts and passes most of the
-            # suite, then a wait this suite makes never resolves, a different one each run, with a thirty second
-            # budget expired and 638 of 640 tests green (runs 38431886203 and 38433132571, the 22.19 leg).
+            # A path that is not a file makes findBrowser() return undefined, so the 139 tests that need a browser
+            # skip themselves and say why; the other 501 tests, and the checks above, still fail the job. The
+            # reason is the runner's browser, not the suite: the tests that need one fail there on waits that
+            # never resolve, a different one each run, with the budget expired and most of the suite green (run
+            # 38433132571: 638 of 640 passed, the 22.19 leg; 38429902721 and 38429841208 the same, on the ten
+            # second budget the waits had then). Ticket 7K0XBQD is where the runner's browser gets worked out.
             PI_POCKET_BROWSER: /nonexistent-browser-on-ci
         steps:
             - uses: actions/checkout@v7
