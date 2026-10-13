@@ -1160,8 +1160,9 @@ export class BrowserPage {
     }
 
     /**
-     * A JPEG of the viewport, or of the whole page (up to 8000 CSS pixels tall). The size it reports is in CSS pixels;
-     * the image itself is at most `SHOT_MAX` pixels on its longer side, `scale` image pixels to a CSS pixel (1 unless
+     * A JPEG of the viewport, or of the whole page (up to 8000 CSS pixels tall). The size it reports is the page's
+     * CSS size at capture (the layout width/height, excluding any scrollbar); this changes as the page zooms.
+     * The image itself is at most `SHOT_MAX` pixels on its longer side, `scale` image pixels to a CSS pixel (1 unless
      * that made it smaller).
      */
     async screenshot(
@@ -1216,8 +1217,8 @@ export class BrowserPage {
 
         return {
             data: String(shot.data),
-            width: this.#viewport.width,
-            height: this.#viewport.height,
+            width: Math.round(view.clientWidth),
+            height: Math.round(view.clientHeight),
             scale: fit(view.clientWidth, view.clientHeight),
         };
     }
