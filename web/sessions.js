@@ -840,11 +840,16 @@ export function SessionList({ compact = false }) {
         }
 
         const onKey = (event) => {
+            const target = event.target;
+
             if (
                 event.key !== "Escape" ||
                 event.defaultPrevented ||
                 store.state.sheet ||
-                store.state.launcher
+                store.state.launcher ||
+                target instanceof HTMLInputElement ||
+                target instanceof HTMLTextAreaElement ||
+                target.isContentEditable
             ) {
                 return;
             }
