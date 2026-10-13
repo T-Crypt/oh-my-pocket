@@ -1,6 +1,7 @@
-// Routers: prompts already on the machine are detected, with the stages they name; the editor saves routers, one
-// with a detected router's id takes its place; a session running as a router gets its prompt, its model, and its
-// stages' models; picking another model by hand ends that; a dispatcher router may not run commands itself.
+// Routers: Pi Pocket ships a Standard router of stages; the editor saves routers made of stages (a template's words,
+// the skills a stage reads first, its model and effort, or one of the person's role files); prompts already on the
+// machine are detected read-only; a session running as a router gets a prompt written from its stages, and each
+// stage runs on the model and effort its router gives it; a dispatcher router may not run commands itself.
 import {
     type App,
     cleanUp,
@@ -26,14 +27,14 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId, JsonObject } from "@earendil-works/pi-durable";
 import { RouterDoc, SubagentsDoc } from "../src/server/docs.ts";
-import { checkRouter, detectRouters, namedStages } from "../src/server/routers.ts";
+import { namedStages, pipelinePrompt, STANDARD } from "../src/server/routers.ts";
 
 const dataDir = join(root, "routers-data");
 const ompDir = join(home, ".omp", "agent", "router");
+const skillDir = join(home, ".agents", "skills", "checklist");
 
-/** The model each subagent's requests went to. */
-const seen: Record<string, string> = {};
-/** The tool call the parent makes for its next "go". */
+/** What each subagent's requests carried: its model and system prompt. */
+const seen: Record<string, { model: string; prompt: string }> = {};
 let call: { name: string; args: JsonObject } = { name: "subagent", args: {} };
 let lastResult = "";
 let lastPrompt = "";
@@ -44,7 +45,7 @@ const route: FauxResponseStep = (request, _options, _state, model) => {
     const subagent = /You are the subagent \\?"([^"\\]+)\\?"/.exec(all)?.[1];
 
     if (subagent !== undefined) {
-        seen[subagent] = model.id;
+        seen[subagent] = { model: model.id, prompt: all };
 
         return fauxAssistantMessage([fauxText(`result of ${subagent}`)]);
     }
@@ -74,15 +75,25 @@ before(async () => {
     mkdirSync(join(dataDir, "agents"), { recursive: true });
     mkdirSync(join(dataDir, "routers"), { recursive: true });
     mkdirSync(ompDir, { recursive: true });
-    writeFileSync(join(dataDir, "agents", "planner.md"), "---\nmodel: faux/faux-2\n---\nPlan.\n");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+        join(skillDir, "SKILL.md"),
+        "---\nname: checklist\ndescription: A checklist to follow.\n---\nCheck every box.\n",
+    );
+    writeFileSync(
+        join(dataDir, "agents", "planner.md"),
+        "---\nmodel: faux/faux-2\n---\nYou are PLANNERFILE.\n",
+    );
     writeFileSync(join(dataDir, "agents", "builder.md"), "---\nmodel: faux/faux-2\n---\nBuild.\n");
     writeFileSync(
         join(dataDir, "routers", "ROUTER.md"),
-        "You are MAINROUTER. Spawn `planner`, then `builder`. Never `nobody`.\n",
+        "You are MAINROUTER. Spawn `planner`, then `builder`.\n",
     );
-    writeFileSync(join(ompDir, "ROUTER.md"), "OMP's main router, shadowed by Pi Pocket's.\n");
+    writeFileSync(join(ompDir, "ROUTER.md"), "OMP's main router, shadowed.\n");
     writeFileSync(join(ompDir, "ROUTER-FAST.md"), "You are FASTROUTER: `builder` only.\n");
-    // The scripted models, and one that thinks, for stage thinking levels.
+    // An old saved router with no stages: not one from this editor, so left out.
+    writeFileSync(join(dataDir, "routers", "old.json"), JSON.stringify({ id: "old", prompt: "x" }));
+
     const faux = fauxProvider({
         tokensPerSecond: 2000,
         models: [
@@ -100,6 +111,7 @@ before(async () => {
 after(async () => {
     await app?.close();
     rmSync(join(home, ".omp"), { recursive: true, force: true });
+    rmSync(join(home, ".agents"), { recursive: true, force: true });
     cleanUp();
 });
 
@@ -115,140 +127,154 @@ async function go(id: ConversationId, name: string, args: JsonObject) {
     return lastResult;
 }
 
-test("prompts on the machine are detected, Pi Pocket's first, with the stages they name", () => {
-    const routers = app.routers(true);
-    const main = routers.find((router) => router.id === "router");
-    const fast = routers.find((router) => router.id === "router-fast");
-
-    assert.equal(main?.from, "Pi Pocket", "Pi Pocket's ROUTER.md wins over Oh My Pi's");
-    assert.deepEqual(main?.stages, { planner: "faux/faux-2", builder: "faux/faux-2" });
-    assert.equal(fast?.from, "Oh My Pi");
-    // Pi Pocket's own pipeline, with its own roles: no one's skills or models needed.
-    assert.deepEqual(routers.find((router) => router.id === "pipeline")?.from, "built in");
-    assert.deepEqual(
-        Object.keys(routers.find((router) => router.id === "pipeline")?.stages ?? {}),
-        [],
-    );
-    assert.deepEqual(Object.keys(fast?.stages ?? {}), ["builder"]);
-    assert.deepEqual(
-        namedStages("`a` `planner` `planner`", [{ name: "planner", instructions: "" }]),
-        ["planner"],
-    );
-    assert.deepEqual(
-        detectRouters([{ dir: join(root, "nowhere"), from: "x" }], [], () => undefined),
-        [],
-    );
+const stage = (id: string, template: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    template,
+    instructions: `Do ${id}.`,
+    ...extra,
 });
 
-test("a router from the editor is checked, saved, takes a detected one's place, and deleting brings it back", async () => {
-    const resolve = (spec: string) => {
-        if (spec.startsWith("faux/")) {
-            return { provider: "faux", modelId: spec.slice(5) };
-        }
+test("Standard ships; prompts on the machine are detected read-only; old saved files without stages are left out", () => {
+    const routers = app.routers(true);
 
-        throw new Error(`${spec} is not available`);
-    };
+    assert.deepEqual(
+        routers.find((router) => router.id === "standard")?.pipeline?.map((each) => each.template),
+        ["plan", "implement", "review", "fix", "ship"],
+    );
+    assert.equal(routers.find((router) => router.id === "router")?.from, "Pi Pocket");
+    assert.deepEqual(routers.find((router) => router.id === "router")?.stages, {
+        planner: "faux/faux-2",
+        builder: "faux/faux-2",
+    });
+    assert.equal(routers.find((router) => router.id === "router-fast")?.from, "Oh My Pi");
+    assert.equal(
+        routers.find((router) => router.id === "old"),
+        undefined,
+    );
+    assert.deepEqual(namedStages("`a` `planner`", [{ name: "planner", instructions: "" }]), [
+        "planner",
+    ]);
 
-    assert.throws(
-        () => checkRouter({ id: "Bad Id", model: "faux/faux-1" }, resolve, ["off"]),
-        /id must/,
-    );
-    assert.throws(
-        () => checkRouter({ id: "x", model: "nope/m", prompt: "p", stages: {} }, resolve, ["off"]),
-        /not available/,
-    );
-    assert.throws(
-        () => checkRouter({ id: "x", model: "faux/faux-1", stages: {} }, resolve, ["off"]),
-        /needs a prompt/,
-    );
-    assert.throws(
-        () =>
-            checkRouter(
-                { id: "x", model: "faux/faux-1", prompt: "p", stages: { a: "nomodel" } },
-                resolve,
-                ["off"],
-            ),
-        /stage a/,
-    );
+    const prompt = pipelinePrompt(STANDARD);
 
+    assert.match(prompt, /1\. Plan \(agent: `plan`\)/);
+    assert.match(prompt, /fit check/);
+    assert.match(prompt, /Run the fix stage only when the review stage reported findings/);
+    assert.match(prompt, /Run the ship stage last/);
+});
+
+test("the editor's routers are checked, saved, replace Standard by its id, and deleting brings it back", () => {
     const guest = app.config.addUser("Router guest", "guest").user;
+    const save = (router: Record<string, unknown>) => app.saveRouter(owner(app), router);
 
     assert.throws(() => app.saveRouter(guest, { id: "x" }), { status: 403 });
-    // A prompt file outside the router prompt folders is refused.
+    assert.throws(() => save({ id: "Bad Id", pipeline: [stage("plan", "plan")] }), { status: 400 });
+    assert.throws(() => save({ id: "x", pipeline: [] }), /at least one stage/);
+    assert.throws(() => save({ id: "x", pipeline: [stage("a", "nope")] }), /template/);
     assert.throws(
-        () =>
-            app.saveRouter(owner(app), {
-                id: "leak",
-                model: "faux/faux-1",
-                promptFile: join(dataDir, "agents", "planner.md"),
-                stages: {},
-            }),
-        { status: 400 },
+        () => save({ id: "x", pipeline: [stage("a", "plan"), stage("a", "fix")] }),
+        /own id/,
     );
+    assert.throws(
+        () => save({ id: "x", pipeline: [stage("a", "plan", { skills: ["not-installed"] })] }),
+        /skills installed here/,
+    );
+    assert.throws(
+        () => save({ id: "x", pipeline: [stage("a", "plan", { role: "ghost" })] }),
+        /role ghost/,
+    );
+    assert.throws(() => save({ id: "x", model: "nope/m", pipeline: [stage("a", "plan")] }), {
+        status: 400,
+    });
 
-    const over = app.saveRouter(owner(app), {
-        id: "router",
-        label: "Main, edited",
-        model: "faux/faux-1",
-        prompt: "You are EDITEDMAIN.",
-        stages: { planner: "faux/faux-1" },
+    const over = save({
+        id: "standard",
+        label: "Mine",
+        pipeline: [stage("fix", "fix"), stage("ship", "ship")],
     });
 
     assert.equal(over.overrides, true);
-    assert.equal(app.routers().find((router) => router.id === "router")?.label, "Main, edited");
-    app.deleteRouter(owner(app), "router");
-    assert.equal(app.routers().find((router) => router.id === "router")?.source, "detected");
-    assert.throws(() => app.deleteRouter(owner(app), "router"), { status: 404 });
+    assert.equal(app.routers().find((router) => router.id === "standard")?.label, "Mine");
+    app.deleteRouter(owner(app), "standard");
+    assert.equal(app.routers().find((router) => router.id === "standard")?.source, "built in");
 });
 
-test("a session running as a router gets its model and prompt, and its stages run on the router's models", async () => {
+test("a session running as a router gets its stages' prompt, and each stage its model, effort, skills, and words", async () => {
     app.saveRouter(owner(app), {
         id: "mix",
         label: "Mix",
-        model: "faux/faux-1",
-        prompt: "You are MIXROUTER.",
-        stages: { planner: "faux/faux-vision" },
+        model: "faux/faux-think",
+        thinking: "low",
+        pipeline: [
+            stage("plan", "plan", {
+                model: "faux/faux-think",
+                thinking: "high",
+                skills: ["checklist"],
+            }),
+            stage("build", "implement"),
+            stage("role-plan", "custom", { role: "planner" }),
+        ],
     });
     const id = await newSession(app);
 
-    await app.commands.configure(id, owner(app), {
-        model: { provider: "faux", modelId: "faux-2" },
-    });
     await app.commands.setRouter(id, owner(app), "mix");
-    assert.equal((await app.agentState(id))?.model?.modelId, "faux-1", "the router's model");
+    assert.equal((await app.agentState(id))?.model?.modelId, "faux-think");
     assert.equal((await app.harness.snapshot(RouterDoc, id, context))?.router, "mix");
 
-    // The router's stage model, over the definition's, and allowed though auto would not reach it.
-    assert.match(
-        await go(id, "subagent", { action: "spawn", name: "p1", agent: "planner", message: "x" }),
-        /on faux\/faux-vision/,
-    );
+    // The stage's own model and effort, above the router's; its words, and the skill to read first.
+    await go(id, "subagent", { action: "spawn", name: "p1", agent: "plan", message: "x" });
     await until(() => seen.p1 !== undefined, "the stage's request");
-    assert.equal(seen.p1, "faux-vision");
-    assert.match(lastPrompt, /You are MIXROUTER\./);
-    assert.match(lastPrompt, /- planner \(runs on faux\/faux-vision\)/);
+    assert.equal(seen.p1!.model, "faux-think");
+    assert.match(seen.p1!.prompt, /You are the Plan stage/);
+    assert.match(seen.p1!.prompt, /Do plan\./);
+    assert.match(seen.p1!.prompt, /- checklist: .*checklist[\\/]+SKILL\.md/);
 
-    // A role the router does not map runs as its definition and the session's choice say.
-    assert.match(
-        await go(id, "subagent", { action: "spawn", name: "b1", agent: "builder", message: "x" }),
-        /on faux\/faux-2/,
-    );
+    const p1 = (await app.harness.snapshot(SubagentsDoc, id, context))?.agents.p1;
+
+    assert.equal((await app.agentState(p1!.conversationId))?.thinkingLevel, "high");
+    assert.match(lastPrompt, /You are a router: Mix/);
+    assert.doesNotMatch(lastPrompt, /Agent definitions you can spawn/, "no one's role files");
+
+    // No model of its own: the router's.
+    await go(id, "subagent", { action: "spawn", name: "b1", agent: "build", message: "x" });
+    await until(() => seen.b1 !== undefined, "the stage's request");
+    assert.equal(seen.b1!.model, "faux-think");
+
+    // A role file in place of the words.
+    await go(id, "subagent", { action: "spawn", name: "r1", agent: "role-plan", message: "x" });
+    await until(() => seen.r1 !== undefined, "the stage's request");
+    assert.match(seen.r1!.prompt, /You are PLANNERFILE\./);
 
     // Another model picked by hand: the session is plain again.
     await app.commands.configure(id, owner(app), {
         model: { provider: "faux", modelId: "faux-2" },
     });
     assert.equal((await app.harness.snapshot(RouterDoc, id, context))?.router, undefined);
-
     await assert.rejects(app.commands.setRouter(id, owner(app), "ghost"), { status: 404 });
+});
+
+test("a detected router runs its prompt, its roles on their models; one with no model here keeps the session's", async () => {
+    const id = await newSession(app);
+
+    await app.commands.configure(id, owner(app), {
+        model: { provider: "faux", modelId: "faux-1" },
+    });
+    await app.commands.setRouter(id, owner(app), "router");
+    assert.equal(
+        (await app.agentState(id))?.model?.modelId,
+        "faux-1",
+        "no model named router here",
+    );
+    await go(id, "subagent", { action: "spawn", name: "d1", agent: "planner", message: "x" });
+    await until(() => seen.d1 !== undefined, "the stage's request");
+    assert.equal(seen.d1!.model, "faux-2");
+    assert.match(lastPrompt, /You are MAINROUTER\./);
 });
 
 test("a dispatcher router may not run commands itself", async () => {
     app.saveRouter(owner(app), {
         id: "dispatch",
-        model: "faux/faux-1",
-        prompt: "Dispatch.",
-        stages: {},
+        pipeline: [stage("fix", "fix")],
         dispatcher: true,
     });
     const id = await newSession(app);
@@ -258,40 +284,6 @@ test("a dispatcher router may not run commands itself", async () => {
         await go(id, "bash", { command: "echo hi" }),
         /dispatch is a dispatcher: bash, edit and write are blocked/,
     );
-
     await app.commands.setRouter(id, owner(app), null);
     assert.doesNotMatch(await go(id, "bash", { command: "echo hi" }), /dispatcher/);
-});
-
-test("a router's stage thinks as its person set it, above the session's own level too", async () => {
-    app.saveRouter(owner(app), {
-        id: "deep",
-        model: "faux/faux-think",
-        thinking: "low",
-        prompt: "Deep.",
-        stages: { planner: "faux/faux-think" },
-        stageThinking: { planner: "high" },
-    });
-    assert.throws(
-        () =>
-            app.saveRouter(owner(app), {
-                id: "bad",
-                model: "faux/faux-1",
-                prompt: "x",
-                stages: {},
-                stageThinking: { planner: "enormous" },
-            }),
-        { status: 400 },
-    );
-
-    const id = await newSession(app);
-
-    await app.commands.setRouter(id, owner(app), "deep");
-    assert.equal((await app.agentState(id))?.thinkingLevel, "low");
-    await go(id, "subagent", { action: "spawn", name: "d1", agent: "planner", message: "x" });
-    await until(() => seen.d1 !== undefined, "the stage's request");
-
-    const stage = (await app.harness.snapshot(SubagentsDoc, id, context))?.agents.d1;
-
-    assert.equal((await app.agentState(stage!.conversationId))?.thinkingLevel, "high");
 });

@@ -33,9 +33,9 @@ A Markdown file in `~/.pi/agent/prompts/` (or a project's `.pi/prompts/`, unless
 
 Use a template for a message people send often; use a skill for steps Pi should know how to take.
 
-## Routers: pipelines of stage roles
+## Routers: stages a task runs through
 
-A router (`~/.pi-pocket/routers/<id>.json`, made in the router editor: the rail's Routers button) is a prompt, the model a session runs on, and a map from stage role (an agent definition's name) to the model that stage runs on. A session running as a router gets the prompt with every message, and a role it spawns runs on the router's model and thinking level for it (`stages`, `stageThinking`), not its definition's. Router prompts that harnesses render (`~/.pi-pocket/routers/*.md`, `~/.omp/agent/router/ROUTER*.md`, and the built-in pipeline) are detected and listed; their stages are the agent definitions the prompt names in backticks.
+A router (made in the router editor, saved to `~/.pi-pocket/routers/<id>.json`) is the model a session runs on and its stages, in order (`pipeline`): each with an `id`, a `template` (plan, implement, review, fix, ship, custom), its `instructions`, the `skills` it reads first (installed skills, by name), and optionally a `model`, a `thinking` level, or a `role` (an agent definition run in its place). The router's prompt is written from its stages, plus `extra` if set. A session running as a router spawns each stage with `agent: <stage id>`. Router prompt files (`~/.pi-pocket/routers/*.md`, `~/.omp/agent/router/ROUTER*.md`) are listed read-only; their stages are the agent definitions the prompt names in backticks.
 
 ## Agent definitions: roles a subagent starts as
 
