@@ -32,6 +32,7 @@ jobs:
                   node-version: ${{ matrix.node }}
             - run: npm ci
             - run: npm run check
+            - run: npm run check:web
             - run: npm run lint
             - run: npm run format:check
             # With PI_POCKET_BROWSER naming something that is not a file, findBrowser() returns undefined and
