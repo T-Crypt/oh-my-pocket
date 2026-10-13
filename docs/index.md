@@ -28,6 +28,7 @@ A drop-in extension survives updates to Pi Pocket and can be turned off from the
 - [extensions.md](extensions.md): writing extensions (tools, prompt sections, hooks), with working examples in [examples/](examples/).
 - [self-editing.md](self-editing.md): changing Pi Pocket's code while it runs, checking the change, and getting a broken one back.
 - [map.md](map.md): where each part of the code is, and how to add the common things.
+- [RESEARCH.md](RESEARCH.md): the 2026-10-11 survey of what other harnesses do with context on local models, with measurements; the implemented results are the batteries in the README.
 - [architecture.md](architecture.md): how the parts depend on each other, and the orderings they rely on.
 - [features.md](features.md): what each feature does, as people use it.
 - [../SECURITY.md](../SECURITY.md): what Pi Pocket protects, and what it does not.

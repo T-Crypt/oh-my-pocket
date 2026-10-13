@@ -6,6 +6,7 @@ import { pipeline } from "node:stream/promises";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import type { Attachment, SubmitRequest } from "../commands.ts";
 import { HttpError } from "../errors.ts";
+import { contextDiff } from "../context-meter.ts";
 import { serveImage, TYPES } from "./assets.ts";
 import { type ApiRequest, json, readJson, send } from "./io.ts";
 
@@ -127,6 +128,13 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    // A failed subagent dealt with: `at` says which failure the person saw.
+    if (third === "dismiss" && method === "POST") {
+        const body = await readJson<{ at?: unknown }>(request);
+
+        return json(response, 200, await app.commands.dismissSubagent(id, user, body.at));
+    }
+
     if (third === "withdraw" && method === "POST") {
         const body = await readJson<{ submissionId?: number }>(request);
 
@@ -165,6 +173,24 @@ export async function conversationRoutes(
         }
 
         await app.commands.setPlan(id, user, body.on);
+
+        return json(response, 200, { ok: true });
+    }
+
+    if (third === "router" && method === "POST") {
+        const body = await readJson<{ router?: unknown }>(request);
+
+        await app.commands.setRouter(id, user, body.router ?? null);
+
+        return json(response, 200, { ok: true });
+    }
+
+    if (third === "subagents" && method === "POST") {
+        await app.commands.setSubagents(
+            id,
+            user,
+            await readJson<{ mode?: unknown; models?: unknown }>(request),
+        );
 
         return json(response, 200, { ok: true });
     }
@@ -331,6 +357,31 @@ export async function conversationRoutes(
         }
 
         return serveImage(request, response, app.workspace.conversationFile(user, id, requested));
+    }
+
+    if (third === "context" && method === "GET" && fourth === undefined) {
+        const meter = await app.contextMeter(id);
+        const baseline = await app.contextBaseline(id);
+
+        return json(
+            response,
+            200,
+            baseline === undefined
+                ? { ...meter, baseline: undefined }
+                : { ...meter, baseline, diff: contextDiff(meter.rows, baseline.rows) },
+        );
+    }
+
+    // The owner's reference point for where the context goes: take it before a change, diff the next meter against
+    // it, and clear it when the change is done with.
+    if (third === "context" && fourth === "baseline" && method === "POST") {
+        return json(response, 200, await app.takeContextBaseline(id));
+    }
+
+    if (third === "context" && fourth === "baseline" && method === "DELETE") {
+        await app.clearContextBaseline(id);
+
+        return json(response, 200, { ok: true });
     }
 
     if (third === "entry" && fourth !== undefined && method === "GET") {

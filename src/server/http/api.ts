@@ -514,15 +514,24 @@ export function createApi(options: HttpOptions, auth: Auth) {
                 approvalRule?: unknown;
                 defaultModel?: unknown;
                 pipCompactAt?: unknown;
+                subagentModels?: unknown;
             }>(request);
 
             // One at a time: a second that fails must not leave the first changed.
             if (
-                [body.approvalRule, body.defaultModel, body.pipCompactAt].filter(
-                    (value) => value !== undefined,
-                ).length > 1
+                [
+                    body.approvalRule,
+                    body.defaultModel,
+                    body.pipCompactAt,
+                    body.subagentModels,
+                ].filter((value) => value !== undefined).length > 1
             ) {
                 throw new HttpError(400, "Change one setting at a time.");
+            }
+
+            // The models subagents may run on besides their session's own: the owner's (checked in `app.ts`).
+            if (body.subagentModels !== undefined) {
+                await app.setSubagentModels(user, body.subagentModels);
             }
 
             if (body.pipCompactAt !== undefined) {
@@ -537,6 +546,39 @@ export function createApi(options: HttpOptions, auth: Auth) {
             if (body.defaultModel !== undefined) {
                 await app.setDefaultModel(user, body.defaultModel);
             }
+
+            return json(response, 200, { ok: true });
+        }
+
+        // One model allowed for subagents, or no longer: the rest stay as they are. The owner's (checked in `app.ts`).
+        if (first === "subagent-models" && second === undefined && method === "POST") {
+            const body = await readJson<{ model?: unknown; allowed?: unknown }>(request);
+
+            return json(response, 200, {
+                subagentModels: await app.allowSubagentModel(user, body.model, body.allowed),
+            });
+        }
+
+        // The router editor: every router, each with its prompt, and the roles a stage can be. Saving and deleting
+        // are the owner's (checked in `app.ts`); anyone signed in may look, as they may pick a router.
+        if (first === "routers" && second === undefined && method === "GET") {
+            return json(response, 200, app.routerEditorState());
+        }
+
+        if (first === "routers" && second === undefined && method === "POST") {
+            const body = await readJson<{ router?: unknown }>(request);
+
+            const router = app.saveRouter(user, body.router);
+
+            await app.commands.followRouter(user, router.id);
+
+            return json(response, 200, { router });
+        }
+
+        if (first === "routers" && second === "delete" && method === "POST") {
+            const body = await readJson<{ id?: unknown }>(request);
+
+            app.deleteRouter(user, body.id);
 
             return json(response, 200, { ok: true });
         }
@@ -575,8 +617,51 @@ export function createApi(options: HttpOptions, auth: Auth) {
             return json(response, 200, await app.extensions(user));
         }
 
+        // For the owner, each subscription's sign-in is asked afresh first (three seconds at most; a mark found later
+        // comes with the models): one that can no longer be renewed shows as needing sign-in. Others see what was last
+        // found, so nobody else makes the server ask providers.
         if (first === "providers" && second === undefined && method === "GET") {
-            return json(response, 200, app.providers.list());
+            if (user.role === "owner") {
+                await app.providers.checkAll(3_000);
+            }
+
+            return json(response, 200, app.providers.list(user.role === "owner"));
+        }
+
+        if (
+            first === "providers" &&
+            second !== undefined &&
+            third === "models" &&
+            method === "GET"
+        ) {
+            return json(response, 200, { models: app.providers.modelsFor(second) });
+        }
+
+        if (
+            first === "providers" &&
+            second !== undefined &&
+            third === "models" &&
+            method === "POST"
+        ) {
+            requireOwner(user);
+            const body = await readJson<{ models?: unknown }>(request);
+
+            if (body.models !== null && !Array.isArray(body.models)) {
+                throw new HttpError(
+                    400,
+                    "models must be an array of model ids, or null for every model",
+                );
+            }
+
+            // Both lists the sheet shows, so one tap is one round trip.
+            const asked = body.models === null ? null : body.models.map((each) => String(each));
+
+            app.providers.setVisible(second, asked);
+
+            return json(response, 200, {
+                providers: app.providers.list(),
+                models: app.providers.modelsFor(second),
+            });
         }
 
         if (

@@ -185,7 +185,7 @@ test("the parent's prompt lists the definitions", async () => {
     const conversation = (await app.harness.conversation(id, context))!;
 
     prompt = JSON.stringify(await conversation.context(context));
-    assert.match(prompt, /reviewer: Reviews a diff\. Never edits\./);
+    assert.match(prompt, /reviewer \(runs on faux\/faux-2\): Reviews a diff\. Never edits\./);
 });
 
 test("an unknown definition or a bad thinking level starts nothing and says why", async () => {

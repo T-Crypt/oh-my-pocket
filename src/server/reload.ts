@@ -31,6 +31,7 @@ const ORDER = [
     "artifacts.ts",
     "browser.ts",
     "subagents.ts",
+    "routers.ts",
     "schedules.ts",
     "goals.ts",
     "plan.ts",
@@ -39,7 +40,17 @@ const ORDER = [
     "memory.ts",
     "pip.ts",
     "triggers.ts",
+    "read-economy.ts",
+    "loop-guard.ts",
+    "pruner.ts",
+    "tool-repair.ts",
+    "today.ts",
 ];
+/**
+ * Modules installed after every other one, drop-ins included: the day is the one prompt line that changes on its own,
+ * so its section must sit behind every stable one, a drop-in's too, or its daily flip re-prefills them.
+ */
+const LAST = new Set(["today.ts"]);
 /** Modules the app cannot work without: always on. */
 const REQUIRED = new Set(["prompt.ts"]);
 /** Built-in modules that stay off until the owner turns them on. Drop-ins all do. */
@@ -49,6 +60,7 @@ const TITLES: Record<string, string> = {
     "artifacts.ts": "Artifacts",
     "browser.ts": "Browser",
     "subagents.ts": "Subagents",
+    "routers.ts": "Routers",
     "schedules.ts": "Scheduled messages",
     "goals.ts": "Done when",
     "plan.ts": "Plan mode",
@@ -57,6 +69,11 @@ const TITLES: Record<string, string> = {
     "memory.ts": "Memory",
     "pip.ts": "PiP",
     "triggers.ts": "Triggers",
+    "read-economy.ts": "Read economy",
+    "loop-guard.ts": "Loop guard",
+    "pruner.ts": "Context pruner",
+    "tool-repair.ts": "Tool repair",
+    "today.ts": "Today",
 };
 
 /**
@@ -253,7 +270,13 @@ export class ExtensionLoader {
     async loadAll(): Promise<void> {
         this.#reportClashes();
 
-        for (const module of this.#modules()) {
+        const modules = this.#modules();
+        const ordered = [
+            ...modules.filter((module) => !LAST.has(module.file)),
+            ...modules.filter((module) => LAST.has(module.file)),
+        ];
+
+        for (const module of ordered) {
             if (!this.#isOn(module)) {
                 continue;
             }
@@ -371,6 +394,19 @@ export class ExtensionLoader {
 
         this.#installed.set(file, extensions);
         this.#errors.delete(file);
+
+        // A newly installed extension lands at the end of the registry; put the last modules back behind it.
+        if (
+            !LAST.has(file) &&
+            extensions.some((extension) => !previous.some((old) => old.name === extension.name))
+        ) {
+            for (const last of LAST) {
+                for (const extension of this.#installed.get(last) ?? []) {
+                    this.#registry.uninstall(extension);
+                    this.#registry.install(extension);
+                }
+            }
+        }
 
         return extensions;
     }

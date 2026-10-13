@@ -31,6 +31,7 @@ import {
     type HarnessSettings,
     LiveDoc,
     type LiveState,
+    type ModelRef,
     type Registry,
     type Storage,
     UsageDoc,
@@ -39,13 +40,16 @@ import {
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
+import { type AgentDefinition, listAgents } from "./agents.ts";
 import { Alerts } from "./alerts.ts";
 import { Attribution, type Missing } from "./attribution.ts";
 import { Browsers } from "./browser.ts";
+import { compactionSettings } from "./compaction.ts";
 import type { BrowserState } from "./browser/page.ts";
 import { Collab, REACTIONS } from "./collab.ts";
 import { Commands } from "./commands.ts";
 import { APP_ROOT, ConfigStore, type User } from "./config.ts";
+import { type ContextMeter, contextMeter } from "./context-meter.ts";
 import {
     ArtifactBodyDoc,
     type ArtifactMeta,
@@ -54,8 +58,10 @@ import {
     BrowserDoc,
     ChatDoc,
     type ChatMessage,
+    ContextBaselineDoc,
     DecisionsDoc,
     MemoryDoc,
+    RouterDoc,
     type SessionMeta,
     SessionsDoc,
     type SubagentRecord,
@@ -68,17 +74,35 @@ import { type ApprovalRequest, Approvals, type PocketHost } from "./host.ts";
 import { type GuardStatus, LancetGuard } from "./lancet.ts";
 import { takeLock } from "./lock.ts";
 import { Memory } from "./memory.ts";
-import { isThinkingLevel, modelList, resolveModel, THINKING_LEVELS } from "./models.ts";
+import { findModel, isThinkingLevel, modelList, resolveModel, THINKING_LEVELS } from "./models.ts";
 import { configureHttp } from "./net.ts";
 import { PiSessions } from "./pi-sessions.ts";
 import { Hooks } from "./hooks.ts";
 import { Pip, PIP_EXTENSION } from "./pip.ts";
 import { PIP_COMPACT_CHOICES, PipCompaction } from "./pip-compact.ts";
+import { Pruner } from "./pruner.ts";
+import { LoopGuard } from "./loop-guard.ts";
 import { RepoWatches } from "./repo-watches.ts";
 import { snippet } from "./projection.ts";
 import { loadPromptTemplates, type PromptTemplate, type SkillCommand } from "./prompts.ts";
+import { measureModelStreams } from "./timing.ts";
 import { Providers } from "./providers.ts";
 import { PushStore } from "./push.ts";
+import {
+    allRouters,
+    checkRouter,
+    deleteRouter,
+    TEMPLATE_INFO,
+    promptOf,
+    type RouterConfig,
+    saveRouter,
+} from "./routers.ts";
+import {
+    policyLabel,
+    policyModels,
+    type SubagentMode,
+    type SubagentPolicy,
+} from "./subagent-policy.ts";
 import { type ExtensionInfo, ExtensionLoader, prepareDropInFolder } from "./reload.ts";
 import { ResendTask } from "./resend.ts";
 import { type Client, reportingOf, Room, ROOM_DOCS, subagentView } from "./room.ts";
@@ -115,6 +139,10 @@ const BROWSER_FILE = "browser.ts";
 const BROWSER_EXTENSION = "pocket-browser";
 /** The extension module that is PiP. */
 const PIP_FILE = "pip.ts";
+/** The extension module with the subagent tool, rebuilt when the models subagents may use change. */
+const SUBAGENTS_FILE = "subagents.ts";
+/** The most models the owner may allow subagents besides their session's own. */
+const MAX_SUBAGENT_MODELS = 50;
 
 /** The most peek tiles a tab gets live at once: the ones on its screen, which a tall screen fits a handful of. */
 export const MAX_PEEKS = 12;
@@ -151,9 +179,9 @@ export function subagentState(entry: SubagentEntry): SubagentState {
 }
 
 /**
- * On the subagents board, a session's finished subagents (done or stopped) beyond this many, the oldest, are left out:
- * the session list counts them, and the board says how many more there are. Those that work, wait, failed, or have a
- * report on its way always show.
+ * On the subagents board, a session's finished subagents (done, stopped, or failed and dealt with) past this many, the
+ * oldest, are left out: the session list counts them, and the board says how many more there are. Those that work,
+ * wait, failed with nobody dealing with it yet, or have a report on its way always show.
  */
 const BOARD_FINISHED = 24;
 
@@ -163,7 +191,9 @@ const SETTINGS_STALE_MS = 30_000;
 /** A session's subagents as the board gets them: all but its oldest finished ones past `BOARD_FINISHED`. */
 function forBoard(entries: readonly SubagentEntry[]): SubagentEntry[] {
     const finished = (entry: SubagentEntry) =>
-        entry.reporting !== true && ["done", "stopped"].includes(subagentState(entry));
+        entry.reporting !== true &&
+        (["done", "stopped"].includes(subagentState(entry)) ||
+            (subagentState(entry) === "failed" && entry.dealt === true));
     const done = entries.filter(finished);
 
     if (done.length <= BOARD_FINISHED) {
@@ -176,20 +206,27 @@ function forBoard(entries: readonly SubagentEntry[]): SubagentEntry[] {
     return entries.filter((entry) => !finished(entry) || kept.has(entry));
 }
 
-/** How many of a session's subagents are in each state, without the empty ones; undefined for none at all. */
+/**
+ * How many of a session's subagents are in each state, without the empty ones, and how many of those that failed a
+ * person dealt with (`dealt`): the rest need someone. Undefined for none at all.
+ */
 function countSubagents(
     entries: readonly SubagentEntry[],
-): Partial<Record<SubagentState, number>> | undefined {
+): (Partial<Record<SubagentState, number>> & { dealt?: number }) | undefined {
     if (entries.length === 0) {
         return undefined;
     }
 
-    const counts: Partial<Record<SubagentState, number>> = {};
+    const counts: Partial<Record<SubagentState, number>> & { dealt?: number } = {};
 
     for (const entry of entries) {
         const state = subagentState(entry);
 
         counts[state] = (counts[state] ?? 0) + 1;
+
+        if (state === "failed" && entry.dealt === true) {
+            counts.dealt = (counts.dealt ?? 0) + 1;
+        }
     }
 
     return counts;
@@ -248,6 +285,10 @@ export class PocketApp {
     readonly pip = new Pip(this);
     /** PiP's context kept small: compacted sooner than a session's, with summaries of its own (`pip-compact.ts`). */
     readonly pipCompaction = new PipCompaction(this);
+    /** Sessions' context pruned before it is summarised, without a model call (`pruner.ts`). */
+    readonly pruner = new Pruner(this);
+    /** What a repeated tool call should not run again (`loop-guard.ts`), judged on the turn's own outcomes. */
+    readonly loopGuard = new LoopGuard();
     /** Sessions' watches of their pull requests (`watches.ts`). */
     readonly watches = new Watches(this);
     /** PiP's standing orders on GitHub repositories: what happens there goes to PiP or a session (`repo-watches.ts`). */
@@ -367,6 +408,7 @@ export class PocketApp {
 
         this.models = await ModelRuntime.create();
         this.#configureModels?.(this.models);
+        measureModelStreams(this.models);
         await this.models.getAvailable().catch(() => []);
 
         const registry = createRegistry();
@@ -374,7 +416,10 @@ export class PocketApp {
         registry.install(CodingTools);
         // Durable work of the app itself, whatever extension modules are on.
         registry.install(
-            defineExtension({ name: "pocket-core", tasks: [ResendTask, this.shell.task] }),
+            defineExtension({
+                name: "pocket-core",
+                tasks: [ResendTask, this.shell.task, this.commands.followTask],
+            }),
         );
         const host: PocketHost = {
             guard: this.guard,
@@ -389,9 +434,14 @@ export class PocketApp {
                 }
             },
             skills: (cwd) => this.skills(cwd),
-            resolveModel: (spec) => resolveModel(this.models, spec),
+            resolveModel: (spec) => resolveModel(this.models, spec, this.signInNeeded),
+            subagentModels: () => this.config.subagentModels,
+            routerFor: (conversationId) => this.routerFor(conversationId),
+            modelProblem: (ref, fresh) => this.providers.problem(ref, fresh),
+            envFor: (conversationId) => this.envFor(conversationId),
             requesterOf: (conversationId) => this.attribution.requesterOf(conversationId),
-            notice: (level, message) => this.notice(level, message),
+            loopGuard: this.loopGuard,
+            notice: (level, message, conversationId) => this.notice(level, message, conversationId),
             heldBack: (conversationId) => this.spend.heldBack(conversationId),
             onLimitsChanged: (listener) => this.spend.onLimitsChanged(listener),
             schedules: this.schedules,
@@ -399,9 +449,11 @@ export class PocketApp {
             browsers: this.browsers,
             pip: this.pip,
             pipCompaction: this.pipCompaction,
+            pruner: this.pruner,
             watches: this.watches,
             repoWatches: this.repoWatches,
             memory: this.memory,
+            readOnlyCalls: new Map(),
         };
 
         this.host = host;
@@ -566,6 +618,19 @@ export class PocketApp {
                 }
             } else if (change.type === "submission") {
                 this.attribution.submissionCommitted(change.value);
+
+                // A run that failed because its provider's sign-in could not be renewed marks that provider; one that
+                // was answered shows its provider works, and a mark it had (signed in again in Pi's terminal app, say)
+                // is asked again.
+                if (change.value.status === "unanswered" && change.value.reason === "model_error") {
+                    this.providers.runFailed(change.value.detail);
+                } else if (change.value.status === "done") {
+                    const provider = this.#agents.get(change.value.conversationId)?.model?.provider;
+
+                    if (provider !== undefined) {
+                        this.providers.runAnswered(provider);
+                    }
+                }
             }
         }
 
@@ -723,7 +788,7 @@ export class PocketApp {
                 return stream();
             },
             get compaction() {
-                return safe(() => settings.getCompactionSettings()) ?? {};
+                return compactionSettings(settings);
             },
             get retry() {
                 return safe(() => settings.getRetrySettings()) ?? {};
@@ -775,6 +840,27 @@ export class PocketApp {
             if (reaches) {
                 client.send("notice", { level, message });
             }
+        }
+    }
+
+    /** A notice for the owner's tabs alone: about what only they may change. */
+    ownerNotice(level: "info" | "warning" | "error", message: string): void {
+        this.#log(`[${level}] ${message}`);
+
+        for (const client of this.#clients) {
+            if (client.user.role === "owner") {
+                client.send("notice", { level, message });
+            }
+        }
+    }
+
+    /** Every open view builds itself again: what it shows from outside its documents changed (a model's sign-in). */
+    refreshViews(): void {
+        for (const pending of this.#rooms.values()) {
+            void pending.then(
+                (room) => room.schedule(),
+                () => {},
+            );
         }
     }
 
@@ -1461,7 +1547,7 @@ export class PocketApp {
                 ...(user.sessions === undefined ? {} : { sessions: user.sessions.map(Number) }),
             },
             users: this.people(user),
-            models: modelList(this.models),
+            models: modelList(this.models, this.config, this.signInNeeded),
             guard: await this.guardStatus(),
             server: {
                 supervised: this.supervised,
@@ -1481,6 +1567,10 @@ export class PocketApp {
                 approvalRule: this.config.approvalRule,
                 // The model and thinking level new sessions start with, or null for the last one picked.
                 defaultModel: this.config.defaultModel ?? null,
+                // The models Pi may start subagents on besides their session's own: the owner's to see and change.
+                ...(user.role === "owner"
+                    ? { subagentModels: [...this.config.subagentModels] }
+                    : {}),
                 // This person may have a PiP, the assistant over every screen (`pip.ts`).
                 pip: this.pip.available(user),
                 // Tokens of context above which PiP compacts itself once idle; 0: only as sessions do.
@@ -1667,6 +1757,47 @@ export class PocketApp {
     }
 
     /** A conversation's handle; 404 when it does not exist. */
+    /** Where a conversation's context goes: system prompt by section, tool schemas, and history by kind. */
+    async contextMeter(id: ConversationId): Promise<ContextMeter> {
+        return contextMeter((await (await this.conversation(id)).context(context)).messages);
+    }
+
+    /** The context baseline the owner took here, if any: what the context measured like before a change. */
+    async contextBaseline(id: ConversationId) {
+        const baseline = await this.harness.snapshot(ContextBaselineDoc, id, context);
+
+        return baseline?.takenAt === 0 ? undefined : baseline;
+    }
+
+    /** Take the conversation's context meter as the baseline the next meter is diffed against. */
+    async takeContextBaseline(id: ConversationId) {
+        const meter = await this.contextMeter(id);
+        const takenAt = Date.now();
+
+        await this.harness.commit(async (tx) => {
+            Object.assign(await tx.doc(ContextBaselineDoc, id), {
+                takenAt,
+                measured: meter.measured,
+                tokens: meter.tokens,
+                rows: meter.rows,
+            });
+        }, context);
+
+        return { takenAt, measured: meter.measured, tokens: meter.tokens, rows: meter.rows };
+    }
+
+    /** Forget the baseline, so the next meter stands on its own. */
+    async clearContextBaseline(id: ConversationId) {
+        await this.harness.commit(async (tx) => {
+            Object.assign(await tx.doc(ContextBaselineDoc, id), {
+                takenAt: 0,
+                measured: false,
+                tokens: 0,
+                rows: [],
+            });
+        }, context);
+    }
+
     async conversation(id: ConversationId): Promise<Conversation> {
         const conversation = await this.harness.conversation(id, context);
 
@@ -2256,10 +2387,278 @@ export class PocketApp {
         await this.#refreshClients();
     }
 
-    /** Send every client a fresh hello: the guard's status and the extension names changed. */
-    async #refreshClients(): Promise<void> {
+    /**
+     * Whether a provider's sign-in expired and needs a person to sign in again: the model menu and a session's model chip
+     * mark its models, and subagents on another model are refused them (`resolveModel`). A session's own run still tries.
+     */
+    readonly signInNeeded = (provider: string): boolean =>
+        this.providers.needsSignIn(provider) !== undefined;
+
+    /** Routers, read again at most every few seconds: rooms and prompts ask for them often. */
+    #routers: { at: number; list: RouterConfig[] } | undefined;
+
+    /** Every router (`routers.ts`): detected on this machine, and saved from the router editor. */
+    routers(fresh = false): RouterConfig[] {
+        const now = Date.now();
+
+        if (fresh || this.#routers === undefined || now - this.#routers.at > 3000) {
+            this.#routers = {
+                at: now,
+                list: allRouters(
+                    this.dataDir,
+                    (id) => {
+                        const model = findModel(this.models, id);
+
+                        return model === undefined
+                            ? undefined
+                            : { provider: model.provider, modelId: model.id };
+                    },
+                    this.#home,
+                ),
+            };
+        }
+
+        return this.#routers.list;
+    }
+
+    /** The router a conversation runs as; a subagent's is its session's, as its stages work for that router. */
+    async routerFor(id: ConversationId): Promise<RouterConfig | undefined> {
+        const chosen = (await this.harness.snapshot(RouterDoc, id, context))?.router;
+
+        return chosen === undefined
+            ? undefined
+            : this.routers().find((router) => router.id === chosen);
+    }
+
+    /** Save a router from the editor (the owner): a new one, or one that takes a detected one's place. */
+    saveRouter(user: User, input: unknown): RouterConfig {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        let router: RouterConfig;
+
+        try {
+            router = checkRouter(
+                input,
+                (spec) => this.resolveModelSpec(spec),
+                THINKING_LEVELS,
+                listAgents(this.dataDir).map((agent) => agent.name),
+                this.skills(this.defaultCwd).map((skill) => skill.name),
+            );
+        } catch (error) {
+            throw new HttpError(400, describe(error));
+        }
+
+        saveRouter(this.dataDir, router);
+
+        return this.routers(true).find((each) => each.id === router.id)!;
+    }
+
+    /** Delete a saved router (the owner); a detected one with its id shows again. */
+    deleteRouter(user: User, id: unknown): void {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        if (typeof id !== "string" || !deleteRouter(this.dataDir, id)) {
+            throw new HttpError(404, "No saved router by that id");
+        }
+
+        this.routers(true);
+    }
+
+    /** What the router editor shows: the routers, each with its prompt as it is now, and the roles there are. */
+    routerEditorState() {
+        return {
+            routers: this.routers(true).map((router) => ({
+                ...router,
+                promptText: promptOf(router) ?? "",
+            })),
+            thinkingLevels: THINKING_LEVELS,
+            // What a stage can start from, and the skills installed here that a stage can read first.
+            templates: TEMPLATE_INFO,
+            skills: this.skills(this.defaultCwd).map((skill) => ({
+                name: skill.name,
+                description: skill.description,
+            })),
+            roles: listAgents(this.dataDir).map((agent) => ({
+                name: agent.name,
+                ...(agent.model === undefined ? {} : { model: agent.model }),
+                ...(agent.description === undefined ? {} : { description: agent.description }),
+            })),
+        };
+    }
+
+    /** `provider/modelId` (or a bare model id) to a model Pi may use now, or an error that says why not. */
+    resolveModelSpec(spec: string): ModelRef {
+        return resolveModel(this.models, spec, this.signInNeeded);
+    }
+
+    /** Agent definitions, read again at most every few seconds: a room asks for them each time it sends its state. */
+    #definitions: { at: number; list: AgentDefinition[] } | undefined;
+
+    /**
+     * What a session's subagents may run on, for its people: its choice (`SubagentPolicyDoc`), that choice in a word for
+     * the message box's chip, and the models it allows besides the session's own and the owner's.
+     */
+    subagentsView(
+        policy: SubagentPolicy | undefined,
+        own: ModelRef | undefined,
+    ): { mode: SubagentMode; label: string; models: string[]; allowed: string[] } {
+        const now = Date.now();
+
+        if (this.#definitions === undefined || now - this.#definitions.at > 5000) {
+            this.#definitions = { at: now, list: listAgents(this.dataDir) };
+        }
+
+        const mode = policy?.mode ?? "auto";
+        const allowed = policyModels(policy, own, this.#definitions.list, (spec) =>
+            this.resolveModelSpec(spec),
+        ).filter((spec) => own === undefined || spec !== `${own.provider}/${own.modelId}`);
+
+        return { mode, label: policyLabel(mode, allowed), models: policy?.models ?? [], allowed };
+    }
+
+    /**
+     * The owner picks the models Pi may start subagents on besides their session's own (`provider/modelId`, models Pi
+     * knows). Empty, the default: none, and the subagent tool offers Pi no choice of model at all. The tool is rebuilt
+     * to match, so its description and parameters say what Pi may do. This replaces the whole list; the Providers sheet
+     * changes one model at a time (`allowSubagentModel`).
+     */
+    async setSubagentModels(user: User, models: unknown): Promise<void> {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        if (
+            !Array.isArray(models) ||
+            models.length > MAX_SUBAGENT_MODELS ||
+            models.some((each) => typeof each !== "string")
+        ) {
+            throw new HttpError(
+                400,
+                `subagentModels must be a list of at most ${String(MAX_SUBAGENT_MODELS)} models, each provider/modelId`,
+            );
+        }
+
+        const chosen: string[] = [];
+
+        for (const spec of models as string[]) {
+            const slash = spec.indexOf("/");
+            const model =
+                slash > 0
+                    ? this.models.getModel(spec.slice(0, slash), spec.slice(slash + 1))
+                    : undefined;
+
+            if (model === undefined) {
+                throw new HttpError(400, `${spec} is not a model Pi knows (provider/modelId).`);
+            }
+
+            const key = `${model.provider}/${model.id}`;
+
+            if (!chosen.includes(key)) {
+                chosen.push(key);
+            }
+        }
+
+        await this.#saveSubagentModels(chosen);
+    }
+
+    /**
+     * The owner allows one model for subagents, or stops allowing it, and keeps the rest as they are now: what the
+     * Providers sheet sends, so two quick taps, or two tabs, never undo each other. The list is read and written with no
+     * wait between, so changes that come together all count. A model stopped need not be one Pi still knows. Returns the
+     * list as it is then.
+     */
+    async allowSubagentModel(
+        user: User,
+        model: unknown,
+        allowed: unknown,
+    ): Promise<readonly string[]> {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        if (typeof model !== "string" || typeof allowed !== "boolean") {
+            throw new HttpError(400, "Send model (provider/modelId) and allowed (true or false).");
+        }
+
+        const current = this.config.subagentModels;
+        let chosen = current.filter((each) => each !== model);
+
+        if (allowed) {
+            const slash = model.indexOf("/");
+            const found =
+                slash > 0
+                    ? this.models.getModel(model.slice(0, slash), model.slice(slash + 1))
+                    : undefined;
+
+            if (found === undefined) {
+                throw new HttpError(400, `${model} is not a model Pi knows (provider/modelId).`);
+            }
+
+            const key = `${found.provider}/${found.id}`;
+
+            chosen = current.includes(key) ? [...current] : [...current, key];
+
+            if (chosen.length > MAX_SUBAGENT_MODELS) {
+                throw new HttpError(
+                    400,
+                    `At most ${String(MAX_SUBAGENT_MODELS)} models can be allowed for subagents.`,
+                );
+            }
+        }
+
+        await this.#saveSubagentModels(chosen);
+
+        return this.config.subagentModels;
+    }
+
+    /**
+     * Keep the models for subagents, rebuild the subagent tool to match, and tell the owner's tabs, the only ones whose
+     * hello carries the list.
+     */
+    async #saveSubagentModels(chosen: readonly string[]): Promise<void> {
+        const before = this.config.subagentModels;
+
+        if (JSON.stringify(before) === JSON.stringify(chosen)) {
+            return;
+        }
+
+        this.config.subagentModels = chosen;
+
+        // The tool offers a model only while some are allowed: rebuilt now, for the next request of every session.
+        if (this.loader.enabled(SUBAGENTS_FILE)) {
+            try {
+                await this.loader.reload(SUBAGENTS_FILE);
+            } catch (error) {
+                this.notice("error", `Subagents failed to reload: ${describe(error)}`);
+            }
+        }
+
+        await this.#refreshClients((user) => user.role === "owner");
+        // What changed: the checklist shows the rest.
+        const added = chosen.filter((each) => !before.includes(each));
+        const removed = before.filter((each) => !chosen.includes(each));
+        const said = [
+            ...(added.length === 0 ? [] : [`${added.join(", ")} allowed for subagents`]),
+            ...(removed.length === 0
+                ? []
+                : [`${removed.join(", ")} no longer allowed for subagents`]),
+        ];
+
+        if (said.length > 0) {
+            this.ownerNotice("info", `${said.join("; ")}.`);
+        }
+    }
+
+    /** Send clients a fresh hello, every one or those of the people `to` names: what it carries changed. */
+    async #refreshClients(to: (user: User) => boolean = () => true): Promise<void> {
         for (const client of this.#clients) {
-            client.send("hello", this.#helloFor(client, await this.hello(client.user)));
+            if (to(client.user)) {
+                client.send("hello", this.#helloFor(client, await this.hello(client.user)));
+            }
         }
     }
 

@@ -7,32 +7,43 @@
  *
  * Everything survives a restart: anchors, reporters, and the courier that delivers reports are durable tasks, and
  * request IDs keep a restarted task from delivering a message or a report twice.
+ *
+ * Models are a person's to choose: a subagent runs on its session's model, thinking no harder than the session, unless
+ * the owner allowed other models for subagents (`subagentModels`), and then only on one of those. A subagent its model
+ * or provider failed is reported as such, and Pi is told to stop and tell the user, never to try another model.
  */
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, Type } from "@earendil-works/pi-ai";
 import type { Context } from "@earendil-works/chord";
 import {
+    AgentDoc,
     AssistantEntry,
     type ConversationId,
     configure,
     defineExtension,
     defineTask,
     defineTool,
+    type DocumentReader,
     type Extension,
     InboxDoc,
     LiveDoc,
+    type ModelRef,
     section,
     type SubmissionId,
     type SubmissionRecord,
+    type TaskId,
     type TaskRuntime,
     type Tx,
 } from "@earendil-works/pi-durable";
-import { listAgents, loadAgent } from "../agents.ts";
-import { type PendingReport, REPORT_PREFIX, STOPPED, SubagentsDoc } from "../docs.ts";
+import { type AgentDefinition, listAgents, loadAgent } from "../agents.ts";
+import { type PendingReport, REPORT_PREFIX, SubagentPolicyDoc, SubagentsDoc } from "../docs.ts";
 import { describe } from "../errors.ts";
 import type { PocketHost } from "../host.ts";
-import { THINKING_LEVELS } from "../models.ts";
+import { levelAtMost, sameModel, THINKING_LEVELS } from "../models.ts";
 import { requestFor } from "../requests.ts";
+import { stageDefinition, stageModels, stageOf } from "../routers.ts";
+import { definitionModel, keyOf, policyModels, type SubagentMode } from "../subagent-policy.ts";
+import { whyUnanswered } from "../subagent-runs.ts";
 
 function textOf(message: AssistantMessage | undefined): string {
     return (message?.content ?? [])
@@ -62,19 +73,24 @@ const Anchor = defineTask<null, { phase: "done" }, null>({
         runtime.commit(() => ({ status: "terminal", outcome: { status: "aborted" } }), context),
 });
 
-/** `requestedBy`: whom the parent worked for when it sent the message, whose work the subagent's then is. */
+/**
+ * `requestedBy`: whom the parent worked for when it sent the message, whose work the subagent's then is. `waiter`: the
+ * parent's tool call that waits for the answer (`wait: true`); the answer is its result instead of a report, unless that
+ * call is gone by then (stopped, or cut off by a restart).
+ */
 type ReporterInput = {
     name: string;
     conversationId: ConversationId;
     message: string;
     followUp: boolean;
     requestedBy?: string;
+    waiter?: TaskId;
 };
 type ReporterState = { phase: "deliver" } | { phase: "report"; report?: string };
 
 /** Delivers one message to a subagent, waits for the answer, and reports it to the parent, through `Courier`. */
-function reporterFor(Courier: CourierTask) {
-    return defineTask<ReporterInput, ReporterState, null>({
+function reporterFor(Courier: CourierTask, host: Pick<PocketHost, "notice">) {
+    return defineTask<ReporterInput, ReporterState, string | null>({
         name: "pocket.subagent-reporter",
         version: 1,
         initial: () => ({ phase: "deliver" }),
@@ -129,6 +145,16 @@ function reporterFor(Courier: CourierTask) {
                     await withdrawing.catch(() => {});
                 }
 
+                // A failure of its model or provider (a sign-in, a model that is gone, a quota): named, with the model.
+                const modelFailed =
+                    !withdrawn &&
+                    settled.status === "unanswered" &&
+                    modelFailure(settled.reason, settled.detail);
+                const ran = modelFailed
+                    ? (await runtime.snapshot(AgentDoc, conversationId, context))?.model
+                    : undefined;
+                const ranOn = ran === undefined ? "" : `${ran.provider}/${ran.modelId}: `;
+
                 await runtime.commit(async (tx) => {
                     const next = (report?: string) =>
                         ({ status: "running", checkpoint: { phase: "report", report } }) as const;
@@ -138,7 +164,7 @@ function reporterFor(Courier: CourierTask) {
                     if (settled.status === "unanswered") {
                         const why = withdrawn
                             ? IDLE
-                            : whyUnanswered(settled.reason, settled.detail);
+                            : `${ranOn}${whyUnanswered(settled.reason, settled.detail)}`;
 
                         if (agent !== undefined) {
                             agent.answeredAt = Date.now();
@@ -146,8 +172,11 @@ function reporterFor(Courier: CourierTask) {
                             agent.error = why;
                         }
 
-                        // Stopped too: Pi may be waiting for its answer, and is told none comes.
-                        return next(`${REPORT_PREFIX}${name} failed: ${why}]`);
+                        // Stopped too: Pi may be waiting for its answer, and is told none comes. One its model failed
+                        // tells Pi to stop and tell its person, not to try again on another model.
+                        return next(
+                            `${REPORT_PREFIX}${name} failed: ${why}]${modelFailed ? ` ${MODEL_FAILED}` : ""}`,
+                        );
                     }
 
                     if (settled.type !== "input") {
@@ -169,6 +198,15 @@ function reporterFor(Courier: CourierTask) {
                         `${REPORT_PREFIX}${name} answered, no reply needed] ${textOf(answer)}`,
                     );
                 }, context);
+
+                // The people in the session see it at once, as well as in its report.
+                if (modelFailed && settled.status === "unanswered") {
+                    host.notice(
+                        "warning",
+                        `Subagent ${name} failed: ${ranOn}${whyUnanswered(settled.reason, settled.detail)}. Pi was told to stop and tell you, not to switch models.`,
+                        runtime.conversationId,
+                    );
+                }
             },
             // The report waits with the others for the courier, which this starts when none is at work. A batch still in the
             // parent's queue takes it too: it is taken back out, and goes again with this one, so the queue holds one
@@ -185,6 +223,20 @@ function reporterFor(Courier: CourierTask) {
                             runtime.conversationId,
                             `subagent-report:${reporter.id}`,
                         )) !== undefined;
+
+                    // The tool call waiting for it takes the answer as its result, while it still waits.
+                    const waiter = reporter.input.waiter;
+
+                    if (
+                        report !== undefined &&
+                        waiter !== undefined &&
+                        (await tx.task(waiter))?.state.status !== "terminal"
+                    ) {
+                        return {
+                            status: "terminal",
+                            outcome: { status: "completed", result: report },
+                        };
+                    }
 
                     if (report !== undefined && !sentBefore) {
                         const id = runtime.conversationId;
@@ -222,17 +274,24 @@ function reporterFor(Courier: CourierTask) {
 /** Tasks of a conversation that run beside its work: its Esc and idle waits do not reach them. */
 const BACKGROUND = { ownership: { kind: "conversation" }, background: true } as const;
 
-/** Why a subagent did not answer, for its report and its row: what went wrong, in a line, or that it was stopped. */
-function whyUnanswered(reason: string, detail: unknown): string {
-    if (reason === "aborted") {
-        return STOPPED;
-    }
+/**
+ * What a provider says when the model or its account is the problem (a sign-in, a model that is gone or refused, a
+ * quota or rate limit, an overload), not the request: a context that will not fit, say, is Pi's to work around.
+ */
+const PROVIDER_TROUBLE =
+    /oauth|sign.?in|auth|api.?key|unauthori[sz]ed|forbidden|permission|\b(401|402|403|404|429|503|529)\b|not found|does not exist|no such model|not available|not configured|unsupported model|quota|rate.?limit|insufficient|billing|credit|usage limit|overloaded/i;
 
-    const text = typeof detail === "string" && detail.trim() !== "" ? detail : reason;
-
-    // One line, and no "]", which ends a report's head.
-    return text.replace(/\s+/g, " ").replace(/]/g, ")").trim().slice(0, 200);
+/** Whether a run ended unanswered because of its model or provider: no model to use, or the provider's trouble. */
+function modelFailure(reason: string, detail: unknown): boolean {
+    return (
+        reason === "no_model" ||
+        (reason === "model_error" && typeof detail === "string" && PROVIDER_TROUBLE.test(detail))
+    );
 }
+
+/** What a report of a subagent its model failed tells Pi, after why. */
+export const MODEL_FAILED =
+    "Its model or provider failed. Do not start it again on another model, and do not work around it: stop, and tell the user what failed and why. Only the user chooses models, and signs in again.";
 
 /** The submission of the batch `request`, while it waits in `conversationId`'s queue; undefined once it has left. */
 async function queuedBatch(
@@ -608,61 +667,212 @@ function courierFor(limits: Limits) {
     });
 }
 
-const GUIDE = `You can delegate to background subagents with the subagent tool. A subagent is a separate agent with its own transcript that works while you keep talking to the user; its answer comes back to you at your next pause (after a tool call, or when you are done) as a message starting with "${REPORT_PREFIX}<name> answered". Answers that arrive together come in one message. Use them for independent, self-contained work (research, long builds, test runs, a second opinion). Give each message everything the subagent needs: it does not see this conversation. Do not poll: wait for the report. The user can open a subagent and talk to it directly.`;
+const GUIDE = `You can delegate to background subagents with the subagent tool. A subagent is a separate agent with its own transcript that works while you keep talking to the user; its answer comes back to you at your next pause (after a tool call, or when you are done) as a message starting with "${REPORT_PREFIX}<name> answered". Answers that arrive together come in one message. Use them for independent, self-contained work (research, long builds, test runs, a second opinion). Give each message everything the subagent needs: it does not see this conversation. Do not poll: wait for the report. The user can open a subagent and talk to it directly.
+A subagent runs on your model, thinking as hard as you or less. Models are the user's to choose: never pick one on your own. If a subagent fails because of its model or provider (a sign-in, a missing model, a quota), stop and tell the user what failed; never start it again on another model.`;
+
+/** What the tool says when Pi names a model, and none but its own may be used. */
+const NO_CHOICE =
+    "Subagents run on this session's model: you cannot choose another. Leave model out. If the work needs a different model, stop and ask the user: only they choose models, here with /subagents (local lets your agent definitions run on their own models).";
+
+/** The models the owner allows subagents everywhere besides their session's own; none on a server older than that. */
+function ownerModels(host: PocketHost): readonly string[] {
+    return typeof host.subagentModels === "function" ? host.subagentModels() : [];
+}
+
+/**
+ * The models this session's subagents may run on besides the session's own: the owner's, and those its person's choice
+ * (`/subagents`) allows, as `provider/modelId`, each once.
+ */
+async function allowedFor(
+    host: PocketHost,
+    read: Pick<DocumentReader, "snapshot">,
+    id: ConversationId,
+    own: ModelRef | undefined,
+    context: Context,
+): Promise<{ mode: SubagentMode; allowed: string[] }> {
+    const policy = await read.snapshot(SubagentPolicyDoc, id, context);
+    const mode = policy?.mode ?? "auto";
+    const resolve = (spec: string) => host.resolveModel(spec);
+    const chosen = policyModels(policy, own, listAgents(host.dataDir), resolve);
+    // A router's stages run where its person set them: choosing the router chose those models.
+    const router = await host.routerFor?.(id);
+    const stages = stageModels(router);
+    const allowed = [...new Set([...ownerModels(host), ...chosen, ...stages])].filter(
+        (spec) => own === undefined || spec !== keyOf(own),
+    );
+
+    return { mode, allowed };
+}
+
+/** `provider/modelId` as a model reference. */
+function refOf(spec: string): ModelRef | undefined {
+    const slash = spec.indexOf("/");
+
+    return slash > 0
+        ? { provider: spec.slice(0, slash), modelId: spec.slice(slash + 1) }
+        : undefined;
+}
+
+const same = (a: ModelRef | undefined, b: ModelRef | undefined) =>
+    a !== undefined && b !== undefined && keyOf(a) === keyOf(b);
+
+/** Why Pi may not use a model now (its sign-in, say), or undefined; nothing to say on a server older than the check. */
+async function problemOf(host: PocketHost, ref: ModelRef, fresh: boolean) {
+    return typeof host.modelProblem === "function" ? host.modelProblem(ref, fresh) : undefined;
+}
+
+/** The guide, and the models this session's subagents may also use, each that cannot be used now saying why. */
+async function guide(host: PocketHost, allowed: readonly string[]): Promise<string> {
+    if (allowed.length === 0) {
+        return GUIDE;
+    }
+
+    const listed = await Promise.all(
+        allowed.map(async (spec) => {
+            const ref = refOf(spec);
+            const problem = ref === undefined ? undefined : await problemOf(host, ref, false);
+
+            return problem === undefined ? spec : `${spec} (not now: ${problem})`;
+        }),
+    );
+
+    return `${GUIDE}\nThe user also allows subagents on these models, passed as model: ${listed.join(", ")}. Leave model out unless the work needs one of them; no others.`;
+}
+
+/**
+ * The model a subagent asked for may run on: undefined for this session's own (asked for, or left out), else one of
+ * `allowed` whose sign-in works now. Anything else is refused with a message that tells Pi to go to the user, never to
+ * pick another model.
+ */
+async function chosenModel(
+    host: PocketHost,
+    asked: unknown,
+    own: ModelRef | undefined,
+    allowed: readonly string[],
+): Promise<ModelRef | undefined> {
+    if (asked === undefined) {
+        return undefined;
+    }
+
+    if (typeof asked !== "string") {
+        throw new Error(NO_CHOICE);
+    }
+
+    if (sameModel(asked, own)) {
+        return undefined;
+    }
+
+    if (allowed.length === 0) {
+        throw new Error(NO_CHOICE);
+    }
+
+    let ref: ModelRef;
+    const named = refOf(asked.trim());
+
+    // Its sign-in asked afresh first, so a mark that is out of date neither refuses it nor lets it through.
+    if (named !== undefined && allowed.includes(keyOf(named))) {
+        await problemOf(host, named, true);
+    }
+
+    try {
+        ref = host.resolveModel(asked);
+    } catch (error) {
+        throw new Error(
+            `${describe(error)} Do not pick another model: leave model out to use this session's model, or stop and tell the user.`,
+        );
+    }
+
+    if (!allowed.includes(keyOf(ref))) {
+        throw new Error(
+            `${keyOf(ref)} is not one of the models the user allows for subagents in this session (${allowed.join(", ")}). Do not pick another model on your own: leave model out to use this session's model, or stop and ask the user (they choose with /subagents).`,
+        );
+    }
+
+    const problem = await problemOf(host, ref, named === undefined);
+
+    if (problem !== undefined) {
+        throw new Error(
+            `${keyOf(ref)} cannot be used now: ${problem}. Stop and tell the user; do not use another model instead.`,
+        );
+    }
+
+    return ref;
+}
+
+/** Where a level stands among the thinking levels, lowest first. */
+const rank = (level: ModelThinkingLevel) => THINKING_LEVELS.indexOf(level);
 
 export default function createSubagents(host: PocketHost) {
     const Courier = courierFor(host);
-    const Reporter = reporterFor(Courier);
+    const Reporter = reporterFor(Courier, host);
+    const base = {
+        action: Type.Union([
+            Type.Literal("spawn"),
+            Type.Literal("send"),
+            Type.Literal("stop"),
+            Type.Literal("status"),
+        ]),
+        name: Type.Optional(
+            Type.String({ description: "Short kebab-case name, for example test-runner." }),
+        ),
+        message: Type.Optional(Type.String()),
+        followUp: Type.Optional(Type.Boolean()),
+        wait: Type.Optional(
+            Type.Boolean({
+                description:
+                    "spawn and send: return the subagent's answer as this call's result, instead of a message later.",
+            }),
+        ),
+        agent: Type.Optional(
+            Type.String({
+                description:
+                    "spawn only: an agent definition to start as (its role, model, thinking level, and tools). " +
+                    "The other spawn options override it. Its model is used only where this session allows it; " +
+                    "otherwise it runs on your model.",
+            }),
+        ),
+        thinking: Type.Optional(
+            Type.Union(
+                THINKING_LEVELS.map((level) => Type.Literal(level)),
+                {
+                    description:
+                        "spawn only: its thinking level, yours or lower. One its model lacks becomes the nearest lower one it has.",
+                },
+            ),
+        ),
+        tools: Type.Optional(
+            Type.Array(Type.String(), {
+                description: "spawn only: the tool names it may use. Default: your tools.",
+            }),
+        ),
+    };
+    // Always offered: which models a subagent may use depends on the session (`/subagents`), and the call checks.
+    const parameters = Type.Object({
+        ...base,
+        model: Type.Optional(
+            Type.String({
+                description:
+                    "spawn only: one of the models the user allows for subagents in this session, listed in your instructions, as provider/modelId. Leave it out to use your own model.",
+            }),
+        ),
+    });
 
     const subagent = defineTool({
         name: "subagent",
         description:
-            "Manage persistent background subagents. Actions: spawn (name, message; optional agent definition, model as " +
-            "provider/modelId, thinking level, and tools to allow), send (name, message; followUp: true queues it after the current answer " +
-            "instead of steering), stop (name: aborts its current work), status (one name, or all). Answers come back " +
-            "to you as messages at your next pause; those that arrive together come in one.",
-        parameters: Type.Object({
-            action: Type.Union([
-                Type.Literal("spawn"),
-                Type.Literal("send"),
-                Type.Literal("stop"),
-                Type.Literal("status"),
-            ]),
-            name: Type.Optional(
-                Type.String({ description: "Short kebab-case name, for example test-runner." }),
-            ),
-            message: Type.Optional(Type.String()),
-            followUp: Type.Optional(Type.Boolean()),
-            agent: Type.Optional(
-                Type.String({
-                    description:
-                        "spawn only: an agent definition to start as (its role, model, thinking level, and tools). " +
-                        "The other spawn options override it.",
-                }),
-            ),
-            model: Type.Optional(
-                Type.String({ description: "spawn only: provider/modelId. Default: your model." }),
-            ),
-            thinking: Type.Optional(
-                Type.Union(
-                    THINKING_LEVELS.map((level) => Type.Literal(level)),
-                    {
-                        description:
-                            "spawn only: its thinking level. One its model lacks becomes the nearest it has.",
-                    },
-                ),
-            ),
-            tools: Type.Optional(
-                Type.Array(Type.String(), {
-                    description: "spawn only: the tool names it may use. Default: your tools.",
-                }),
-            ),
-        }),
+            "Manage persistent background subagents. Actions: spawn (name, message; optional agent definition, " +
+            "model, only one the user allows in this session (it runs on your model otherwise), " +
+            "thinking level, yours or lower, and tools to allow), send (name, message; followUp: true queues it after the current answer instead of steering), stop " +
+            "(name: aborts its current work), status (one name, or all). Answers come back to you as messages at your " +
+            "next pause; those that arrive together come in one. With wait: true, spawn and send return the answer " +
+            "as their result instead, and you take no turn until it comes: use it for a stage you would only wait " +
+            "for anyway.",
+        parameters,
         // Not rerun after a crash: repeating stop could stop newer work. The model sees the interruption and can check
         // with status.
         replay: "unsafe",
         execute: async (args, api, context) => {
-            const { action, name, message, followUp } = args;
+            const { action, name, message, followUp, wait } = args;
             const reply = (text: string, conversationId?: ConversationId) => ({
                 content: [{ type: "text" as const, text }],
                 ...(conversationId === undefined || name === undefined
@@ -724,11 +934,107 @@ export default function createSubagents(host: PocketHost) {
                 return reply(`${action} needs a message.`);
             }
 
-            // Resolve spawn options before the commit, so a bad model or agent name fails without side effects.
-            const definition =
+            const parent = await api.agent(context);
+            // The router this session runs as: its stages' models and thinking levels are its person's choice.
+            const router = await host.routerFor?.(api.conversationId);
+            const higher = (a: ModelThinkingLevel, b: ModelThinkingLevel) =>
+                rank(a) >= rank(b) ? a : b;
+            const routerMost = (router?.pipeline ?? [])
+                .flatMap((stage) => (stage.thinking ? [stage.thinking] : []))
+                .reduce<ModelThinkingLevel>(
+                    (most, level) => higher(most, level as ModelThinkingLevel),
+                    parent.thinkingLevel ?? "off",
+                );
+            const { allowed } = await allowedFor(
+                host,
+                api,
+                api.conversationId,
+                parent.model,
+                context,
+            );
+
+            // Work goes to a subagent only on this session's model, or one the owner allows: one started on a model the
+            // owner no longer allows (or before there was a choice) gets none. A model a person set there is the
+            // owner's to allow too.
+            // A subagent started before thinking was capped, or one a person raised, thinks no harder than the session
+            // for this work: lowered (never raised) as the work is sent.
+            let lowered: ModelThinkingLevel | undefined;
+
+            if (action === "send") {
+                const child = await api.snapshot(AgentDoc, agent!.conversationId, context);
+                const runs = child?.model;
+                // A router's stage may think as hard as its person set any stage.
+                const most = routerMost;
+                const level = child?.thinkingLevel;
+                const found =
+                    runs === undefined
+                        ? undefined
+                        : api.models.getModel(runs.provider, runs.modelId);
+
+                if (level !== undefined && rank(level) > rank(most)) {
+                    lowered = (found === undefined ? undefined : levelAtMost(found, most)) ?? most;
+                }
+
+                if (runs !== undefined && !same(runs, parent.model)) {
+                    if (!allowed.includes(keyOf(runs))) {
+                        throw new Error(
+                            `${name} runs on ${keyOf(runs)}, which is neither this session's model nor one the user allows for subagents. Do not send it work: start a new subagent, which runs on this session's model, or ask the user.`,
+                        );
+                    }
+
+                    const problem = await problemOf(host, runs, true);
+
+                    if (problem !== undefined) {
+                        throw new Error(
+                            `${name} runs on ${keyOf(runs)}, which cannot be used now: ${problem}. Stop and tell the user; do not use another model instead.`,
+                        );
+                    }
+                }
+            }
+
+            // Resolve spawn options before the commit, so a bad agent name or refused model fails without side effects.
+            // A router's own stage first: its template and skills, or the person's role file it names.
+            const pipelineStage =
                 action === "spawn" && args.agent !== undefined
-                    ? loadAgent(host.dataDir, args.agent)
+                    ? router?.pipeline?.find((stage) => stage.id === args.agent)
                     : undefined;
+
+            // A router from the editor runs its own stages and nothing else: no one's role files, which may run elsewhere.
+            if (
+                action === "spawn" &&
+                args.agent !== undefined &&
+                router?.pipeline !== undefined &&
+                pipelineStage === undefined
+            ) {
+                throw new Error(
+                    `${args.agent} is not a stage of the router ${router.label}. Its stages: ${router.pipeline.map((stage) => stage.id).join(", ")}. Spawn one of them, or leave agent out to work on this session's model.`,
+                );
+            }
+
+            const skillFile = (name: string) =>
+                typeof host.skills === "function"
+                    ? host.skills(parent.cwd ?? process.cwd()).find((skill) => skill.name === name)
+                          ?.filePath
+                    : undefined;
+            const definition =
+                pipelineStage !== undefined
+                    ? pipelineStage.role === undefined
+                        ? stageDefinition(pipelineStage, skillFile)
+                        : (() => {
+                              const role = loadAgent(host.dataDir, pipelineStage.role);
+
+                              return {
+                                  ...role,
+                                  ...stageDefinition(
+                                      { ...pipelineStage, instructions: role.instructions },
+                                      skillFile,
+                                  ),
+                                  ...(role.tools === undefined ? {} : { tools: role.tools }),
+                              };
+                          })()
+                    : action === "spawn" && args.agent !== undefined
+                      ? loadAgent(host.dataDir, args.agent)
+                      : undefined;
 
             if (
                 definition?.thinking !== undefined &&
@@ -739,16 +1045,39 @@ export default function createSubagents(host: PocketHost) {
                 );
             }
 
-            const modelSpec = args.model ?? definition?.model;
             const toolNames = args.tools ?? definition?.tools;
-            const model =
-                action === "spawn" && modelSpec !== undefined
-                    ? host.resolveModel(modelSpec)
+            const askedModel = (args as { model?: unknown }).model;
+            // A model passed to spawn is Pi's choice, refused unless allowed. A definition's model is its role's: used
+            // where this session allows it, and otherwise the role runs on this session's model, and Pi is told so.
+            // In a router session, a stage role runs on the model the router gives it, not its definition's.
+            const stage = definition === undefined ? undefined : stageOf(router, definition.name);
+            const stageModel = stage?.model;
+            const stageThinking = stage?.thinking as ModelThinkingLevel | undefined;
+            const fromDefinition =
+                action === "spawn" && askedModel === undefined && definition !== undefined
+                    ? definitionModel(
+                          stageModel === undefined
+                              ? definition
+                              : { ...definition, model: stageModel },
+                          (spec) => host.resolveModel(spec),
+                      )
                     : undefined;
-            const parentTools =
-                action === "spawn" && toolNames !== undefined
-                    ? (await api.agent(context)).tools
-                    : [];
+            const definitionAllowed =
+                fromDefinition !== undefined &&
+                (same(fromDefinition, parent.model) || allowed.includes(keyOf(fromDefinition)));
+            const model =
+                action !== "spawn"
+                    ? undefined
+                    : fromDefinition === undefined || definitionAllowed
+                      ? await chosenModel(
+                            host,
+                            askedModel ??
+                                (fromDefinition === undefined ? undefined : keyOf(fromDefinition)),
+                            parent.model,
+                            allowed,
+                        )
+                      : undefined;
+            const parentTools = action === "spawn" && toolNames !== undefined ? parent.tools : [];
             const tools =
                 action !== "spawn" || toolNames === undefined
                     ? undefined
@@ -764,22 +1093,46 @@ export default function createSubagents(host: PocketHost) {
                           return found;
                       });
             // TypeBox infers no type from a union built from a list; the schema itself checks the value.
-            const asked = (args.thinking ?? definition?.thinking) as ModelThinkingLevel | undefined;
-            let wanted = asked;
-            let thinking = asked;
+            const asked = (args.thinking ?? stageThinking ?? definition?.thinking) as
+                ModelThinkingLevel | undefined;
+            // The session's own level is the most a subagent may think: its person chose it. A router's stage level is
+            // its person's choice too, and may be higher.
+            const most =
+                stageThinking !== undefined && args.thinking === undefined
+                    ? higher(parent.thinkingLevel ?? "off", stageThinking)
+                    : (parent.thinkingLevel ?? "off");
+            const wanted = asked === undefined ? most : rank(asked) > rank(most) ? most : asked;
+            const notes: string[] = [];
+            let thinking: ModelThinkingLevel | undefined;
 
-            // As the model picker does: the level asked for, or else the one it starts with as a copy of this agent, and
-            // when its model lacks that level, the nearest one it has.
+            if (asked !== undefined && rank(asked) > rank(most)) {
+                notes.push(`no higher than this session's ${most}`);
+            }
+
+            // As the model picker does, but never up: the level wanted, and when its model lacks that level, the nearest
+            // lower one it has. On this session's own model, the level the session itself gets when even its lowest is
+            // above that; on another model, a refusal.
             if (action === "spawn" && (asked !== undefined || model !== undefined)) {
-                const parent = await api.agent(context);
                 const ref = model ?? parent.model;
                 const found =
                     ref === undefined ? undefined : api.models.getModel(ref.provider, ref.modelId);
+                const lower = found === undefined ? wanted : levelAtMost(found, wanted);
 
-                wanted = asked ?? parent.thinkingLevel;
-                thinking = found === undefined ? wanted : clampThinkingLevel(found, wanted);
+                if (lower === undefined && model !== undefined) {
+                    throw new Error(
+                        `${keyOf(model)} cannot think as little as this session (${most}). Leave model out, or ask the user.`,
+                    );
+                }
+
+                thinking =
+                    lower ?? (found === undefined ? wanted : clampThinkingLevel(found, wanted));
+
+                if (thinking !== wanted) {
+                    notes.push(`its model has no ${wanted}`);
+                }
             }
 
+            let reporterId: TaskId<string | null> | undefined;
             const result = await api.commit(async (tx) => {
                 const state = await tx.doc(SubagentsDoc, api.conversationId);
 
@@ -812,6 +1165,10 @@ export default function createSubagents(host: PocketHost) {
                 const conversationId = record.conversationId;
                 const requestedBy = host.requesterOf(api.conversationId);
 
+                if (lowered !== undefined) {
+                    await configure(tx, conversationId, { thinkingLevel: lowered });
+                }
+
                 // For the subagents bar: what it works on now, and since when.
                 record.asked = message.trim().slice(0, 300);
                 record.askedAt = Date.now();
@@ -821,21 +1178,45 @@ export default function createSubagents(host: PocketHost) {
                     message,
                     followUp: action === "send" && followUp === true,
                     ...(requestedBy === undefined ? {} : { requestedBy }),
+                    ...(wait === true ? { waiter: api.taskId } : {}),
                 };
 
-                state.reporters[api.taskId] = await tx.createTask(Reporter, input, BACKGROUND);
+                reporterId = await tx.createTask(Reporter, input, BACKGROUND);
+                state.reporters[api.taskId] = reporterId;
 
                 if (action === "send") {
-                    return `Sent to ${name}.`;
+                    return lowered === undefined
+                        ? `Sent to ${name}.`
+                        : `Sent to ${name}, thinking at ${lowered} now: no higher than this session's.`;
                 }
 
-                return thinking === wanted
-                    ? `Started ${name}.`
-                    : `Started ${name}, thinking at ${thinking}: its model has no ${wanted}.`;
+                const runs = model ?? parent.model;
+                const on =
+                    (runs === undefined ? "" : ` on ${keyOf(runs)}`) +
+                    (fromDefinition !== undefined && !definitionAllowed
+                        ? ` (your model: ${keyOf(fromDefinition)} is not allowed for subagents in this session; the user can allow it with /subagents)`
+                        : "");
+
+                return notes.length === 0
+                    ? `Started ${name}${on}.`
+                    : `Started ${name}${on}, thinking at ${thinking}: ${notes.join(", and ")}.`;
             }, context);
             const current = (await api.snapshot(SubagentsDoc, api.conversationId, context))?.agents[
                 name
             ];
+
+            // On a local server that answers one request at a time, a turn taken while the subagent works only pushes
+            // its context out of the cache; waiting here takes none.
+            if (wait === true && reporterId !== undefined) {
+                const settled = await api.waitForTask(reporterId, context);
+                const outcome = settled.state.outcome;
+                const answer =
+                    outcome.status === "completed" && typeof outcome.result === "string"
+                        ? outcome.result
+                        : `${result} Its answer comes back as a message.`;
+
+                return reply(answer, current?.conversationId);
+            }
 
             return reply(result, current?.conversationId);
         },
@@ -846,18 +1227,64 @@ export default function createSubagents(host: PocketHost) {
         tasks: [Anchor, Reporter, Courier],
         tools: [subagent],
         sections: [
-            section("subagents", () => GUIDE),
-            section("subagent_definitions", () => {
+            section("subagents", async (input, context) =>
+                guide(
+                    host,
+                    (
+                        await allowedFor(
+                            host,
+                            input.read,
+                            input.conversationId,
+                            input.agent.model,
+                            context,
+                        )
+                    ).allowed,
+                ),
+            ),
+            section("subagent_definitions", async (input, context) => {
                 const agents = listAgents(host.dataDir);
 
-                return agents.length === 0
-                    ? undefined
-                    : `Agent definitions you can spawn a subagent as (subagent spawn with agent: <name>):\n${agents
-                          .map(
-                              (agent) =>
-                                  `- ${agent.name}${agent.description ? `: ${agent.description}` : ""}`,
-                          )
-                          .join("\n")}`;
+                if (agents.length === 0) {
+                    return undefined;
+                }
+
+                const own = input.agent.model;
+                const { allowed } = await allowedFor(
+                    host,
+                    input.read,
+                    input.conversationId,
+                    own,
+                    context,
+                );
+
+                // Where each runs, so Pi knows which share this session's model and which another (one GPU, say).
+                const router = await host.routerFor?.(input.conversationId);
+
+                // A router from the editor spawns its own stages, which its prompt lists: no one's role files.
+                if (router?.pipeline !== undefined) {
+                    return undefined;
+                }
+
+                const stages = router?.stages ?? {};
+
+                const where = (agent: AgentDefinition) => {
+                    const stage = stages[agent.name];
+                    const ref = definitionModel(
+                        stage === undefined ? agent : { ...agent, model: stage },
+                        (spec) => host.resolveModel(spec),
+                    );
+
+                    return ref !== undefined && !same(ref, own) && allowed.includes(keyOf(ref))
+                        ? ` (runs on ${keyOf(ref)})`
+                        : " (runs on your model)";
+                };
+
+                return `Agent definitions you can spawn a subagent as (subagent spawn with agent: <name>):\n${agents
+                    .map(
+                        (agent) =>
+                            `- ${agent.name}${where(agent)}${agent.description ? `: ${agent.description}` : ""}`,
+                    )
+                    .join("\n")}`;
             }),
         ],
     });
