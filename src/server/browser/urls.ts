@@ -130,7 +130,7 @@ export function normalizeUrl(
     }
 }
 
-/** An address as the address bar shows it: without `http://` and a lone trailing slash. */
+/** An address as the address bar shows it: without http:// and a lone trailing slash. Mirror of web/browser.js's displayUrl. Keep the two in step. */
 export function displayUrl(url: string): string {
     if (url === "" || url === "about:blank") {
         return "";

@@ -53,7 +53,7 @@ export function reportNavigation(result) {
     }
 }
 
-/** The address as the address bar shows it: without http:// and a lone trailing slash. */
+/** The address as the address bar shows it: without http:// and a lone trailing slash. Mirror of src/server/browser/urls.ts's displayUrl. Keep the two in step. */
 export function displayUrl(url) {
     if (!url || url === "about:blank") {
         return "";
