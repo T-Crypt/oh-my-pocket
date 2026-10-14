@@ -530,6 +530,10 @@ export function checkRouter(
         fail("each stage needs its own id");
     }
 
+    if (raw.dispatcher !== undefined && typeof raw.dispatcher !== "boolean") {
+        fail(`router ${id}: dispatcher must be a boolean`);
+    }
+
     return {
         id,
         label,
