@@ -186,6 +186,24 @@ test("the editor's routers are checked, saved, replace Standard by its id, and d
     assert.throws(() => save({ id: "x", model: "nope/m", pipeline: [stage("a", "plan")] }), {
         status: 400,
     });
+    assert.throws(
+        () =>
+            save({
+                id: "x",
+                pipeline: [stage("a", "plan")],
+                dispatcher: { blockedTools: ["bash"] },
+            }),
+        /router x: dispatcher must be a boolean/,
+    );
+
+    const withTrue = save({ id: "bool-true", pipeline: [stage("a", "plan")], dispatcher: true });
+
+    assert.equal(withTrue.dispatcher, true);
+    const withFalse = save({ id: "bool-false", pipeline: [stage("a", "plan")], dispatcher: false });
+
+    assert.equal(withFalse.dispatcher, undefined);
+    app.deleteRouter(owner(app), "bool-true");
+    app.deleteRouter(owner(app), "bool-false");
 
     const over = save({
         id: "standard",
