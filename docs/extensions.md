@@ -115,13 +115,19 @@ What the default export receives. Extensions reach the app only through it; it s
 | `subagentModels()`               | The models the owner allows subagents besides their session's own (`provider/modelId`); empty by default                      |
 | `modelProblem(ref, fresh?)`      | Why a model may not be used now (not signed in, its sign-in expired), or `undefined`; `fresh` asks its provider again         |
 | `requesterOf(conversationId)`    | The id of the person Pi works for in a session now                                                                            |
+| `envFor(conversationId)`         | The file system a conversation works in: its environment, rooted at the conversation's working directory                      |
+| `routerFor(conversationId)`      | The router a conversation runs as (`routers.ts`), or `undefined` for a plain session: its prompt, model, and stage models     |
 | `skillPaths()`                   | The extra skill folders in Pi's settings                                                                                      |
 | `skills(cwd)`                    | Pi's skills for a session working in `cwd`, from every place Pi looks                                                         |
 | `heldBack(conversationId)`       | Why work Pi would start there with nobody asking may not start now (a spend limit), or `undefined`                            |
 | `onLimitsChanged(listener)`      | Call `listener` when the owner changes a spend limit; returns how to stop                                                     |
 | `approvals`, `guard`             | Calls waiting for a person to allow them; Lancet Guard                                                                        |
+| `loopGuard`                      | Why a call that repeats one that failed, or a third identical one, should not run                                             |
 | `schedules`, `goals`, `browsers` | Scheduled messages, Done when, and the built-in browser, as their extensions use them                                         |
 | `memory`                         | Lessons Pi keeps across sessions: their projects, the ones in force, saving and changing them                                 |
+| `pip`                            | PiP's tools, each acting as PiP's person (`pip.ts`)                                                                           |
+| `pipCompaction`                  | PiP's compactions: its extension's hook has PiP write its own summaries                                                       |
+| `pruner`                         | A session's compactions, pruned before a model summarises them (`pruner.ts`)                                                  |
 | `watches`                        | Sessions' PR watches: starting, stopping, and reading one, and the task that looks                                            |
 | `repoWatches`                    | Repository watches' task, which the triggers extension installs                                                               |
 | `readOnlyCalls`                  | Tool name to a check of its arguments: calls that pass only read, so plan mode lets them run                                  |
