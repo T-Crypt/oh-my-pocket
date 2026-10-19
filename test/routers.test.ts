@@ -343,3 +343,40 @@ test("a dispatcher router may not run commands itself", async () => {
     await app.commands.setRouter(id, owner(app), null);
     assert.doesNotMatch(await go(id, "bash", { command: "echo hi" }), /dispatcher/);
 });
+
+test("a spawn's skills go into the subagent's prompt after its definition's words; a wrong list starts nothing", async () => {
+    const id = await newSession(app);
+
+    await go(id, "subagent", {
+        action: "spawn",
+        name: "s1",
+        agent: "builder",
+        message: "x",
+        skills: ["checklist", "checklist"],
+    });
+    await until(() => seen.s1 !== undefined, "the subagent's request");
+    assert.match(
+        seen.s1!.prompt,
+        /Build\.[\s\S]*read each of these skills in full[\s\S]*- checklist: .*checklist[\\/]+SKILL\.md/,
+    );
+    assert.equal(seen.s1!.prompt.match(/- checklist: /g)?.length, 1, "named twice, read once");
+
+    assert.match(
+        await go(id, "subagent", { action: "spawn", name: "s2", message: "x", skills: ["nope"] }),
+        /nope is not an installed skill/,
+    );
+    assert.match(
+        await go(id, "subagent", {
+            action: "spawn",
+            name: "s3",
+            message: "x",
+            skills: ["a", "b", "c", "d", "e"],
+        }),
+        /At most 4 skills per spawn, not 5/,
+    );
+
+    const agents = (await app.harness.snapshot(SubagentsDoc, id, context))?.agents ?? {};
+
+    assert.equal(agents.s2, undefined, "an unknown skill starts nothing");
+    assert.equal(agents.s3, undefined, "too many skills start nothing");
+});
