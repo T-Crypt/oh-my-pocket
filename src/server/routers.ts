@@ -165,32 +165,42 @@ export function pipelinePrompt(router: RouterConfig): string {
 }
 
 /**
- * A pipeline stage as the subagent tool starts it: its instructions, the skills it reads first (each skill's file, as
- * `skillFile` finds it; one no longer installed is named, so the stage says so), and its template's tools.
+ * What a stage is told about the skills it reads before it starts: each skill's file, as `skillFile` finds it; one no
+ * longer installed is named, so the stage says so. Empty for no skills. A router's stage and a spawn's `skills` both
+ * use it, so a stage reads its skills the same way whichever asked for them.
  */
+export function skillsToRead(
+    names: readonly string[],
+    skillFile: (name: string) => string | undefined,
+): string[] {
+    if (names.length === 0) {
+        return [];
+    }
+
+    return [
+        "Before anything else, read each of these skills in full and follow them in this stage:",
+        ...names.map((name) => {
+            const file = skillFile(name);
+
+            return file === undefined
+                ? `- ${name}: not installed here; say so in your answer`
+                : `- ${name}: ${file}`;
+        }),
+    ];
+}
+
+/** A pipeline stage as the subagent tool starts it: its instructions, the skills it reads first, and its template's tools. */
 export function stageDefinition(
     stage: PipelineStage,
     skillFile: (name: string) => string | undefined,
 ): AgentDefinition {
-    const skills = (stage.skills ?? []).map((name) => {
-        const file = skillFile(name);
-
-        return file === undefined
-            ? `- ${name}: not installed here; say so in your answer`
-            : `- ${name}: ${file}`;
-    });
+    const skills = skillsToRead(stage.skills ?? [], skillFile);
 
     return {
         name: stage.id,
         instructions: [
             `You are the ${stage.name} stage of a router's pipeline. The brief names the task and a run folder.`,
-            ...(skills.length === 0
-                ? []
-                : [
-                      "",
-                      "Before anything else, read each of these skills in full and follow them in this stage:",
-                      ...skills,
-                  ]),
+            ...(skills.length === 0 ? [] : ["", ...skills]),
             "",
             stage.instructions,
         ].join("\n"),

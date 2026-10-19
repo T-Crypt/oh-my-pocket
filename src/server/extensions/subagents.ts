@@ -41,7 +41,7 @@ import { describe } from "../errors.ts";
 import type { PocketHost } from "../host.ts";
 import { levelAtMost, sameModel, THINKING_LEVELS } from "../models.ts";
 import { requestFor } from "../requests.ts";
-import { stageDefinition, stageModels, stageOf } from "../routers.ts";
+import { skillsToRead, stageDefinition, stageModels, stageOf } from "../routers.ts";
 import { definitionModel, keyOf, policyModels, type SubagentMode } from "../subagent-policy.ts";
 import { whyUnanswered } from "../subagent-runs.ts";
 
@@ -799,6 +799,9 @@ async function chosenModel(
     return ref;
 }
 
+/** The most skills one spawn may add: each is read in full before the subagent starts, so each costs its whole file. */
+const MAX_SPAWN_SKILLS = 4;
+
 /** Where a level stands among the thinking levels, lowest first. */
 const rank = (level: ModelThinkingLevel) => THINKING_LEVELS.indexOf(level);
 
@@ -845,6 +848,13 @@ export default function createSubagents(host: PocketHost) {
                 description: "spawn only: the tool names it may use. Default: your tools.",
             }),
         ),
+        skills: Type.Optional(
+            Type.Array(Type.String(), {
+                description:
+                    "spawn only: skills to put in its prompt, by name (any installed skill): it reads each in full " +
+                    `before it starts, after any its agent definition or stage already names. At most ${MAX_SPAWN_SKILLS}.`,
+            }),
+        ),
     };
     // Always offered: which models a subagent may use depends on the session (`/subagents`), and the call checks.
     const parameters = Type.Object({
@@ -862,7 +872,7 @@ export default function createSubagents(host: PocketHost) {
         description:
             "Manage persistent background subagents. Actions: spawn (name, message; optional agent definition, " +
             "model, only one the user allows in this session (it runs on your model otherwise), " +
-            "thinking level, yours or lower, and tools to allow), send (name, message; followUp: true queues it after the current answer instead of steering), stop " +
+            "thinking level, yours or lower, tools to allow, and skills to read first), send (name, message; followUp: true queues it after the current answer instead of steering), stop " +
             "(name: aborts its current work), status (one name, or all). Answers come back to you as messages at your " +
             "next pause; those that arrive together come in one. With wait: true, spawn and send return the answer " +
             "as their result instead, and you take no turn until it comes: use it for a stage you would only wait " +
@@ -1045,6 +1055,24 @@ export default function createSubagents(host: PocketHost) {
                 );
             }
 
+            // Skills for this spawn, on top of its definition's: checked here, so a wrong name fails without side effects.
+            const spawnSkills = action === "spawn" ? [...new Set(args.skills ?? [])] : [];
+
+            if (spawnSkills.length > MAX_SPAWN_SKILLS) {
+                throw new Error(
+                    `At most ${MAX_SPAWN_SKILLS} skills per spawn, not ${spawnSkills.length}: each is read in full.`,
+                );
+            }
+
+            const unknownSkill = spawnSkills.find((skill) => skillFile(skill) === undefined);
+
+            if (unknownSkill !== undefined) {
+                throw new Error(
+                    `${unknownSkill} is not an installed skill. Use a name from the skills in your instructions.`,
+                );
+            }
+
+            const extraSkills = skillsToRead(spawnSkills, skillFile);
             const toolNames = args.tools ?? definition?.tools;
             const askedModel = (args as { model?: unknown }).model;
             // A model passed to spawn is Pi's choice, refused unless allowed. A definition's model is its role's: used
@@ -1153,7 +1181,8 @@ export default function createSubagents(host: PocketHost) {
                             `You are the subagent "${name}". You work for another agent, not directly for a person, although a person may open your conversation and talk to you. Answer requests completely but concisely: your final answer is what gets reported back.` +
                             (definition === undefined || definition.instructions === ""
                                 ? ""
-                                : `\n\n${definition.instructions}`),
+                                : `\n\n${definition.instructions}`) +
+                            (extraSkills.length === 0 ? "" : `\n\n${extraSkills.join("\n")}`),
                         ...(model === undefined ? {} : { model }),
                         ...(thinking === undefined ? {} : { thinkingLevel: thinking }),
                         ...(tools === undefined ? {} : { tools }),
