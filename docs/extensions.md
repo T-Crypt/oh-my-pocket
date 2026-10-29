@@ -61,7 +61,7 @@ The file:
 Installing an extension with a name already installed replaces it, and a tool with the name of another replaces it in every session. So Pi Pocket refuses a drop-in that would take a name it keeps for itself, or one another module already has, and says so in Menu → Extensions:
 
 - Extension names `coding-tools`, `pocket-core`, and anything starting with `pocket-` (`pocket-prompt`, `pocket-guard`, and the rest), whether that built-in is on or off.
-- The built-in tools: `read`, `write`, `edit`, `bash`, `artifact`, `browser`, `subagent`, `schedule`, `codemode`, and `memory`, and PiP's: `sessions`, `session_read`, `session_start`, `session_send`, `session_follow`, `session_stop`, `session_archive`, `session_schedule`, `approvals`, `repo_watch`, and `session_watch_pr`, and the triggers' `watch_pr`.
+- The built-in tools: `read`, `write`, `edit`, `bash`, `artifact`, `browser`, `subagent`, `schedule`, `codemode`, `memory`, and `todo`, and PiP's: `sessions`, `session_read`, `session_start`, `session_send`, `session_follow`, `session_stop`, `session_archive`, `session_schedule`, `approvals`, `repo_watch`, and `session_watch_pr`, and the triggers' `watch_pr`.
 - An extension or tool name another module installed: the first one in keeps it.
 
 Give every extension and tool a name of your own, with a prefix (`example-clock`, `acme_lookup`). To change how a built-in tool works, wrap it (`wrapTool` in Pi Durable's README) or check its calls with a hook, rather than replacing it.

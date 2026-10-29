@@ -528,6 +528,10 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "loop-guard.ts",
             "pruner.ts",
             "tool-repair.ts",
+            "bash-timeout.ts",
+            "quiet-shell.ts",
+            "read-first.ts",
+            "todo.ts",
             "today.ts",
         ],
     );

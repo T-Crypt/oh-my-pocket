@@ -44,6 +44,10 @@ const ORDER = [
     "loop-guard.ts",
     "pruner.ts",
     "tool-repair.ts",
+    "bash-timeout.ts",
+    "quiet-shell.ts",
+    "read-first.ts",
+    "todo.ts",
     "today.ts",
 ];
 /**
@@ -73,6 +77,10 @@ const TITLES: Record<string, string> = {
     "loop-guard.ts": "Loop guard",
     "pruner.ts": "Context pruner",
     "tool-repair.ts": "Tool repair",
+    "bash-timeout.ts": "Bash timeout",
+    "quiet-shell.ts": "Quiet shell",
+    "read-first.ts": "Read first",
+    "todo.ts": "Todo",
     "today.ts": "Today",
 };
 
@@ -95,6 +103,7 @@ export const BUILT_IN_TOOLS: ReadonlySet<string> = new Set([
     "schedule",
     "codemode",
     "memory",
+    "todo",
     "sessions",
     "session_read",
     "session_start",

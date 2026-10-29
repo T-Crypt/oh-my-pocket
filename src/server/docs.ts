@@ -177,6 +177,20 @@ export const SubagentsDoc = defineDoc<{
     initial: () => ({ agents: {}, reporters: {} }),
 });
 
+/** One item of the model's task list (`extensions/todo.ts`). */
+export type TodoItem = { text: string; status: "pending" | "doing" | "done" };
+
+/** The model's task list for this session: replaced whole on each update. */
+export const TodoDoc = defineDoc<{ items: TodoItem[] }>({
+    kind: "pocket.todo",
+    version: 1,
+    scope: "conversation",
+    history: "latest",
+    // A fork, a forked subagent included, starts from the list as it was.
+    fork: "current",
+    initial: () => ({ items: [] }),
+});
+
 /** Which models this session's subagents may run on besides its own (`subagent-policy.ts`): its person's choice. */
 export const SubagentPolicyDoc = defineDoc<SubagentPolicy>({
     kind: "pocket.subagent-policy",
