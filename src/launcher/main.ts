@@ -62,6 +62,16 @@ const APP_ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const SERVER_FLAGS = APP_ROOT.split(sep).includes("node_modules")
     ? ["--import", new URL("../../bin/strip-types.js", import.meta.url).href]
     : [];
+/**
+ * The server's memory, measured on a copy of a real data folder (608 sessions; `bench/real.ts`, 60 sessions opened):
+ * V8 keeps what it once grew to, so the process sat at about 400 MB after a GC with a live heap of 68 MB. A smaller
+ * young generation and an old space that stops growing early bring it to about 300 MB with sessions opening as fast.
+ * The old space's limit is four times the largest heap measured. One that NODE_OPTIONS sets is left to it: Node lets
+ * the command line win over NODE_OPTIONS, so these would override it.
+ */
+const MEMORY_FLAGS = ["--max-semi-space-size=4", "--max-old-space-size=768"].filter(
+    (flag) => !(process.env.NODE_OPTIONS ?? "").includes(flag.slice(0, flag.indexOf("="))),
+);
 const RESTART_CODE = 75;
 /** How long a server started with an update under way may take to be ready before it counts as not starting. */
 const UPDATE_START_LIMIT_MS = 5 * 60_000;
@@ -482,11 +492,14 @@ function startServer(first: boolean): void {
     }
 
     // Node 22 calls node:sqlite experimental and says so at every start, right above the panel.
-    const flags = ["--disable-warning=ExperimentalWarning", ...SERVER_FLAGS];
+    const flags = ["--disable-warning=ExperimentalWarning", ...MEMORY_FLAGS, ...SERVER_FLAGS];
     const proc = spawn(process.execPath, [...flags, ...args], {
         stdio: ["ignore", "pipe", "pipe", "ipc"],
         // PI_POCKET_ROLLBACK: this launcher goes back to the version before an update that does not start.
         env: {
+            // glibc gives each thread that allocates an arena of its own and keeps them: two are enough here (about
+            // 30 MB less), unless the environment says otherwise.
+            MALLOC_ARENA_MAX: "2",
             ...process.env,
             PI_POCKET_SUPERVISED: "1",
             PI_POCKET_LAUNCHER: "1",
