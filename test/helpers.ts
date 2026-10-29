@@ -9,6 +9,7 @@ import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi
 import { type ConversationId, UsageDoc } from "@earendil-works/pi-durable";
 import type { Attachment } from "../src/server/commands.ts";
 import type { User } from "../src/server/config.ts";
+import { SENT_STAMP } from "../src/server/sent-at.ts";
 import type { Client } from "../src/server/room.ts";
 
 export const context = BACKGROUND_CONTEXT;
@@ -29,7 +30,7 @@ const { PocketApp } = await import("../src/server/app.ts");
 
 export type App = Awaited<ReturnType<typeof PocketApp.open>>;
 
-/** The text of the newest message a model request carries, and who sent it. */
+/** The text of the newest message a model request carries, and who sent it, without the time it was sent. */
 export function lastText(context: { messages: readonly { role: string; content: unknown }[] }): {
     role: string;
     text: string;
@@ -42,7 +43,10 @@ export function lastText(context: { messages: readonly { role: string; content: 
 
     return {
         role: last.role,
-        text: content.flatMap((part) => (part.type === "text" ? [part.text ?? ""] : [])).join(""),
+        text: content
+            .flatMap((part) => (part.type === "text" ? [part.text ?? ""] : []))
+            .join("")
+            .replace(SENT_STAMP, ""),
     };
 }
 
