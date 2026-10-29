@@ -558,6 +558,10 @@ export function Composer() {
 
         // A command is not a message to Pi: no "typing to Pi" for it.
         typing(value.trim() === "" || value.startsWith("/") ? null : "pi");
+
+        if (value.trim() !== "" && !value.startsWith("/") && canSteer()) {
+            warmSoon(conversationId);
+        }
     };
 
     // Ctrl+R: what was sent before that has the words in the box.
@@ -1660,6 +1664,19 @@ defineItem("composer", {
         </button>`,
 });
 
+/** When each session last asked for its model to be warmed: once a minute is plenty. */
+const warmedAt = new Map();
+
+/** Ask the server to load this session's local model while the person writes (`PocketApp.warmFor`). */
+function warmSoon(conversationId) {
+    if (conversationId === null || Date.now() - (warmedAt.get(conversationId) ?? 0) < 60_000) {
+        return;
+    }
+
+    warmedAt.set(conversationId, Date.now());
+    actions.warm(conversationId).catch(() => {});
+}
+
 /** The browser sizes the message box to its text itself (`field-sizing` in style.css): nothing to measure. */
 const SIZES_ITSELF = globalThis.CSS?.supports?.("field-sizing", "content") ?? false;
 
@@ -1884,6 +1901,38 @@ defineItem("status", {
         >
             ${here} here
         </span>`;
+    },
+});
+defineItem("status", {
+    id: "core:gpu",
+    label: "GPU",
+    order: 150,
+    render() {
+        const { loading, waiting, serving } = store.state.gpu ?? {};
+
+        if (loading?.length > 0) {
+            return html`<span
+                class="gpu"
+                data-part="status-gpu"
+                title="llama-swap is loading the model onto the GPU: the answer starts once it is there"
+            >
+                loading ${loading.join(", ")}…
+            </span>`;
+        }
+
+        if (waiting?.length > 0) {
+            const what = waiting.map((each) => `${each.model} (${each.count})`).join(", ");
+
+            return html`<span
+                class="gpu"
+                data-part="status-gpu"
+                title=${`The GPU holds ${serving ?? "another model"}; waiting for their turn: ${what}. Requests for one model go together, so it swaps models less.`}
+            >
+                GPU busy · ${waiting.length === 1 ? waiting[0].model : `${waiting.length} waiting`}
+            </span>`;
+        }
+
+        return null;
     },
 });
 defineItem("status", {

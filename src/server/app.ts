@@ -107,6 +107,7 @@ import {
 import { Updates } from "./updates.ts";
 import { pocketPackage, pocketVersion } from "./versions.ts";
 import { compactionReader, withBackground } from "./compaction.ts";
+import { Gpu } from "./gpu.ts";
 import { configureHttp } from "./net.ts";
 import { createPublicFetch } from "./public-fetch.ts";
 import { PiSessions } from "./pi-sessions.ts";
@@ -335,6 +336,11 @@ export class PocketApp {
     readonly limits: LimitGate;
     /** Keeps the prompt cache warm while a run waits on a tool call (`cache-keeper.ts`). */
     readonly cacheKeeper: CacheKeeper;
+    /** The llama-swap cards this server's requests use: a turn each by model, and what they wait for (`gpu.ts`). */
+    readonly gpu = new Gpu();
+    #gpuSent: NodeJS.Timeout | undefined;
+    #gpuAgain = false;
+    #gpuLoading = "";
     readonly schedules = new Schedules(this);
     /** Commands Pi runs in the background, watched until they end (`background.ts`). */
     readonly background = new BackgroundTasks(this);
@@ -754,6 +760,14 @@ export class PocketApp {
         measureModelStreams(this.models);
         // Outside the timing wrapper: each attempt is timed on its own, not the wait before it.
         this.limits.install(this.models);
+
+        // Inside the cache keeper: a request it replays takes its turn on the card like any other.
+        // PI_POCKET_GPU_LANE=0 sends every request straight on, as before the lane.
+        if (process.env.PI_POCKET_GPU_LANE !== "0") {
+            installGpuLane(this.models, this.gpu);
+        }
+
+        this.gpu.onChange(() => this.#sendGpu());
         // Outermost: it sees each real request finish, and replays it through the wrappers below.
         this.cacheKeeper.install(this.models);
         await this.models.getAvailable().catch(() => []);
@@ -2223,6 +2237,53 @@ export class PocketApp {
         return modelList(this.models, this.config, this.signInNeeded, scopedModels);
     }
 
+    /**
+     * Every tab hears what the card is doing: at once, then at most every quarter second, the last word always sent; a
+     * load starting or ending is never held back.
+     */
+    #sendGpu(): void {
+        const status = this.gpu.status();
+        // A model starting or ending its load goes out at once, whatever was sent just before.
+        const loading = status.loading.join(",");
+
+        if (this.#gpuSent !== undefined && loading === this.#gpuLoading) {
+            this.#gpuAgain = true;
+
+            return;
+        }
+
+        clearTimeout(this.#gpuSent);
+        this.#gpuLoading = loading;
+
+        for (const client of this.#clients) {
+            client.send("gpu", status);
+        }
+
+        this.#gpuSent = setTimeout(() => {
+            this.#gpuSent = undefined;
+
+            if (this.#gpuAgain) {
+                this.#gpuAgain = false;
+                this.#sendGpu();
+            }
+        }, 250);
+    }
+
+    /**
+     * Someone started writing in a session: when its model is a llama-swap model that is not on the card and nothing
+     * else uses the card, start loading it now, so the answer does not wait for the load (`Gpu.warm`).
+     */
+    async warmFor(id: ConversationId, user: User): Promise<boolean> {
+        this.requireSee(user, id);
+        this.requireSteer(user);
+
+        const ref = (await this.agentState(id))?.model;
+        const model =
+            ref === undefined ? undefined : this.models.getModel(ref.provider, ref.modelId);
+
+        return model === undefined ? false : await this.gpu.warm(model);
+    }
+
     async hello(user: User) {
         return {
             user: {
@@ -2233,6 +2294,7 @@ export class PocketApp {
             },
             users: this.people(user),
             models: await this.modelList(),
+            gpu: this.gpu.status(),
             guard: await this.guardStatus(),
             server: {
                 pocketVersion: pocketVersion(),
@@ -3732,6 +3794,7 @@ export class PocketApp {
     close(): Promise<void> {
         this.#closing ??= (async () => {
             clearTimeout(this.#sessionsTimer);
+            clearTimeout(this.#gpuSent);
             this.alerts.close();
             this.themes.close();
             await this.cacheKeeper.close();
@@ -3806,6 +3869,55 @@ export class PocketApp {
  * last one closest to the wire. With no shaper, the call goes on untouched. A shaper may answer with a promise. One
  * that throws is logged and skipped: a faulty module must not fail the model call.
  */
+/**
+ * Requests to a llama-swap take their turn on its card (`Gpu.acquire`): the turn starts once the request is built, as
+ * it is about to go, and ends when its answer does. The first event of the answer says the model is on the card.
+ */
+export function installGpuLane(
+    models: { streamSimple: ModelRuntime["streamSimple"] },
+    gpu: Gpu,
+): void {
+    const stream = models.streamSimple.bind(models);
+
+    models.streamSimple = (model, context, options) => {
+        if (!Gpu.may(model)) {
+            return stream(model, context, options);
+        }
+
+        let held: ReturnType<Gpu["acquire"]> | undefined;
+        const answer = stream(model, context, {
+            ...options,
+            onPayload: async (payload, payloadModel) => {
+                const asked = await options?.onPayload?.(payload, payloadModel);
+
+                held ??= gpu.acquire(model, options?.signal);
+                await held;
+
+                return asked;
+            },
+        });
+        const push = answer.push.bind(answer);
+        let first = true;
+
+        answer.push = (event) => {
+            if (first && held !== undefined) {
+                first = false;
+                void held.then((turn) => turn.started());
+            }
+
+            push(event);
+        };
+
+        // An answer that called tools means the run goes on: its model keeps the card for the next turn.
+        answer.result().then(
+            (message) => void held?.then((turn) => turn.release(message.stopReason === "toolUse")),
+            () => void held?.then((turn) => turn.release()),
+        );
+
+        return answer;
+    };
+}
+
 export function installRequestShaping(
     models: { streamSimple: ModelRuntime["streamSimple"] },
     shapers: readonly ModelRequestShaper[],

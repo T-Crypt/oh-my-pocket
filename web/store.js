@@ -116,6 +116,8 @@ export const store = {
         me: undefined, // undefined: unknown, null: signed out
         users: [],
         models: [],
+        /** What the llama-swap card does for this server, while something waits for it (`src/server/gpu.ts`). */
+        gpu: { waiting: [], loading: [] },
         /** This tab's shared model refresh state and last result (`model-refresh.js`). */
         modelRefresh: { loading: false, result: null, error: null },
         guard: null,
@@ -909,6 +911,7 @@ const handlers = {
     "folder-favorites": (folderFavorites) =>
         setChanged({ folderFavorites: kept(store.state.folderFavorites, folderFavorites) }),
     models: (models) => setChanged({ models: kept(store.state.models, models) }),
+    gpu: (gpu) => store.set({ gpu }),
     // A theme folder came, went, or changed (`theme.js` loads its new version).
     themes: (themeList) => setChanged({ themeList: kept(store.state.themeList, themeList) }),
     // Every subagent in every session, while this tab shows the subagents board (`subagents-board.js`).
@@ -1329,6 +1332,7 @@ export async function start() {
             me: hello.user,
             users: hello.users,
             models: hello.models,
+            gpu: hello.gpu ?? { waiting: [], loading: [] },
             guard: hello.guard,
             server: keptServer(store.state.server, hello.server, asked),
             themeList: Array.isArray(hello.themes) ? hello.themes : [],
@@ -1404,6 +1408,8 @@ export const actions = {
     setPlan: (on) => api(`c/${current()}/plan`, { on }),
     /** Let Pi use the browser in this session, or stop it (`commands.setBrowserUse`). */
     setBrowserUse: (on) => api(`c/${current()}/browser-use`, { on }),
+    /** Someone started writing here: load the session's local model meanwhile (the server decides if it should). */
+    warm: (id) => api(`c/${id}/warm`, {}),
     /** `{ mode }`, or `{ mode: "custom", models }`: which models this session's subagents may run on. */
     setSubagents: (request) => api(`c/${current()}/subagents`, request),
     /** Run this session as a router by id, or as a plain session again (null). */

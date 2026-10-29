@@ -198,6 +198,11 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    // Someone started writing: load the session's local model while they do (`PocketApp.warmFor`).
+    if (third === "warm" && method === "POST") {
+        return json(response, 200, { warming: await app.warmFor(id, user) });
+    }
+
     if (third === "browser-use" && method === "POST") {
         await app.commands.setBrowserUse(id, user, (await readJson<{ on?: unknown }>(request)).on);
 
