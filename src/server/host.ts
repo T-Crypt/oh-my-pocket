@@ -497,6 +497,8 @@ export interface PocketHost {
      * sets its tools here when it loads; a reload sets them again.
      */
     readonly readOnlyCalls: Map<string, (args: Record<string, unknown>) => boolean>;
+    /** Load a built-in module's file again (`reload.ts`), as an edit does: for a module whose settings shape it. */
+    reloadModule(file: string): Promise<void>;
     /**
      * Text from elsewhere made safe for Pi to read (`fence.ts`): `quoted` gives one line, cut to `max`, without
      * invisible characters or any tag, in quotes it cannot close; `defang` keeps the lines, but no closing tag survives,

@@ -9,6 +9,8 @@ export const root = mkdtempSync(join(tmpdir(), "pi-pocket-test-"));
 // Isolate from the real Pi install: its auth, settings, skills, and Lancet Guard.
 process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 process.env.PI_POCKET_GUARD = "off";
+// Every tool offered, as the tests were written; lean-prompt.test.ts turns the lean prompt on for itself.
+process.env.PI_POCKET_LEAN_PROMPT ??= "0";
 mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 /** The folder test sessions work in. */
 export const work = join(root, "work");

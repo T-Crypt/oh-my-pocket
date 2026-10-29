@@ -846,6 +846,9 @@ export class PocketApp {
             repoWatches: this.repoWatches,
             memory: this.memory,
             readOnlyCalls: new Map(),
+            reloadModule: async (file) => {
+                await this.loader.reload(file);
+            },
             gallery: this.gallery,
             updates: this.updates,
             text: Object.freeze({ quoted, defang }),

@@ -79,7 +79,8 @@ type Internal =
     | "envFor"
     | "loopGuard"
     | "pruner"
-    | "readOnlyCalls";
+    | "readOnlyCalls"
+    | "reloadModule";
 
 type PublicHost = Pick<PocketHost, keyof Host>;
 

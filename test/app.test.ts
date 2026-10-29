@@ -543,6 +543,7 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "loop-guard.ts",
             "pruner.ts",
             "tool-repair.ts",
+            "lean-prompt.ts",
             "today.ts",
             "gallery.ts",
             "session-tags.ts",
