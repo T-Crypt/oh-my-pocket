@@ -24,6 +24,7 @@ import {
     defineTask,
     defineTool,
     type DocumentReader,
+    type EntryId,
     type Extension,
     InboxDoc,
     LiveDoc,
@@ -802,6 +803,35 @@ async function chosenModel(
 /** The most skills one spawn may add: each is read in full before the subagent starts, so each costs its whole file. */
 const MAX_SPAWN_SKILLS = 4;
 
+/** What a forked subagent is told with its task: its instructions are its parent's, so its role comes with the task. */
+function forkBrief(name: string, task: string): string {
+    return `[forked subagent "${name}"] You are a copy of the agent above, forked to do one task for it. Everything above is your context. Do only this task, then answer completely but concisely: your answer is reported back. Do not start subagents.\n\nTask: ${task}`;
+}
+
+/** Where a fork of `id` starts: the newest entry before the answer that carries the call `callId`. */
+async function forkPoint(tx: Tx, id: ConversationId, callId: string): Promise<EntryId> {
+    const page = await tx.scanEntries({ conversationId: id, order: "descending" }, 200);
+    const at = page.items.findIndex((entry) =>
+        (entry.model ?? []).some(
+            (message) =>
+                message.role === "assistant" &&
+                message.content.some((part) => part.type === "toolCall" && part.id === callId),
+        ),
+    );
+
+    if (at < 0) {
+        throw new Error("Cannot fork: the answer that made this call is not in this conversation.");
+    }
+
+    const before = page.items[at + 1]?.id ?? (await tx.conversation(id))?.parent?.at;
+
+    if (before === undefined) {
+        throw new Error("Cannot fork: there is nothing before this call to fork.");
+    }
+
+    return before;
+}
+
 /** Where a level stands among the thinking levels, lowest first. */
 const rank = (level: ModelThinkingLevel) => THINKING_LEVELS.indexOf(level);
 
@@ -848,6 +878,14 @@ export default function createSubagents(host: PocketHost) {
                 description: "spawn only: the tool names it may use. Default: your tools.",
             }),
         ),
+        fork: Type.Optional(
+            Type.Boolean({
+                description:
+                    "spawn only: start it as a copy of this conversation so far, on your model and tools, for a side " +
+                    "task that needs what you already know: it reads nothing again, and a local server reuses the " +
+                    "prompt it already has. Not with agent, model, thinking, tools, or skills.",
+            }),
+        ),
         skills: Type.Optional(
             Type.Array(Type.String(), {
                 description:
@@ -872,7 +910,7 @@ export default function createSubagents(host: PocketHost) {
         description:
             "Manage persistent background subagents. Actions: spawn (name, message; optional agent definition, " +
             "model, only one the user allows in this session (it runs on your model otherwise), " +
-            "thinking level, yours or lower, tools to allow, and skills to read first), send (name, message; followUp: true queues it after the current answer instead of steering), stop " +
+            "thinking level, yours or lower, tools to allow, and skills to read first; or fork: true, a copy of this conversation), send (name, message; followUp: true queues it after the current answer instead of steering), stop " +
             "(name: aborts its current work), status (one name, or all). Answers come back to you as messages at your " +
             "next pause; those that arrive together come in one. With wait: true, spawn and send return the answer " +
             "as their result instead, and you take no turn until it comes: use it for a stage you would only wait " +
@@ -896,6 +934,18 @@ export default function createSubagents(host: PocketHost) {
                           },
                       }),
             });
+            // A forked subagent has this tool, so its prompt stays the parent's byte for byte, but it does its task itself.
+            const self = await api.commit(
+                async (tx) => tx.conversation(api.conversationId),
+                context,
+            );
+
+            if (self?.parent !== undefined && self.owner !== undefined) {
+                throw new Error(
+                    "You are a forked subagent: do your task yourself, then answer. You cannot use subagents.",
+                );
+            }
+
             const registry = (await api.snapshot(SubagentsDoc, api.conversationId, context)) ?? {
                 agents: {},
                 reporters: {},
@@ -1055,6 +1105,21 @@ export default function createSubagents(host: PocketHost) {
                 );
             }
 
+            const fork = action === "spawn" && args.fork === true;
+
+            if (
+                fork &&
+                (args.agent !== undefined ||
+                    (args as { model?: unknown }).model !== undefined ||
+                    args.thinking !== undefined ||
+                    args.tools !== undefined ||
+                    args.skills !== undefined)
+            ) {
+                throw new Error(
+                    "A fork runs as you: on your model, thinking, tools, and skills. Leave agent, model, thinking, tools, and skills out, or spawn without fork.",
+                );
+            }
+
             // Skills for this spawn, on top of its definition's: checked here, so a wrong name fails without side effects.
             const spawnSkills = action === "spawn" ? [...new Set(args.skills ?? [])] : [];
 
@@ -1162,6 +1227,10 @@ export default function createSubagents(host: PocketHost) {
 
             let reporterId: TaskId<string | null> | undefined;
             const result = await api.commit(async (tx) => {
+                // Read before the first write: a commit cannot scan entries after it.
+                const forkAt = fork
+                    ? await forkPoint(tx, api.conversationId, api.callId)
+                    : undefined;
                 const state = await tx.doc(SubagentsDoc, api.conversationId);
 
                 if (action === "spawn") {
@@ -1170,23 +1239,34 @@ export default function createSubagents(host: PocketHost) {
                     }
 
                     const anchor = await tx.createTask(Anchor, null, BACKGROUND);
-                    // Owned by a task of this conversation, so it starts as a copy of this agent.
-                    const child = await tx.createConversation({
-                        ownership: { kind: "task", taskId: anchor },
-                    });
+                    // Owned by a task of this conversation, so it starts as a copy of this agent. A fork also starts
+                    // with this conversation up to the entry before the answer that made this call, and is configured
+                    // no further: the same messages, agent, and tools, so its first request starts with the prompt
+                    // this conversation last sent.
+                    const child =
+                        forkAt !== undefined
+                            ? await tx.forkConversation(api.conversationId, forkAt, {
+                                  ownership: { kind: "task", taskId: anchor },
+                              })
+                            : await tx.createConversation({
+                                  ownership: { kind: "task", taskId: anchor },
+                              });
 
-                    await configure(tx, child.id, {
-                        extensions: { remove: [SubagentTools] },
-                        instructions:
-                            `You are the subagent "${name}". You work for another agent, not directly for a person, although a person may open your conversation and talk to you. Answer requests completely but concisely: your final answer is what gets reported back.` +
-                            (definition === undefined || definition.instructions === ""
-                                ? ""
-                                : `\n\n${definition.instructions}`) +
-                            (extraSkills.length === 0 ? "" : `\n\n${extraSkills.join("\n")}`),
-                        ...(model === undefined ? {} : { model }),
-                        ...(thinking === undefined ? {} : { thinkingLevel: thinking }),
-                        ...(tools === undefined ? {} : { tools }),
-                    });
+                    if (!fork) {
+                        await configure(tx, child.id, {
+                            extensions: { remove: [SubagentTools] },
+                            instructions:
+                                `You are the subagent "${name}". You work for another agent, not directly for a person, although a person may open your conversation and talk to you. Answer requests completely but concisely: your final answer is what gets reported back.` +
+                                (definition === undefined || definition.instructions === ""
+                                    ? ""
+                                    : `\n\n${definition.instructions}`) +
+                                (extraSkills.length === 0 ? "" : `\n\n${extraSkills.join("\n")}`),
+                            ...(model === undefined ? {} : { model }),
+                            ...(thinking === undefined ? {} : { thinkingLevel: thinking }),
+                            ...(tools === undefined ? {} : { tools }),
+                        });
+                    }
+
                     state.agents[name] = { conversationId: child.id, reported: [] };
                 }
 
@@ -1204,7 +1284,7 @@ export default function createSubagents(host: PocketHost) {
                 const input = {
                     name,
                     conversationId,
-                    message,
+                    message: fork ? forkBrief(name, message) : message,
                     followUp: action === "send" && followUp === true,
                     ...(requestedBy === undefined ? {} : { requestedBy }),
                     ...(wait === true ? { waiter: api.taskId } : {}),

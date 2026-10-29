@@ -241,7 +241,8 @@ test("a run that crosses its session's limit is stopped once, and the people the
 
         assert.doesNotMatch(
             said,
-            /"done"/,
+            // Pi's answer, not a tool schema's "done" (the todo tool's status).
+            /"type":"text","text":"done"/,
             "the five-second command was cut off, so Pi never answered after it",
         );
         assert.equal(aborts, 1);

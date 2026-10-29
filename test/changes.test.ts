@@ -49,6 +49,13 @@ const route: FauxResponseStep = (request) => {
         return fauxAssistantMessage([fauxText("done")]);
     }
 
+    // Pi reads a file before it changes one (read-first).
+    if (text.endsWith("read it")) {
+        return fauxAssistantMessage([fauxToolCall("read", { path: "keep.txt" })], {
+            stopReason: "toolUse",
+        });
+    }
+
     if (text.endsWith("edit it")) {
         return fauxAssistantMessage(
             [fauxToolCall("edit", { path: "keep.txt", edits: [{ oldText: "b", newText: "c" }] })],
@@ -156,6 +163,7 @@ after(async () => {
 test("a session's changes list git's uncommitted files, mark Pi's, and give each file's diff", async () => {
     const id = await newSession(app, repo);
 
+    await say(app, id, "read it");
     await say(app, id, "edit it");
     await say(app, id, "write notes");
     await say(app, id, "write outside");
