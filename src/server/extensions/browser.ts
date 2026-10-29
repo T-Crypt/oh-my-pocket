@@ -9,7 +9,7 @@ import { awaitWithContext } from "@earendil-works/chord/context";
 import { type ImageContent, type TextContent, Type } from "@earendil-works/pi-ai";
 import { AgentDoc, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
 import type { BrowserPage, LogEntry, Target } from "../browser/page.ts";
-import { displayUrl, normalizeUrl } from "../browser/urls.ts";
+import { displayUrl, hostOf, normalizeUrl } from "../browser/urls.ts";
 import { presetOf, viewportFrom } from "../browser/viewport.ts";
 import type { PocketHost } from "../host.ts";
 
@@ -47,12 +47,17 @@ const CHANGING = new Set<Action>([
     "viewport",
 ]);
 const MAX_TEXT = 20_000;
+/** A console line, as Pi reads it: a stack or a long payload past this is cut. */
+const MAX_LINE = 300;
+/** The console action reads this many of the newest lines. */
+const CONSOLE_LINES = 80;
 
 const GUIDE = `You have a browser tool: a real Chromium on this machine. The people in this conversation see the same page live in the app's Browser panel and can click and type in it too, so it is how you show and test web work: local dev servers (http://localhost:5173), HTML files on this machine (give their path), or any site.
 - Start a dev server in the background with bash first, for example \`nohup npm run dev > /tmp/dev.log 2>&1 &\`, then navigate to it.
 - snapshot lists the page's text and its controls with refs like [e12]; click, type, select, and hover take a ref (or a CSS selector, or the visible label). Refs last until the next snapshot.
 - screenshot shows you how the page looks: use it to check layout and styling. viewport switches between mobile, tablet, and desktop sizes.
-- After a change, check console for errors. evaluate runs JavaScript in the page.`;
+- After a change, check console for errors. evaluate runs JavaScript in the page.
+- Failed loads to other sites (analytics, trackers) are usually blocked on purpose: ignore them unless the page itself breaks.`;
 
 function clip(text: string, max = MAX_TEXT): string {
     return text.length > max
@@ -74,7 +79,34 @@ function formatLog(entry: LogEntry): string {
         return `--- navigated to ${entry.text} ---`;
     }
 
-    return `[${entry.level}] ${entry.text}${entry.source === undefined ? "" : ` (${entry.source})`}`;
+    const repeated = (entry.count ?? 1) > 1 ? ` ×${entry.count}` : "";
+
+    return `[${entry.level}]${repeated} ${clip(entry.text, MAX_LINE)}${entry.source === undefined ? "" : ` (${clip(entry.source, 120)})`}`;
+}
+
+/** Loads that failed on other sites (trackers, beacons a blocker refused), as one line: how many, and to where. */
+function otherSites(entries: readonly LogEntry[]): string | undefined {
+    const hosts = new Map<string, number>();
+
+    for (const entry of entries) {
+        if (entry.level === "net" && entry.other === true) {
+            const host = hostOf(entry.source ?? "another site");
+
+            hosts.set(host, (hosts.get(host) ?? 0) + (entry.count ?? 1));
+        }
+    }
+
+    if (hosts.size === 0) {
+        return undefined;
+    }
+
+    const total = [...hosts.values()].reduce((sum, count) => sum + count, 0);
+    const top = [...hosts]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([host, count]) => (count > 1 ? `${host} ×${count}` : host));
+
+    return `${total} failed load${total === 1 ? "" : "s"} to other sites (${top.join(", ")}${hosts.size > 4 ? ", …" : ""}): trackers or blocked hosts, not this page's own.`;
 }
 
 export default function createBrowser(host: PocketHost) {
@@ -381,13 +413,24 @@ export default function createBrowser(host: PocketHost) {
                     break;
 
                 case "console": {
-                    const entries = page.logs();
+                    const all = page.logs();
+                    const own = all.filter((entry) => !(entry.level === "net" && entry.other));
+                    const shown = own.slice(-CONSOLE_LINES);
+                    const elsewhere = otherSites(all);
 
-                    lines.push(
-                        entries.length === 0
-                            ? "The console is empty."
-                            : clip(entries.map(formatLog).join("\n")),
-                    );
+                    if (all.length === 0) {
+                        lines.push("The console is empty.");
+                    } else {
+                        if (own.length > shown.length) {
+                            lines.push(`(${own.length - shown.length} older lines not shown)`);
+                        }
+
+                        lines.push(clip(shown.map(formatLog).join("\n")));
+
+                        if (elsewhere !== undefined) {
+                            lines.push(elsewhere);
+                        }
+                    }
 
                     if (args.clear === true) {
                         page.clearLogs();
@@ -428,9 +471,14 @@ export default function createBrowser(host: PocketHost) {
             }
 
             if (action !== "console") {
-                const errors = page
-                    .logs(before)
-                    .filter((entry) => entry.level === "error" || entry.level === "dialog");
+                const fresh = page.logs(before);
+                const errors = fresh.filter(
+                    (entry) =>
+                        entry.level === "error" ||
+                        entry.level === "dialog" ||
+                        (entry.level === "net" && entry.other !== true),
+                );
+                const elsewhere = otherSites(fresh);
 
                 if (errors.length > 0) {
                     lines.push(
@@ -440,6 +488,10 @@ export default function createBrowser(host: PocketHost) {
                             ? [`- … and ${errors.length - 10} more (see console)`]
                             : []),
                     );
+                }
+
+                if (elsewhere !== undefined) {
+                    lines.push(elsewhere);
                 }
             }
 
