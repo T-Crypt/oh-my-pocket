@@ -177,6 +177,17 @@ await inPage(`
         for (const entry of list.getEntries()) bench.long.push(entry.duration);
     }).observe({ type: "longtask", buffered: false });
     globalThis.typed = 0;
+    // Components drawn, by name: what each streamed update costs the page.
+    const { options } = await import("preact");
+    const before = options.diffed;
+    bench.renders = {};
+    options.diffed = (vnode) => {
+        if (typeof vnode.type === "function") {
+            const name = vnode.type.displayName || vnode.type.name || "anonymous";
+            bench.renders[name] = (bench.renders[name] ?? 0) + 1;
+        }
+        before?.(vnode);
+    };
     return "null";
 `);
 
@@ -258,7 +269,9 @@ for (const id of [...ids.slice(1), ids[0]!]) {
 clearInterval(memory);
 lag.disable();
 
-const client = await inPage<{ keys: number[]; long: number[] }>(`return JSON.stringify(bench)`);
+const client = await inPage<{ keys: number[]; long: number[]; renders: Record<string, number> }>(
+    `return JSON.stringify(bench)`,
+);
 const typedShown = await inPage<number>(
     `return JSON.stringify(document.querySelector(".composer textarea").value.length)`,
 );
@@ -307,6 +320,12 @@ const result = {
         longTasks: client.long.length,
         blockedMs: ms(client.long.reduce((sum, each) => sum + Math.max(0, each - 50), 0)),
         longestTaskMs: ms(Math.max(0, ...client.long)),
+        rendersPerSecond: Object.fromEntries(
+            Object.entries(client.renders)
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 15)
+                .map(([name, count]) => [name, Math.round(count / seconds)]),
+        ),
     },
 };
 
