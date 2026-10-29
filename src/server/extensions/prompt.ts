@@ -6,7 +6,7 @@
  * Edit freely: saving this file reloads it into the running server.
  */
 import { statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import {
     formatSkillsForPrompt,
     getDocsPath,
@@ -26,7 +26,7 @@ const GUIDELINES = `- Keep replies short and easy to read on a small screen. Lea
 - To show the user an image file from this machine (a screenshot, a chart, a picture), embed it in your reply with Markdown: ![short description](/absolute/path.png). Paths relative to the working directory work too. Files the user attaches are saved on the server; their paths are listed in the message.
 - Before running something destructive or irreversible, say what it will do. A guard may ask a human to approve risky commands; if a call is blocked, do not try to get around the block.
 - Never repeat a tool call that just failed or was blocked: if it did not work, change something - the arguments, the tool, or the file - before trying again, or answer with what you have and say what is still unknown.
-- Do not commit, push, publish, or deploy unless asked.`;
+- A message with the marker "[via PiP]" or "[via linked session …]" at its start (after "[from: Name]" when several people use this server, or after "[scheduled]") comes from another agent (PiP, the owner's assistant, or a linked session). Write your answer to it, and what you send back to that agent, in ASD-STE100 (Simplified Technical English), at about 80% adherence: short sentences (25 words or fewer), one idea in each, the main point first, active voice, simple tenses, the articles kept, no contractions or idioms, "must" for a rule and "can" for an ability, numerals for numbers, and one word for one thing. Write names of commands, files, and identifiers exactly, in backticks. Keep every fact: do not cut one to make the answer shorter. Answer a message without the marker as usual, also later in the same session.`;
 
 /**
  * Where Pi Pocket's documentation for agents is, as Pi's prompt says where Pi's is: to read only when it is
@@ -38,9 +38,9 @@ function docs(dataDir: string): string {
 
     return `Pi Pocket documentation (read only when someone asks about Pi Pocket itself: how it works, changing how you behave in it, extending it, or changing its code):
 - Start here: ${join(folder, "index.md")}
-- Pi Pocket's code is in ${code}; its data (people, settings, sessions) in ${dataDir}. Change the data through the app, never by editing its files, except extensions/ in it, where drop-in extensions go.
-- When asked about: changing how you behave without code, such as instructions, AGENTS.md, skills, or prompt templates (docs/customizing.md); a new tool, prompt section, or hook (docs/extensions.md, with working examples in docs/examples/); changing Pi Pocket's own code while it runs (docs/self-editing.md); where its code is (docs/map.md); how its parts depend on each other (docs/architecture.md); what a feature does (docs/features.md)
-- Resolve docs/... under ${code}, not the working directory. Read a doc completely, and follow its links, before changing anything.
+- Pi Pocket's code is in ${code}${code.split(sep).includes("node_modules") ? " (an npm install: read it, never edit it, since the next npm update replaces it; to change Pi Pocket, clone https://github.com/TannerMidd/pi-pocket and run that)" : ""}; its data (people, settings, sessions) in ${dataDir}. Change the data through the app, never by editing its files, except extensions/ in it, where drop-in extensions go, and themes/, where the owner's themes are.
+- When asked about: changing how you behave without code, such as instructions, AGENTS.md, skills, or prompt templates (docs/customizing.md); a new tool, prompt section, or hook, or a page, button, or route in the app (docs/extensions.md, an index of the guides in docs/extensions/, with working examples in docs/examples/ and the exact types in types/pocket.d.ts); how the app looks or is laid out: a theme (docs/extensions/themes.md, with every token and part in docs/extensions/reference/theme-surface.md); changing Pi Pocket's own code while it runs (docs/self-editing.md); where its code is (docs/map.md); how its parts depend on each other (docs/architecture.md); what a feature does (docs/features.md)
+- Resolve docs/... and types/... under ${code}, not the working directory. Read a doc completely before changing anything. docs/index.md and docs/extensions.md are indexes: follow the links your task needs, not all of them.
 - Pi's own documentation (skills, prompt templates, models, providers, settings): ${getDocsPath()}`;
 }
 

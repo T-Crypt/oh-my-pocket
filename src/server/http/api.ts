@@ -27,6 +27,7 @@ import { serveImage } from "./assets.ts";
 import { browserRoutes } from "./browser-routes.ts";
 import { conversationRoutes } from "./conversation-routes.ts";
 import { createEventStreams } from "./events.ts";
+import { extensionRoute } from "./extension-routes.ts";
 import { type ApiRequest, conversationId, type HttpOptions, json, readJson } from "./io.ts";
 import { pushRoutes } from "./push-routes.ts";
 
@@ -163,6 +164,16 @@ export function createApi(options: HttpOptions, auth: Auth) {
             }
 
             app.rename(user, name);
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "folder-favorites" && second === undefined && method === "GET") {
+            return json(response, 200, await app.folderFavorites.list(user));
+        }
+
+        if (first === "folder-favorites" && second === undefined && method === "POST") {
+            await app.folderFavorites.set(user, await readJson(request));
 
             return json(response, 200, { ok: true });
         }
@@ -340,6 +351,64 @@ export function createApi(options: HttpOptions, auth: Auth) {
             });
         }
 
+        // Theme folders (`themes.ts`): everyone signed in lists them, as everyone chooses one for their own browsers;
+        // only the owner adds, edits, and removes them.
+        if (first === "themes" && second === undefined && method === "GET") {
+            return json(response, 200, { themes: app.themes.list(user.role === "owner") });
+        }
+
+        if (first === "themes" && second === "default" && method === "PUT") {
+            await app.setThemeDefault(
+                user,
+                (await readJson<{ default?: unknown }>(request)).default,
+            );
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "themes" && second === "duplicate" && method === "POST") {
+            requireOwner(user);
+            const body = await readJson<{ from?: unknown; name?: unknown; colors?: unknown }>(
+                request,
+            );
+
+            if (typeof body.from !== "string") {
+                throw new HttpError(400, "Say which theme or colors to copy");
+            }
+
+            return json(response, 200, {
+                id: await app.themes.duplicate(body.from, body.name, body.colors === true),
+            });
+        }
+
+        if (first === "themes" && second !== undefined && third === "fonts" && method === "PUT") {
+            requireOwner(user);
+            app.themes.setFonts(
+                second,
+                await readJson<{ sans?: unknown; mono?: unknown; ligatures?: unknown }>(request),
+            );
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "themes" && second !== undefined && third === "edit" && method === "GET") {
+            requireOwner(user);
+
+            return json(response, 200, app.themes.edit(second));
+        }
+
+        if (
+            first === "themes" &&
+            second !== undefined &&
+            third === undefined &&
+            method === "DELETE"
+        ) {
+            requireOwner(user);
+            app.themes.remove(second);
+
+            return json(response, 200, { ok: true });
+        }
+
         if (first === "theme" && second === "wallpaper" && method === "GET") {
             if (user.role !== "owner") {
                 throw new HttpError(403, "Only the owner sees the desktop's wallpaper");
@@ -442,9 +511,18 @@ export function createApi(options: HttpOptions, auth: Auth) {
         }
 
         if (first === "approvals" && second !== undefined && method === "POST") {
-            const body = await readJson<{ allow?: boolean }>(request);
+            const body = await readJson<{ allow?: boolean; values?: unknown }>(request);
 
-            if (!(await app.answerApproval(second, body.allow === true, user))) {
+            // An id may hold a slash, which the path decoded into a part of its own: a codemode script's calls are
+            // named `<call>/<n>`. `values` answer an ask's fields (`host.ask`), and go to the asker alone.
+            if (
+                !(await app.answerApproval(
+                    parts.slice(1).join("/"),
+                    body.allow === true,
+                    user,
+                    body.values,
+                ))
+            ) {
                 throw new HttpError(404, "That approval is no longer pending");
             }
 
@@ -515,6 +593,7 @@ export function createApi(options: HttpOptions, auth: Auth) {
                 defaultModel?: unknown;
                 pipCompactAt?: unknown;
                 subagentModels?: unknown;
+                limitWaitHours?: unknown;
             }>(request);
 
             // One at a time: a second that fails must not leave the first changed.
@@ -524,18 +603,24 @@ export function createApi(options: HttpOptions, auth: Auth) {
                     body.defaultModel,
                     body.pipCompactAt,
                     body.subagentModels,
+                    body.limitWaitHours,
                 ].filter((value) => value !== undefined).length > 1
             ) {
                 throw new HttpError(400, "Change one setting at a time.");
             }
 
-            // The models subagents may run on besides their session's own: the owner's (checked in `app.ts`).
+            // The models subagents may run on: the owner's (checked in `app.ts`).
             if (body.subagentModels !== undefined) {
                 await app.setSubagentModels(user, body.subagentModels);
             }
 
             if (body.pipCompactAt !== undefined) {
                 await app.setPipCompactAt(user, body.pipCompactAt);
+            }
+
+            // How long a run waits for a provider's limit to clear: the owner's (checked in `app.ts`).
+            if (body.limitWaitHours !== undefined) {
+                await app.setLimitWaitHours(user, body.limitWaitHours);
             }
 
             if (body.approvalRule !== undefined) {
@@ -583,6 +668,35 @@ export function createApi(options: HttpOptions, auth: Auth) {
             return json(response, 200, { ok: true });
         }
 
+        // Routes extension modules add, each checking who may use it (`extension-routes.ts`).
+        if (first === "x" && second !== undefined) {
+            return extensionRoute(route, parts.slice(1));
+        }
+
+        // Fetch the LANCET model Lancet Guard needs. Answers at once; the download goes on and shows in the guard's status.
+        if (first === "guard" && second === "model" && third === undefined && method === "POST") {
+            await app.setupGuardModel(user);
+
+            return json(response, 200, await app.extensions(user));
+        }
+
+        // A module's settings (`web.settings`): the owner sets them; whoever its browser module is for reads them.
+        if (first === "extension-settings" && second !== undefined && third === undefined) {
+            if (method === "GET") {
+                return json(response, 200, app.extensionSettings(user, second));
+            }
+
+            if (method === "PUT") {
+                requireOwner(user);
+
+                return json(
+                    response,
+                    200,
+                    app.setExtensionSettings(user, second, await readJson(request)),
+                );
+            }
+        }
+
         if (first === "extensions" && second === undefined && method === "GET") {
             return json(response, 200, await app.extensions(user));
         }
@@ -615,6 +729,17 @@ export function createApi(options: HttpOptions, auth: Auth) {
             await app.reloadExtension(second);
 
             return json(response, 200, await app.extensions(user));
+        }
+
+        if (
+            first === "models" &&
+            second === "refresh" &&
+            third === undefined &&
+            method === "POST"
+        ) {
+            requireOwner(user);
+
+            return json(response, 200, await app.providers.modelRefresh.refresh());
         }
 
         // For the owner, each subscription's sign-in is asked afresh first (three seconds at most; a mark found later

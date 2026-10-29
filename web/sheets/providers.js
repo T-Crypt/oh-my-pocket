@@ -1,9 +1,10 @@
 // Model providers: signing in and out, the models subagents may use besides their session's own, and the models
 // each one offers the pickers (the chat's model menu, the default model, and every other place a model is chosen).
 // The dialog a sign-in uses to ask for a code or a key is here too.
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { api, attempt, closeSheet, closeSignIn, signInAnswered, store } from "../store.js";
 import { html, Icon, Loader, Sheet, Switch } from "../ui.js";
+import { RefreshModels } from "../model-refresh.js";
 
 /** How many of a provider's models the list shows at once. The search field reaches the rest. */
 const MODELS_AT_ONCE = 50;
@@ -15,9 +16,10 @@ const MODEL_SEARCH_AT = 8;
 let saving = Promise.resolve();
 
 /**
- * The owner's choice of the models Pi may start subagents on besides their session's own: every model, by provider,
- * each checked or not on its own. None, the default: subagents always run on their session's model, and Pi is offered
- * no model to pick. A tap sends that one model's change, not the whole list, so quick taps and other tabs keep theirs.
+ * The owner's choice of the models Pi may start subagents and linked sessions on: every model, by provider, each
+ * checked or not on its own. None, the default: they run on their session's model, and Pi is offered no model to pick.
+ * Some: only those, their session's model too only when it is checked. A tap sends that one model's change, not the
+ * whole list, so quick taps and other tabs keep theirs.
  * `names`: providers' names by id, once the sheet has them.
  */
 function SubagentModels({ names }) {
@@ -142,21 +144,74 @@ function SubagentModels({ names }) {
     </div>`;
 }
 
+/** How long a run waits for a provider's limit to clear (`limit-gate.ts`), at most. */
+const LIMIT_WAIT = [
+    [0, "Off"],
+    [1, "1 hour"],
+    [6, "6 hours"],
+    [12, "12 hours"],
+    [24, "24 hours"],
+];
+
+/** The owner's choice of how long a run waits for a limit, rather than failing. Shorter limits wait less. */
+function LimitWait() {
+    const hours = store.state.server?.limitWaitHours;
+
+    // A server that does not wait for limits sends none.
+    if (typeof hours !== "number") {
+        return null;
+    }
+
+    const change = (value) => attempt(() => api("settings", { limitWaitHours: value }));
+
+    return html`<div class="limit-wait">
+        <div class="small">Wait for a limit</div>
+        <p class="muted small">
+            When a provider's limit stops a run, it waits for the limit to clear, up to this long, and goes on by
+            itself. A limit that clears later makes it fail with the time.
+        </p>
+        <div class="segmented" role="group" aria-label="How long to wait for a limit">
+            ${LIMIT_WAIT.map(
+                ([value, label]) => html`<button
+                    class=${hours === value ? "on" : ""}
+                    aria-pressed=${hours === value}
+                    onClick=${() => change(value)}
+                >
+                    ${label}
+                </button>`,
+            )}
+        </div>
+    </div>`;
+}
+
 export function ProvidersSheet() {
-    const { me } = store.state;
+    const { me, auth } = store.state;
     const [providers, setProviders] = useState(null);
     const [query, setQuery] = useState("");
     // The provider whose models are open, with every model it has and whether the pickers offer it.
     const [open, setOpen] = useState(null);
     const [search, setSearch] = useState("");
+    const loginButton = useRef(null);
     const load = () => attempt(async () => setProviders(await api("providers")));
 
     useEffect(() => {
         load();
     }, [store.state.models]);
+    useLayoutEffect(() => {
+        if (!auth) {
+            loginButton.current?.focus();
+            loginButton.current = null;
+        }
+    }, [auth]);
     const owner = me?.role === "owner";
     const path = (provider, after = "") => `providers/${encodeURIComponent(provider.id)}${after}`;
-    const login = (provider, type) => attempt(() => api(path(provider, "/login"), { type }));
+
+    const login = (provider, type, button) => {
+        loginButton.current = button;
+
+        return attempt(() => api(path(provider, "/login"), { type }));
+    };
+
     const logout = (provider) =>
         confirm(
             `Log out of ${provider.name}? Pi uses the same sign-in, so it is signed out too.`,
@@ -221,96 +276,79 @@ export function ProvidersSheet() {
     const listed = found.slice(0, MODELS_AT_ONCE);
     const shown = models.filter((model) => model.shown).length;
 
-    return html`<${Sheet} title="Providers" onClose=${closeSheet}>
-        <p class="muted small">
-            Pi Pocket shares Pi's sign-ins (<span class="mono">~/.pi/agent/auth.json</span>). ${owner ? "" : "Only the owner can change them."}
-        </p>
+    // Signed-out providers wait at the end, and an expired sign-in comes first: that is the one to act on.
+    const groups = [
+        ["Needs sign-in", list.filter((provider) => provider.needsSignIn)],
+        ["Signed in", list.filter((provider) => !provider.needsSignIn && provider.configured)],
+        [
+            "Not configured",
+            list.filter((provider) => !provider.needsSignIn && !provider.configured),
+        ],
+    ].filter(([, each]) => each.length > 0);
+
+    const row = (provider) => html`<div class="provider-block" key=${provider.id}>
+    <div class="provider">
+        <div class="provider-info">
+            <div class="provider-name">
+                ${provider.name}
+                ${
+                    provider.needsSignIn
+                        ? html` <span class="warn provider-needs">needs sign-in</span>`
+                        : provider.configured && html` <span class="ok">✓</span>`
+                }
+            </div>
+            <div class="muted small">
+                ${provider.needsSignIn ? "the sign-in expired and could not be renewed: sign in again. Until then, sessions on its models fail, and PiP and subagents on other models do not use them" : provider.configured ? `signed in${provider.label ? ` · ${provider.label}` : provider.source ? ` · ${provider.source}` : ""}` : "not configured"} · ${provider.shown === provider.models ? `${provider.models} models` : `${provider.shown} of ${provider.models} models shown`}
+            </div>
+            ${
+                provider.needsSignIn &&
+                html`<div class="muted small mono provider-why">${provider.needsSignIn}</div>`
+            }
+        </div>
         ${
             owner &&
-            html`<${SubagentModels}
-                names=${Object.fromEntries((providers ?? []).map((each) => [each.id, each.name]))}
-            />`
-        }
-        <label class="search">
-            <${Icon} name="search" size=${16} />
-            <input
-                placeholder="Search providers"
-                value=${query}
-                onInput=${(event) => setQuery(event.currentTarget.value)}
-            />
-        </label>
-        ${providers === null && html`<${Loader} label="Loading providers" />`}
-        ${list.map(
-            (provider) => html`<div class="provider-block">
-                <div class="provider">
-                    <div>
-                        <div>
-                            ${provider.name}
-                            ${
-                                provider.needsSignIn
-                                    ? html` <span class="warn">needs sign-in</span>`
-                                    : provider.configured && html` <span class="ok">✓</span>`
-                            }
-                        </div>
-                        <div class="muted small">
-                            ${provider.needsSignIn ? "the sign-in expired and could not be renewed: sign in again. Until then, sessions on its models fail, and PiP and subagents on other models do not use them" : provider.configured ? `signed in${provider.label ? ` · ${provider.label}` : provider.source ? ` · ${provider.source}` : ""}` : "not configured"} · ${
-                                provider.shown === provider.models
-                                    ? `${provider.models} models`
-                                    : `${provider.shown} of ${provider.models} models shown`
-                            }
-                        </div>
-                        ${
-                            provider.needsSignIn &&
-                            html`<div class="muted small mono provider-why">${provider.needsSignIn}</div>`
-                        }
-                    </div>
-                    ${
-                        owner &&
-                        html`<div class="provider-actions">
-                            ${
-                                provider.oauth &&
-                                html`<button
-                                    class="button small"
-                                    onClick=${() => login(provider, "oauth")}
-                                >
-                                    ${provider.oauth}
-                                </button>`
-                            }
-                            ${
-                                provider.apiKey &&
-                                html`<button
-                                    class="button small"
-                                    onClick=${() => login(provider, "api_key")}
-                                >
-                                    API key
-                                </button>`
-                            }
-                            ${
-                                provider.configured &&
-                                html`<button
-                                    class="button small ghost"
-                                    title="Choose which of this provider's models the pickers offer"
-                                    onClick=${() => showModels(provider)}
-                                >
-                                    Models
-                                </button>`
-                            }
-                            ${
-                                provider.configured &&
-                                provider.source === "stored" &&
-                                html`<button
-                                    class="button small ghost"
-                                    onClick=${() => logout(provider)}
-                                >
-                                    Log out
-                                </button>`
-                            }
-                        </div>`
-                    }
-                </div>
+            html`<div class="provider-actions">
                 ${
-                    open?.id === provider.id &&
-                    html`<div class="provider-models">
+                    provider.oauth &&
+                    html`<button
+                        class="button small"
+                        onClick=${(event) => login(provider, "oauth", event.currentTarget)}
+                    >
+                        ${provider.oauth}
+                    </button>`
+                }
+                ${
+                    provider.apiKey &&
+                    html`<button
+                        class="button small"
+                        onClick=${(event) => login(provider, "api_key", event.currentTarget)}
+                    >
+                        API key
+                    </button>`
+                }
+                ${
+                    provider.configured &&
+                    html`<button
+                        class="button small ghost"
+                        title="Choose which of this provider's models the pickers offer"
+                        onClick=${() => showModels(provider)}
+                    >
+                        Models
+                    </button>`
+                }
+                ${
+                    provider.configured &&
+                    provider.source === "stored" &&
+                    html`<button class="button small ghost" onClick=${() => logout(provider)}>
+                        Log out
+                    </button>`
+                }
+            </div>`
+        }
+    </div>
+        ${
+            open?.id === provider.id &&
+            html`<div class="provider-models">
                         <label class="search">
                             <${Icon} name="search" size=${16} />
                             <input
@@ -354,13 +392,115 @@ export function ProvidersSheet() {
                             html`<p class="muted small">Showing the first ${MODELS_AT_ONCE} of ${found.length}. Search to narrow them.</p>`
                         }
                     </div>`
+        }
+    </div>`;
+
+    return html`<${Sheet}
+        title="Providers"
+        onClose=${closeSheet}
+        className=${`providers-sheet ${owner ? "with-side" : ""}`}
+    >
+        <p class="muted small">
+            Pi Pocket shares Pi's sign-ins (<span class="mono">~/.pi/agent/auth.json</span>). ${owner ? "" : "Only the owner can change them."}
+        </p>
+        <div class="providers-layout">
+            ${
+                owner &&
+                html`<aside class="providers-side" aria-label="Models">
+                    <${RefreshModels} />
+                    <${LimitWait} />
+                    <${SubagentModels}
+                        names=${Object.fromEntries(
+                            (providers ?? []).map((each) => [each.id, each.name]),
+                        )}
+                    />
+                </aside>`
+            }
+            <div class="providers-main">
+                ${store.state.auth && html`<${AuthDialog} inline=${true} />`}
+                <label class="search">
+                    <${Icon} name="search" size=${16} />
+                    <input
+                        placeholder="Search providers"
+                        value=${query}
+                        onInput=${(event) => setQuery(event.currentTarget.value)}
+                    />
+                </label>
+                ${providers === null && html`<${Loader} label="Loading providers" />`}
+                ${
+                    providers !== null &&
+                    list.length === 0 &&
+                    needle !== "" &&
+                    html`<div class="launcher-empty" role="status">
+                        <strong>No providers match “${query.trim()}”.</strong>
+                        <button class="button" onClick=${() => setQuery("")}>Clear search</button>
+                    </div>`
                 }
-            </div>`,
-        )}
+                ${groups.map(
+                    ([title, each]) => html`<section class="provider-group" key=${title}>
+                        <h3 class="provider-group-head">
+                            ${title} <span class="muted">${each.length}</span>
+                        </h3>
+                        <div class="sheet-list">${each.map(row)}</div>
+                    </section>`,
+                )}
+            </div>
+        </div>
     <//>`;
 }
 
-export function AuthDialog() {
+/** A provider signs in in place; sign-ins requested elsewhere still get their own dialog. */
+function AuthFrame({ title, onClose, inline, focusKey, children }) {
+    const ref = useRef(null);
+    const close = useRef(onClose);
+
+    close.current = onClose;
+
+    // The first question may arrive after the card mounts. Focus it then, not on every redraw while typing.
+    useLayoutEffect(() => {
+        if (inline) {
+            const card = ref.current?.querySelector(".auth-card");
+            const control =
+                card?.querySelector(".field input:not(:disabled), .field button:not(:disabled)") ??
+                card?.querySelector("a[href], button:not(:disabled)");
+
+            (control ?? ref.current)?.focus({ preventScroll: true });
+            ref.current?.scrollIntoView({ block: "nearest" });
+        }
+    }, [inline, focusKey]);
+    useEffect(() => {
+        if (!inline) {
+            return undefined;
+        }
+
+        const escape = (event) => {
+            if (event.key === "Escape" && !event.isComposing && event.keyCode !== 229) {
+                event.stopImmediatePropagation();
+                close.current();
+            }
+        };
+
+        addEventListener("keydown", escape, true);
+
+        return () => removeEventListener("keydown", escape, true);
+    }, [inline]);
+
+    const content = html`<div class="auth-card">${children}</div>`;
+
+    return inline
+        ? html`<section class="auth-inline" aria-label=${title} tabindex="-1" ref=${ref}>
+            <div class="auth-inline-head">
+                <strong>${title}</strong>
+                <button class="icon-button" aria-label="Close" onClick=${onClose}>
+                    <${Icon} name="close" size=${16} />
+                </button>
+            </div>
+            ${content}
+        </section>`
+        : html`<${Sheet} title=${title} onClose=${onClose}>${content}<//>`;
+}
+
+export function AuthDialog({ inline = false }) {
     const { auth } = store.state;
     const [value, setValue] = useState("");
 
@@ -373,6 +513,10 @@ export function AuthDialog() {
 
     const answer = (payload) => {
         const { flowId, prompt: asked } = auth;
+
+        if (asked.type === "secret" && payload.value?.trim() === "") {
+            return;
+        }
 
         return attempt(async () => {
             await api(`auth/${flowId}/${asked.id}`, payload);
@@ -391,8 +535,13 @@ export function AuthDialog() {
 
     const prompt = auth.prompt;
 
-    return html`<${Sheet} title=${`Sign in: ${auth.providerName}`} onClose=${close}>
-        ${auth.events.map((event) => {
+    return html`<${AuthFrame}
+        title=${`Sign in: ${auth.providerName}`}
+        onClose=${close}
+        inline=${inline}
+        focusKey=${`${auth.flowId}:${prompt?.id ?? auth.events.length}`}
+    >
+        ${(auth.done ? [] : auth.events).map((event) => {
             if (event.type === "auth_url") {
                 return html`<div class="auth-event">
                     <a class="button primary wide" href=${event.url} target="_blank" rel="noopener">
@@ -441,19 +590,46 @@ export function AuthDialog() {
                     <div class="row">
                         <input
                             type=${prompt.type === "secret" ? "password" : "text"}
+                            aria-label=${prompt.message}
                             autocomplete="off"
                             placeholder=${prompt.placeholder ?? ""}
                             value=${value}
                             onInput=${(event) => setValue(event.currentTarget.value)}
                             onKeyDown=${(event) => event.key === "Enter" && answer({ value })}
                         />
-                        <button class="button primary" onClick=${() => answer({ value })}>
+                        <button
+                            class="button primary"
+                            disabled=${prompt.type === "secret" && value.trim() === ""}
+                            onClick=${() => answer({ value })}
+                        >
                             Continue
                         </button>
                     </div>
                 </div>`)
         }
         ${!prompt && !auth.done && html`<${Loader} label="Waiting for the provider" />`}
-        ${auth.done && !auth.done.ok && html`<div class="error-box">${auth.done.error}</div>`}
+        ${
+            auth.done &&
+            !auth.done.ok &&
+            html`<div class="error-box">
+                <p>${auth.done.details ? auth.done.error : "Sign-in did not finish. Try again."}</p>
+                <details>
+                    <summary>Details</summary>
+                    <p>${auth.done.details ?? auth.done.error}</p>
+                </details>
+                <button
+                    class="button"
+                    onClick=${() =>
+                        attempt(async () => {
+                            await api(`providers/${encodeURIComponent(auth.providerId)}/login`, {
+                                type: auth.done.loginType ?? "oauth",
+                            });
+                            closeSignIn(auth.flowId);
+                        })}
+                >
+                    Start again
+                </button>
+            </div>`
+        }
     <//>`;
 }

@@ -8,12 +8,15 @@ import {
     actions,
     attempt,
     canSteer,
+    canToggleTurns,
     chatLogShown,
     closePeople,
     closeSheet,
     collab,
     drafts,
     insertIntoComposer,
+    isLoaded,
+    loadEarlier,
     markChatRead,
     notify,
     openSheet,
@@ -22,7 +25,7 @@ import {
     store,
     typing,
 } from "./store.js";
-import { copyText, html, Icon, Loader, Sheet, Spinner, timeAgo } from "./ui.js";
+import { clockTime, copyText, html, Icon, Loader, Sheet, Spinner, timeAgo } from "./ui.js";
 
 const coarse = matchMedia("(pointer: coarse)").matches;
 
@@ -71,7 +74,7 @@ export function PeopleButton() {
             others.length === 0
                 ? html`<${Icon} name="chat" />`
                 : html`<span class="people-here">
-                      <${Avatar} person=${shown} size=${24} />
+                      <${Avatar} person=${shown} size=${28} />
                       <span
                           class=${`online-mark ${shown.away ? "away" : ""}`}
                           aria-hidden="true"
@@ -117,44 +120,82 @@ export function TypingLine({ where }) {
     </div>`;
 }
 
-function clock(at) {
-    const date = new Date(at);
-    const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+const clock = (at) => clockTime(new Date(at));
 
-    return date.toDateString() === new Date().toDateString()
-        ? time
-        : `${date.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
+/** The newest jump: an earlier one still loading gives way to it. */
+let jumps = 0;
+
+/**
+ * Close the sheet and scroll the transcript to a message, briefly highlighted. The docked People panel stays. Resolves
+ * true once it shows, false when it cannot: not in the session's transcript, the session changed, or a newer jump came.
+ * `quiet` leaves the "earlier history" notice to the caller (`pocket.reveal`).
+ */
+export function jumpToEntry(entryId, { quiet = false } = {}) {
+    closeSheet();
+    const jump = ++jumps;
+    const { view, conversationId } = store.state;
+    const current = () => jump === jumps && store.state.conversationId === conversationId;
+
+    // In the session but not loaded yet (a view brings only the newest): load back to it first.
+    if (view.order.includes(entryId) && !isLoaded(view, entryId)) {
+        return loadEarlier({ from: entryId }).then(
+            () => current() && isLoaded(store.state.view, entryId) && show(entryId, jump, quiet),
+            (error) => {
+                notify("error", error.message ?? String(error));
+
+                return false;
+            },
+        );
+    }
+
+    return show(entryId, jump, quiet);
 }
 
-/** Close the sheet and scroll the transcript to a message, briefly highlighted. The docked People panel stays. */
-export function jumpToEntry(entryId) {
-    closeSheet();
+/** The scroll and flash of a jump, once the entry is loaded. */
+function show(entryId, jump, quiet) {
     // A message above the rows the transcript shows: show from it down. The render runs before the next frame.
     revealEntry(entryId);
     // An answer of only tool calls is a mark in a group of Pi's calls: the group opens (transcript.js).
     document.dispatchEvent(new CustomEvent("pocket:reveal", { detail: entryId }));
-    requestAnimationFrame(() => {
-        const found = document.getElementById(`entry-${entryId}`);
 
-        if (!found) {
-            notify(
-                "info",
-                "That message is in earlier history: use “Show earlier messages” at the top.",
-            );
+    return new Promise((resolve) =>
+        requestAnimationFrame(() => {
+            const found = document.getElementById(`entry-${entryId}`);
 
-            return;
-        }
+            if (jump !== jumps) {
+                return resolve(false);
+            }
 
-        // The mark has no size: its group's line is what shows.
-        const element = found.classList.contains("entry-anchor")
-            ? (found.closest(".activity")?.querySelector(".activity-head") ?? found)
-            : found;
+            if (!found) {
+                if (!quiet) {
+                    notify(
+                        "info",
+                        "That message is in earlier history: use “Show earlier messages” at the top.",
+                    );
+                }
 
-        element.scrollIntoView({ block: "center", behavior: "smooth" });
-        element.classList.remove("flash");
-        void element.offsetWidth;
-        element.classList.add("flash");
-    });
+                return resolve(false);
+            }
+
+            // The mark has no size: its group's line is what shows.
+            const element = found.classList.contains("entry-anchor")
+                ? (found.closest(".activity")?.querySelector(".activity-head") ?? found)
+                : found;
+
+            // A long one from its top, where it starts: centered, its middle would show, and what was found may be above.
+            const tall = element.getBoundingClientRect().height > innerHeight / 2;
+            const still = document.documentElement.dataset.motion === "reduced";
+
+            element.scrollIntoView({
+                block: tall ? "start" : "center",
+                behavior: still ? "auto" : "smooth",
+            });
+            element.classList.remove("flash");
+            void element.offsetWidth;
+            element.classList.add("flash");
+            resolve(true);
+        }),
+    );
 }
 
 /** Chat text with `@Name` mentions of known people highlighted (and the reader's own name more so). */
@@ -225,7 +266,7 @@ class ChatLine extends Component {
 
         return html`<div
             data-chat=${message.id}
-            class=${`chat-msg ${grouped ? "grouped" : ""} ${open ? "open" : ""} ${message.mentions?.includes(me?.id) ? "mentions-me" : ""}`}
+            class=${`chat-msg ${mine ? "mine" : ""} ${grouped ? "grouped" : ""} ${open ? "open" : ""} ${message.mentions?.includes(me?.id) ? "mentions-me" : ""}`}
             style=${`--who:${personColor(message.userId)}`}
         >
             ${
@@ -233,7 +274,7 @@ class ChatLine extends Component {
                 html`<div class="chat-meta">
                     <span class="chat-name">${mine ? "You" : senderName(message, users)}</span>
                     <span class="muted">${clock(message.at)}</span>
-                    ${pinned && html`<span class="muted">📌</span>`}
+                    ${pinned && html`<${Icon} name="pin" size=${11} class="muted" />`}
                 </div>`
             }
             ${
@@ -294,7 +335,7 @@ function mentionQuery(value, caret) {
 
 /** The chat. `focus` puts the caret in its box on desktops: not when a reload brings back the People panel. */
 function ChatTab({ highlight, focus }) {
-    const { chat, presence, me, users, conversationId, chatQuote, view } = store.state;
+    const { chat, me, users, conversationId, chatQuote, view } = store.state;
     const draftKey = `chat-${conversationId}`;
     const [text, setText] = useState(() => drafts.get(draftKey));
     const [sending, setSending] = useState(false);
@@ -309,6 +350,18 @@ function ChatTab({ highlight, focus }) {
 
     useEffect(() => markChatRead(), [newest]);
     useEffect(() => chatLogShown(), []);
+    // Whether the log follows its newest message, and where it last put itself: a scroll to anywhere else is the reader's.
+    const follow = useRef({ on: !highlight, at: -1 });
+
+    const stick = () => {
+        const element = log.current;
+
+        if (element && follow.current.on) {
+            element.scrollTop = element.scrollHeight;
+            follow.current.at = element.scrollTop;
+        }
+    };
+
     useLayoutEffect(() => {
         const element = log.current;
 
@@ -319,11 +372,55 @@ function ChatTab({ highlight, focus }) {
         const target = highlight && element.querySelector(`[data-chat="${CSS.escape(highlight)}"]`);
 
         if (target) {
+            follow.current.on = false;
             target.scrollIntoView({ block: "center" });
         } else {
-            element.scrollTop = element.scrollHeight;
+            follow.current.on = true;
+            stick();
         }
     }, [newest]);
+    // Following, it stays at the bottom while things settle: the panel opening, a pin showing above it, the box under it
+    // growing, a message taking its room.
+    useEffect(() => {
+        const element = log.current;
+
+        if (!element) {
+            return undefined;
+        }
+
+        const onScroll = () => {
+            // Its own scroll, or the browser holding it at the end as the log grew: still following.
+            if (Math.abs(element.scrollTop - follow.current.at) <= 1) {
+                return;
+            }
+
+            follow.current.on =
+                element.scrollHeight - element.scrollTop - element.clientHeight < 24;
+        };
+
+        const sizes = new ResizeObserver(stick);
+
+        const watch = () => {
+            for (const child of element.children) {
+                sizes.observe(child);
+            }
+
+            stick();
+        };
+
+        const children = new MutationObserver(watch);
+
+        element.addEventListener("scroll", onScroll, { passive: true });
+        sizes.observe(element);
+        children.observe(element, { childList: true });
+        watch();
+
+        return () => {
+            element.removeEventListener("scroll", onScroll);
+            sizes.disconnect();
+            children.disconnect();
+        };
+    }, []);
     useEffect(() => {
         if (focus && !coarse) {
             box.current?.focus();
@@ -394,20 +491,11 @@ function ChatTab({ highlight, focus }) {
         }
     };
 
-    return html`<div class="chat-here">
-        ${presence.map(
-            (person) =>
-                html`<span class=${`chip ${person.away ? "away" : ""}`} key=${person.id}>
-                    <${Avatar} person=${person} size=${18} /> ${person.name}
-                    ${person.id === me?.id ? " (you)" : person.away ? " · away" : ""}
-                </span>`,
-        )}
+    return html`<div class="chat-label">
+        <${Icon} name="eye" size=${12} />Side chat · Pi does not see this chat.
     </div>
     <div class="chat-log" ref=${log}>
-        ${
-            chat.length === 0 &&
-            html`<div class="muted">No messages yet. Pi does not see this chat.</div>`
-        }
+        ${chat.length === 0 && html`<div class="muted">No messages yet.</div>`}
         ${chat.map((message, index) => {
             const previous = chat[index - 1];
             const grouped =
@@ -468,7 +556,7 @@ function ChatTab({ highlight, focus }) {
             rows="1"
             maxlength="4000"
             value=${text}
-            placeholder=${collab() ? "Message the people here… @ to mention" : "Message the people here…"}
+            placeholder=${collab() ? "Message… @ to mention" : "Message the people here…"}
             onInput=${(event) => update(event.currentTarget.value, event.currentTarget.selectionStart)}
             onKeyDown=${(event) => {
                 if (
@@ -637,16 +725,85 @@ function NotesTab() {
     </div>`;
 }
 
+/** The session's people and the same take-turns shortcut as the menu, with its driver permissions. */
+function PeopleRoster() {
+    const { presence, users, me, view } = store.state;
+    const turns = view.turns;
+    const driver = users.find((person) => person.id === turns?.driver)?.name ?? "No one";
+    const canToggle = canToggleTurns();
+
+    return html`<div class="people-roster">
+        ${presence.map((person) => {
+            const role = users.find((user) => user.id === person.id)?.role;
+            const writing = person.typing && person.id !== me?.id;
+            const state = writing
+                ? person.typing === "pi"
+                    ? "writing to Pi…"
+                    : "typing…"
+                : person.away
+                  ? "away"
+                  : person.id === me?.id
+                    ? "here · you"
+                    : "here";
+            const roleLabel =
+                role === "owner" ? "owner" : role === "viewer" ? "view only" : "can steer";
+
+            return html`<div class="people-person" key=${person.id}>
+                <span class="people-here">
+                    <${Avatar} person=${person} size=${28} />
+                    <span
+                        class=${`online-mark ${person.away ? "away" : ""}`}
+                        aria-hidden="true"
+                    ></span>
+                </span>
+                <span class="people-person-info">
+                    <span class="people-person-name">${person.name}</span>
+                    <span class=${`people-person-state ${writing ? "typing" : ""}`}>
+                        ${state}
+                    </span>
+                </span>
+                <span class="people-role">${roleLabel}</span>
+            </div>`;
+        })}
+    </div>
+    ${
+        collab() &&
+        html`<div class="people-turns">
+            <span class="grow">
+                <span class="people-turns-title">
+                    ${turns?.on ? `${driver} is driving` : "Take turns"}
+                </span>
+                <span class="people-turns-hint">
+                    ${turns?.on ? "Only the driver can send to Pi" : "One person drives Pi at a time"}
+                </span>
+            </span>
+            ${
+                canToggle &&
+                html`<button
+                    class=${`button small ${turns?.on ? "" : "primary"}`}
+                    onClick=${() => attempt(() => actions.turns(turns?.on ? "off" : "on"))}
+                >
+                    ${turns?.on ? "Turn off" : "Start"}
+                </button>`
+            }
+        </div>`
+    }`;
+}
+
 /** Chat, pinned, and notes: the People sheet's on phones, the People panel's on wide screens. `ask` picks what shows first. */
 function PeopleTabs({ ask, focus }) {
-    const { view } = store.state;
+    const { view, users } = store.state;
+    const featured = view.pins?.at(-1);
+    const pinnedBy = users.find((user) => user.id === featured?.by)?.name ?? "someone";
     const [tab, setTab] = useState(ask.tab ?? "chat");
     const [highlight, setHighlight] = useState(ask.highlight ?? null);
     const pins = view.pins?.length ?? 0;
+    // Messages arriving while another tab is open: the top bar's badge counts them, and so does the tab.
+    const unread = tab === "chat" ? 0 : chatUnread();
     const tabs = collab()
         ? html`<div class="segmented tabs">
             <button class=${tab === "chat" ? "on" : ""} onClick=${() => setTab("chat")}>
-                Chat
+                Chat${unread > 0 ? ` ${unread}` : ""}
             </button>
             <button class=${tab === "pins" ? "on" : ""} onClick=${() => setTab("pins")}>
                 Pinned${pins > 0 ? ` ${pins}` : ""}
@@ -657,28 +814,47 @@ function PeopleTabs({ ask, focus }) {
         </div>`
         : null;
 
-    return html`${tabs}
-    ${
-        tab === "chat" &&
-        html`<${ChatTab} key=${highlight ?? "chat"} highlight=${highlight} focus=${focus} />`
-    }
-    ${
-        tab === "pins" &&
-        html`<${PinsTab}
-            onShowChat=${(chatId) => {
-                setHighlight(chatId);
-                setTab("chat");
-            }}
-        />`
-    }
-    ${tab === "notes" && html`<${NotesTab} />`}`;
+    return html`<div class="people-content">
+        <${PeopleRoster} />
+        ${tabs}
+        ${
+            tab === "chat" &&
+            featured &&
+            html`<button
+                class="people-pin"
+                onClick=${() => (featured.entryId !== undefined ? jumpToEntry(featured.entryId) : setHighlight(featured.chatId))}
+            >
+                <${Icon} name="pin" size=${13} />
+                <span><b>Pinned by ${pinnedBy}</b> · ${featured.text}</span>
+            </button>`
+        }
+        ${
+            tab === "chat" &&
+            html`<${ChatTab} key=${highlight ?? "chat"} highlight=${highlight} focus=${focus} />`
+        }
+        ${
+            tab === "pins" &&
+            html`<${PinsTab}
+                onShowChat=${(chatId) => {
+                    setHighlight(chatId);
+                    setTab("chat");
+                }}
+            />`
+        }
+        ${tab === "notes" && html`<${NotesTab} />`}
+    </div>`;
 }
 
 export function ChatSheet() {
     // While the sheet animates out, the store has no sheet any more.
     const sheet = store.state.sheet ?? {};
 
-    return html`<${Sheet} title="People" onClose=${closeSheet}>
+    return html`<${Sheet}
+        title="People"
+        className="people-sheet"
+        onClose=${closeSheet}
+        actions=${html`<span class="people-count">${store.state.presence.length}</span>`}
+    >
         <${PeopleTabs} ask=${sheet} focus=${true} />
     <//>`;
 }
@@ -714,12 +890,15 @@ export function PeoplePanel({ leaving = false }) {
 
     return html`<section
         class=${`people window ${leaving ? "leaving" : ""}`}
+        data-part="people-panel"
+        data-state=${leaving ? "closing" : undefined}
         aria-label="People"
         inert=${leaving}
         onKeyDown=${keepEscape}
     >
-        <header class="sheet-head">
+        <header class="people-head">
             <h2>People</h2>
+            <span class="people-count">${store.state.presence.length}</span>
             <button
                 class="icon-button"
                 aria-label="Close the People panel"

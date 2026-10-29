@@ -1,8 +1,16 @@
 {
     "name": "pi-pocket",
-    "version": "0.13.2",
+    "version": "0.26.0",
     "description": "A durable, multiplayer, mobile-first web app for Pi agents, built on Pi Durable",
-    "private": true,
+    "keywords": [
+        "pi",
+        "ai",
+        "agent",
+        "coding-agent",
+        "mobile",
+        "multiplayer",
+        "durable"
+    ],
     "type": "module",
     "license": "MIT",
     "author": "Tanner Middleton",
@@ -17,6 +25,18 @@
     "bin": {
         "pi-pocket": "bin/pi-pocket.js"
     },
+    "files": [
+        "bin/",
+        "src/",
+        "web/",
+        "types/",
+        "docs/",
+        "contrib/",
+        "AGENTS.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "npm-shrinkwrap.json"
+    ],
     "engines": {
         "node": ">=22.19"
     },
@@ -24,28 +44,35 @@
     "scripts": {
         "start": "node bin/pi-pocket.js",
         "dev": "node bin/pi-pocket.js --cwd .",
-        "check": "tsc --noEmit -p .",
+        "check": "tsc --noEmit -p . && node test/types-file.ts && node docs-site/check-reference.mjs",
         "check:web": "node scripts/check-web.mjs",
         "test": "node --test test/*.test.ts",
         "coverage": "node --test --experimental-test-coverage --test-coverage-lines=60 test/*.test.ts",
-        "site:publish": "git subtree push --prefix site origin gh-pages",
+        "site:publish": "gh workflow run pages.yml",
         "format": "eslint --fix . && prettier --write .",
         "format:check": "prettier --check . && eslint .",
-        "lint": "eslint ."
+        "lint": "eslint .",
+        "prepack": "node -e \"require('node:fs').copyFileSync('package-lock.json', 'npm-shrinkwrap.json')\"",
+        "postpack": "node -e \"require('node:fs').rmSync('npm-shrinkwrap.json', { force: true })\"",
+        "prepublishOnly": "npm run check && npm run lint && npm test"
     },
     "dependencies": {
-        "@earendil-works/chord": "1.1.0",
-        "@earendil-works/pi-ai": "1.1.0",
-        "@earendil-works/pi-codemode": "1.1.0",
-        "@earendil-works/pi-coding-agent": "1.1.0",
-        "@earendil-works/pi-durable": "1.1.0",
-        "dompurify": "^3.4.16",
+        "@earendil-works/chord": "1.4.0",
+        "@earendil-works/pi-ai": "1.4.0",
+        "@earendil-works/pi-codemode": "1.4.0",
+        "@earendil-works/pi-coding-agent": "1.4.0",
+        "@earendil-works/pi-durable": "1.4.0",
+        "@earendil-works/pi-mcp": "1.4.0",
+        "dompurify": "^3.4.17",
         "htm": "^3.1.1",
         "jiti": "2.7.0",
-        "marked": "^18.1.0",
-        "preact": "^11.0.1",
+        "marked": "^18.1.1",
+        "preact": "^11.0.2",
         "qrcode": "^1.5.4",
-        "undici": "8.10.2"
+        "undici": "8.12.3"
+    },
+    "overrides": {
+        "undici": "8.12.3"
     },
     "devDependencies": {
         "@stylistic/eslint-plugin": "5.10.0",

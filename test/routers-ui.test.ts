@@ -137,8 +137,14 @@ async function openEditor() {
         "the session",
         20_000,
     );
+    // A phone draws no rail: the Routers place is in the session's Menu.
     await inPage<null>(
-        `(document.querySelector(".rail-routers") ?? document.querySelector('[data-place="routers"]'))?.click(); return "null"`,
+        `const rail = document.querySelector(".rail-routers");
+        if (rail) { rail.click(); return "null"; }
+        document.querySelector('.topbar [aria-label="Menu"]')?.click();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        document.querySelector('[data-place="routers"]')?.click();
+        return "null";`,
     );
     await until(
         async () =>

@@ -8,7 +8,7 @@ import {
     type Model,
     type ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
-import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import type { ModelRuntime, ScopedModel } from "@earendil-works/pi-coding-agent";
 import type { AgentState, ModelRef } from "@earendil-works/pi-durable";
 import type { ConfigStore } from "./config.ts";
 
@@ -41,6 +41,7 @@ type ModelSummary = {
     reasoning: boolean;
     images: boolean;
     levels: string[];
+    scoped?: true;
     /** Its provider's sign-in expired and could not be renewed: it works again once someone signs in. */
     signIn?: true;
 };
@@ -60,6 +61,13 @@ export function levelAtMost(
         .find((each) => supported.includes(each));
 }
 
+/** The level a model thinks at when `level` is asked: `level` itself, else its nearest lower one, else its lowest. */
+export function levelFor(model: Model<Api>, level: ModelThinkingLevel): ModelThinkingLevel {
+    const supported = model.reasoning ? getSupportedThinkingLevels(model) : ["off"];
+
+    return levelAtMost(model, level) ?? THINKING_LEVELS.find((each) => supported.includes(each))!;
+}
+
 /** Whether a model thinks, and at which levels, and whether it takes images. */
 function capabilities(model: Model<Api>) {
     return {
@@ -77,7 +85,10 @@ export function modelList(
     models: ModelRuntime,
     config?: Pick<ConfigStore, "showsModel">,
     signInNeeded: SignInNeeded = () => false,
+    scopedModels: readonly ScopedModel[] = [],
 ): ModelSummary[] {
+    const scoped = new Set(scopedModels.map(({ model }) => `${model.provider}/${model.id}`));
+
     return models
         .getAvailableSnapshot()
         .filter((model) => config === undefined || config.showsModel(model.provider, model.id))
@@ -87,6 +98,7 @@ export function modelList(
             name: model.name,
             contextWindow: model.contextWindow,
             ...capabilities(model),
+            ...(scoped.has(`${model.provider}/${model.id}`) ? { scoped: true as const } : {}),
             ...(signInNeeded(model.provider) ? { signIn: true as const } : {}),
         }));
 }
@@ -104,6 +116,26 @@ export function findModel(models: ModelRuntime, spec: string): Model<Api> | unde
                   model.id === trimmed.slice(slash + 1),
           )
         : available.find((model) => model.id === trimmed);
+}
+
+/** Local metadata for one exact model, including models without configured auth. Never contacts a provider. */
+export function modelInfo(models: ModelRuntime, spec: string) {
+    const slash = spec.indexOf("/");
+    const model =
+        slash > 0 ? models.getModel(spec.slice(0, slash), spec.slice(slash + 1)) : undefined;
+
+    return model === undefined
+        ? undefined
+        : {
+              model: { provider: model.provider, modelId: model.id },
+              name: model.name,
+              thinkingLevels: capabilities(model).levels as ModelThinkingLevel[],
+              contextWindow: model.contextWindow,
+              // Dollars per million tokens; left out when the catalog has no price.
+              ...(model.cost.input > 0 || model.cost.output > 0
+                  ? { cost: { input: model.cost.input, output: model.cost.output } }
+                  : {}),
+          };
 }
 
 /** Whether `spec` (`provider/id`, or an id alone) names the model `ref`. */

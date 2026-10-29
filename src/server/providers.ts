@@ -16,7 +16,7 @@ import type { ModelRef } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
 import { describe, HttpError } from "./errors.ts";
-import { modelList } from "./models.ts";
+import { ModelRefresh } from "./model-refresh.ts";
 
 /** How long asking a provider's sign-in afresh may take: a renewal's own limit is 15 seconds. */
 const CHECK_MS = 20_000;
@@ -66,13 +66,17 @@ export function renewalRefused(error: unknown): boolean {
 interface AuthFlow {
     id: string;
     userId: string;
-    prompts: Map<string, { resolve: (value: string) => void; reject: (error: Error) => void }>;
+    prompts: Map<
+        string,
+        { resolve: (value: string) => void; reject: (error: Error) => void; requiresKey: boolean }
+    >;
     abort: AbortController;
 }
 
 export class Providers {
     readonly #app: PocketApp;
     readonly #flows = new Map<string, AuthFlow>();
+    readonly modelRefresh: ModelRefresh;
     /** Providers whose sign-in could not be renewed, and what they said. In memory: asked again after a restart. */
     readonly #expired = new Map<string, string>();
     /** Checks under way, by provider, so asking twice at once asks once. */
@@ -85,6 +89,12 @@ export class Providers {
 
     constructor(app: PocketApp) {
         this.#app = app;
+        this.modelRefresh = new ModelRefresh(app);
+    }
+
+    /** How many sign-ins and sign-outs here a provider has had: a limit that one account hit is not the next one's. */
+    signInEpoch(providerId: string): number {
+        return this.#signIns.get(providerId) ?? 0;
     }
 
     /** Why a provider's sign-in needs a person to sign in again, as last asked; undefined when it does not. */
@@ -218,11 +228,15 @@ export class Providers {
     #signedInOrOut(providerId: string): void {
         this.#signIns.set(providerId, (this.#signIns.get(providerId) ?? 0) + 1);
         this.#expired.delete(providerId);
+        // What a gate knew of a limit was about the account that is gone.
+        this.#app.limits.reset(providerId);
     }
 
     /** A mark came or went: tabs get the models marked again, and sessions' views their model's state. */
     #changed(): void {
-        this.#sendModels();
+        void this.#sendModels().catch((error: unknown) =>
+            this.#app.log(`Models not sent: ${describe(error)}`),
+        );
         this.#app.refreshViews();
     }
 
@@ -330,13 +344,20 @@ export class Providers {
             }
         };
 
+        let lastPromptType: AuthPrompt["type"] | undefined;
+
         const interaction = {
             signal: flow.abort.signal,
             prompt: (prompt: AuthPrompt) =>
                 new Promise<string>((resolvePrompt, rejectPrompt) => {
                     const promptId = randomUUID();
 
-                    flow.prompts.set(promptId, { resolve: resolvePrompt, reject: rejectPrompt });
+                    lastPromptType = prompt.type;
+                    flow.prompts.set(promptId, {
+                        resolve: resolvePrompt,
+                        reject: rejectPrompt,
+                        requiresKey: type === "api_key" && prompt.type === "secret",
+                    });
                     const { signal, ...shown } = prompt;
 
                     signal?.addEventListener("abort", () => {
@@ -361,7 +382,17 @@ export class Providers {
                     send({ step: "done", ok: true });
                     this.#changed();
                 },
-                (error: unknown) => send({ step: "done", ok: false, error: describe(error) }),
+                (error: unknown) =>
+                    send({
+                        step: "done",
+                        ok: false,
+                        loginType: type,
+                        error:
+                            type === "oauth" && lastPromptType === "manual_code"
+                                ? "That code was not accepted."
+                                : "Sign-in did not finish. Try again.",
+                        details: describe(error),
+                    }),
             )
             .finally(() => this.#flows.delete(flow.id));
 
@@ -379,6 +410,10 @@ export class Providers {
 
         if (prompt === undefined) {
             throw new HttpError(404, "No such prompt");
+        }
+
+        if (prompt.requiresKey && value !== undefined && value.trim() === "") {
+            throw new HttpError(400, "Enter an API key.");
         }
 
         flow.prompts.delete(promptId);
@@ -414,11 +449,14 @@ export class Providers {
         this.#changed();
     }
 
+    /** A manual catalog reload reached a new snapshot: every picker and session view gets it. */
+    modelsChanged(): void {
+        this.#changed();
+    }
+
     /** Every tab gets the models available now, marked when their sign-in needs renewing. */
-    #sendModels(): void {
-        const models = modelList(this.#app.models, this.#app.config, (provider) =>
-            this.#expired.has(provider),
-        );
+    async #sendModels(): Promise<void> {
+        const models = await this.#app.modelList();
 
         for (const client of this.#app.clients) {
             client.send("models", models);
@@ -426,6 +464,8 @@ export class Providers {
     }
 
     close(): void {
+        this.modelRefresh.close();
+
         for (const flow of this.#flows.values()) {
             flow.abort.abort();
         }

@@ -6,7 +6,9 @@ import { BrowserError, type Connection, type Json } from "./cdp.ts";
 import { KEYS, keyEvents, parseKeys } from "./keys.ts";
 import {
     DESCRIBE_FUNCTION,
+    FOCUSED_SCRIPT,
     LOCATE_SCRIPT,
+    POINT_SCRIPT,
     SELECT_ALL_SCRIPT,
     SELECT_OPTION_SCRIPT,
     SNAPSHOT_SCRIPT,
@@ -39,6 +41,22 @@ export type Frame = { seq: number; data: Buffer; width: number; height: number }
 
 /** Where Pi points: a ref from the last snapshot, a CSS selector, visible text, or a point. */
 export type Target = { ref?: string; selector?: string; label?: string; x?: number; y?: number };
+
+/** One control of a page's snapshot, as data. A password field's value is `••••` when it holds one, else "". */
+export type BrowserControl = {
+    ref: string;
+    role: string;
+    name: string;
+    /** An input's type (`text`, `password`, `email`, …), `textarea`, `select`, or the element's tag. */
+    kind: string;
+    disabled: boolean;
+    inView: boolean;
+    value?: string;
+    placeholder?: string;
+    checked?: boolean;
+    options?: string[];
+    href?: string;
+};
 
 export type Saved = { url?: string; viewport?: Viewport };
 
@@ -1001,9 +1019,15 @@ export class BrowserPage {
     }
 
     /** Where a target is on screen, scrolled into view. */
-    async locate(
-        target: Target,
-    ): Promise<{ x: number; y: number; label: string; covered?: string; editable?: boolean }> {
+    async locate(target: Target): Promise<{
+        x: number;
+        y: number;
+        label: string;
+        covered?: string;
+        editable?: boolean;
+        kind?: string;
+        password?: boolean;
+    }> {
         if (typeof target.x === "number" && typeof target.y === "number") {
             return {
                 x: target.x,
@@ -1105,6 +1129,69 @@ export class BrowserPage {
         return label;
     }
 
+    /**
+     * Put a person's value into a field, replacing what it holds: for values that must not go through Pi, such as a
+     * password. Only into a field (an input, a text area, or an editable element); the value is not in what it returns.
+     */
+    async fill(target: Target, value: string): Promise<string> {
+        this.usedAt = Date.now();
+        const found = await this.locate(target);
+
+        // A value goes into the field named, or nowhere: never into whatever else a click or the focus found.
+        if (
+            typeof target.x === "number" &&
+            target.ref === undefined &&
+            target.selector === undefined &&
+            target.label === undefined
+        ) {
+            throw new BrowserError("Fill a field by its ref, selector, or label, not by a point.");
+        }
+
+        if (found.editable !== true || found.kind === "select") {
+            throw new BrowserError(`${found.label} is not a field to fill in.`);
+        }
+
+        if (found.covered !== undefined) {
+            throw new BrowserError(
+                `${found.label} is covered by ${found.covered}: nothing was filled in.`,
+            );
+        }
+
+        await this.#click({ x: found.x, y: found.y }, "left", 1);
+
+        if ((await this.#evaluate(FOCUSED_SCRIPT)) !== true) {
+            throw new BrowserError(`${found.label} did not take the focus: nothing was filled in.`);
+        }
+
+        const field = await this.#evaluate(SELECT_ALL_SCRIPT);
+
+        if (field === "none") {
+            throw new BrowserError(`${found.label} cannot be typed into: nothing was filled in.`);
+        }
+
+        if (field === "keys") {
+            await this.#key("a", 2);
+        }
+
+        if ((field === "selected" || field === "keys") && value === "") {
+            await this.#key("Backspace", 0);
+        }
+
+        if (value !== "") {
+            await this.#send("Input.insertText", { text: value });
+        }
+
+        return found.label;
+    }
+
+    /** What is at a point of the viewport, without acting on it. */
+    async describeAt(
+        x: number,
+        y: number,
+    ): Promise<{ label: string; kind: string; editable: boolean; password: boolean }> {
+        return await this.#evaluate(`(${POINT_SCRIPT})(${Number(x)}, ${Number(y)})`);
+    }
+
     async press(combo: string, options: { signal?: AbortSignal } = {}): Promise<void> {
         this.usedAt = Date.now();
         const { key, modifiers } = parseKeys(combo);
@@ -1150,6 +1237,8 @@ export class BrowserPage {
         lines: string;
         truncated: boolean;
         controls: number;
+        /** The controls as data, up to 500 (`BrowserControl`). */
+        items: BrowserControl[];
         scrollY: number;
         scrollHeight: number;
         innerHeight: number;

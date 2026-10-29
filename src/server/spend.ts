@@ -4,7 +4,9 @@
  * the work's usage is committed. The owner can limit a session or a person. Past a limit, new messages are refused,
  * and a run that crosses it is stopped; the model request that crossed it still counts.
  */
+import { copyJson } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { type ConversationId, UsageDoc, type UsageState } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
@@ -76,11 +78,15 @@ export class Spend {
             const added = (this.#costs.get(id) ?? 0) - (stored?.counted[String(id)] ?? 0);
 
             if (added > 0) {
-                this.#owe(id, this.#payer(id), added);
+                this.#owe(id, this.payer(id), added);
             }
         }
 
         await this.#count();
+        const counted = await harness.snapshot(SpendDoc, context);
+
+        this.#people = { ...counted?.people };
+        this.#stopOverLimit();
     }
 
     /** Add spend in a conversation to a person, to be stored with the next count. */
@@ -95,14 +101,15 @@ export class Spend {
      * A conversation's usage changed: called from the commit listener, when whom Pi works for is who asked for this
      * work. Storing it waits for a moment.
      */
-    usageChanged(id: ConversationId, usage: UsageState | null): void {
+    usageChanged(id: ConversationId, usage: UsageState | null, alreadyPaid = false): void {
         const cost = usageCost(usage ?? undefined);
-        const added = cost - (this.#costs.get(id) ?? 0);
+        // An auxiliary request pays all its usage in this commit. Do not infer another debt from rounded totals.
+        const added = alreadyPaid ? 0 : cost - (this.#costs.get(id) ?? 0);
 
         this.#costs.set(id, cost);
 
         if (added > 0) {
-            this.#owe(id, this.#payer(id), added);
+            this.#owe(id, this.payer(id), added);
         }
 
         this.#timer ??= setTimeout(() => {
@@ -113,8 +120,67 @@ export class Spend {
         }, COUNT_AFTER_MS);
     }
 
+    /** Follow stored spend, including auxiliary requests that pay their captured person atomically. */
+    countedChanged(stored: { people: Record<string, number> }): void {
+        this.#people = { ...stored.people };
+    }
+
+    /** Record an auxiliary model request with its captured payer, even if another run has started since. */
+    async recordModelUsage(
+        id: ConversationId,
+        payer: string,
+        message: AssistantMessage,
+    ): Promise<void> {
+        await this.#app.harness.commit(async (tx) => {
+            const models = (await tx.doc(UsageDoc, id)).models as Record<string, Usage>;
+            const key = `${message.provider}/${message.model}`;
+            const usage = message.usage;
+            const total = Object.hasOwn(models, key) ? models[key] : undefined;
+
+            if (total === undefined) {
+                // The provider/model key contains a slash, so it cannot be a prototype setter.
+                models[key] = copyJson(usage, {
+                    omitUndefinedProperties: true,
+                }) as unknown as Usage;
+            } else {
+                for (const field of [
+                    "input",
+                    "output",
+                    "cacheRead",
+                    "cacheWrite",
+                    "totalTokens",
+                ] as const) {
+                    total[field] += usage[field];
+                }
+
+                for (const field of ["cacheWrite1h", "reasoning"] as const) {
+                    if (usage[field] !== undefined) {
+                        total[field] = (total[field] ?? 0) + usage[field];
+                    }
+                }
+
+                for (const field of [
+                    "input",
+                    "output",
+                    "cacheRead",
+                    "cacheWrite",
+                    "total",
+                ] as const) {
+                    total.cost[field] += usage.cost[field];
+                }
+            }
+
+            // Atomic with usage: a restart cannot lose the payer or charge this request twice.
+            const spend = await tx.doc(SpendDoc);
+
+            spend.counted[String(id)] = (spend.counted[String(id)] ?? 0) + usage.cost.total;
+            spend.people[payer] = (spend.people[payer] ?? 0) + usage.cost.total;
+        }, context);
+        this.#stopOverLimit();
+    }
+
     /** Who pays for a conversation's work: whoever asked for it, else whoever started the session, else the owner. */
-    #payer(id: ConversationId): string {
+    payer(id: ConversationId): string {
         const app = this.#app;
 
         return (
@@ -135,7 +201,7 @@ export class Spend {
         }
 
         try {
-            this.#people = await this.#app.harness.commit(async (tx) => {
+            await this.#app.harness.commit(async (tx) => {
                 const doc = await tx.doc(SpendDoc);
 
                 for (const [id, payers] of owed) {
@@ -144,8 +210,6 @@ export class Spend {
                         doc.people[payer] = (doc.people[payer] ?? 0) + added;
                     }
                 }
-
-                return { ...doc.people };
             }, context);
         } catch (error) {
             // Still owed: the next count stores it.
@@ -174,18 +238,70 @@ export class Spend {
         return spent;
     }
 
+    /**
+     * The session at the top of a linked family (`linked-sessions.ts`): the one that started this one, and so on up. A
+     * session no link started is its own.
+     */
+    teamRoot(root: ConversationId): ConversationId {
+        const seen = new Set<ConversationId>([root]);
+        let at = root;
+
+        for (;;) {
+            const from = this.#app.sessionMeta(at)?.linkedFrom?.id as ConversationId | undefined;
+
+            if (from === undefined || seen.has(from)) {
+                return at;
+            }
+
+            seen.add(from);
+            at = from;
+        }
+    }
+
+    /** What a linked family spent: its top session and every session linked under it, subagents included. */
+    #teamSpent(top: ConversationId): number {
+        let spent = 0;
+
+        for (const [id, cost] of this.#costs) {
+            if (this.teamRoot(this.#app.rootOf(id)) === top) {
+                spent += cost;
+            }
+        }
+
+        return spent;
+    }
+
+    /**
+     * What counts against a session's own limit, to show beside it: itself and its subagents, and, for a session that
+     * started linked sessions, theirs too, as `#reached` counts it.
+     */
+    budgetSpent(root: ConversationId): number {
+        return this.teamRoot(root) === root ? this.#teamSpent(root) : this.sessionSpent(root);
+    }
+
     personSpent(userId: string): number {
         return this.#people[userId] ?? 0;
     }
 
     /** The limit work in a conversation reached when `userId` pays for it: the session's, or theirs. */
-    #reached(id: ConversationId, userId: string): { budget: number; person?: User } | undefined {
+    #reached(
+        id: ConversationId,
+        userId: string,
+    ): { budget: number; person?: User; team?: true } | undefined {
         const app = this.#app;
         const root = app.rootOf(id);
         const budget = app.sessionMeta(root)?.budget;
 
         if (budget !== undefined && this.sessionSpent(root) >= budget) {
             return { budget };
+        }
+
+        // The budget of the session that started a team covers it all: what its linked sessions spend counts too.
+        const top = this.teamRoot(root);
+        const team = app.sessionMeta(top)?.budget;
+
+        if (team !== undefined && this.#teamSpent(top) >= team) {
+            return top === root ? { budget: team } : { budget: team, team: true };
         }
 
         const person = app.config.userById(userId);
@@ -207,7 +323,11 @@ export class Spend {
         }
 
         const whose =
-            reached.person === undefined ? "This session reached its" : "You reached your";
+            reached.person !== undefined
+                ? "You reached your"
+                : reached.team
+                  ? "The session that started this one reached its"
+                  : "This session reached its";
 
         throw new HttpError(
             409,
@@ -219,16 +339,18 @@ export class Spend {
      * Why work Pi starts with nobody asking (a scheduled message, the next round toward a goal) may not start: a limit
      * the session or its payer reached. `userId` pays when given, else whoever asked last.
      */
-    heldBack(id: ConversationId, userId = this.#payer(id)): string | undefined {
+    heldBack(id: ConversationId, userId = this.payer(id)): string | undefined {
         const reached = this.#reached(id, userId);
 
         if (reached === undefined) {
             return undefined;
         }
 
-        return reached.person === undefined
-            ? `this session reached its ${dollars(reached.budget)} spend limit`
-            : `${reached.person.name} reached their ${dollars(reached.budget)} spend limit`;
+        return reached.person !== undefined
+            ? `${reached.person.name} reached their ${dollars(reached.budget)} spend limit`
+            : reached.team
+              ? `the session that started this one reached its ${dollars(reached.budget)} spend limit`
+              : `this session reached its ${dollars(reached.budget)} spend limit`;
     }
 
     /** Call `listener` whenever the owner changes a session's or a person's limit; returns how to stop. */
@@ -344,7 +466,7 @@ export class Spend {
             return {
                 id: session.id,
                 title: session.title ?? "New session",
-                spent: byRoot.get(id) ?? 0,
+                spent: budget === undefined ? (byRoot.get(id) ?? 0) : this.budgetSpent(id),
                 ...(budget === undefined ? {} : { budget }),
             };
         });

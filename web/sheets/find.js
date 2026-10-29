@@ -1,8 +1,8 @@
 // Find in session: messages, commands, and files, through the whole history.
 import { useEffect, useRef, useState } from "preact/hooks";
 import { jumpToEntry } from "../chat.js";
-import { actions, closeSheet, isRow, store } from "../store.js";
-import { html, Marked, plainText, Sheet, Spinner, writtenText } from "../ui.js";
+import { actions, closeSheet, isRow, loadEarlier, store } from "../store.js";
+import { html, Icon, Marked, plainText, Sheet, Spinner, writtenText } from "../ui.js";
 
 /** How many entries a page of earlier history has (`app.history` on the server), and how many pages find reads. */
 const HISTORY_PAGE = 400;
@@ -28,6 +28,7 @@ function searchText(entry) {
                 .filter(Boolean)
                 .join("\n");
         case "shell":
+        case "command":
             return `${entry.command}\n${entry.output}`;
         case "note":
             return `${entry.name} ${entry.text}`;
@@ -48,7 +49,7 @@ function speaker(entry) {
         return "Pi";
     }
 
-    if (entry.kind === "shell" || entry.kind === "note") {
+    if (entry.kind === "shell" || entry.kind === "command" || entry.kind === "note") {
         return entry.name;
     }
 
@@ -77,17 +78,25 @@ export function FindSheet({ initial }) {
     // is searched) is here.
     const [earlier, setEarlier] = useState({ entries: [], done: false, all: true });
     const box = useRef(null);
-    const first = view.order.length > 0 ? view.entries.get(view.order[0]) : undefined;
 
     useEffect(() => box.current?.focus(), []);
     useEffect(() => {
-        if (!first || (first.kind !== "compaction" && first.kind !== "reset")) {
-            return setEarlier({ entries: [], done: true, all: true });
-        }
-
         let live = true;
 
         (async () => {
+            // The rest of the active context first: a view brings only its newest entries.
+            await loadEarlier();
+            const { view: now } = store.state;
+            const first = now.order.length > 0 ? now.entries.get(now.order[0]) : undefined;
+
+            if (!live) {
+                return;
+            }
+
+            if (!first || (first.kind !== "compaction" && first.kind !== "reset")) {
+                return setEarlier({ entries: [], done: true, all: true });
+            }
+
             let entries = [];
             let before = first.id;
 
@@ -183,18 +192,28 @@ export function FindSheet({ initial }) {
     };
 
     return html`<${Sheet} title="Find in session" onClose=${closeSheet}>
-        <input
-            class="find-input"
-            ref=${box}
-            type="search"
-            placeholder="Words in a message, a command, a file…"
-            value=${query}
-            onInput=${(event) => {
-                setQuery(event.currentTarget.value);
-                setPick(0);
-            }}
-            onKeyDown=${onKey}
-        />
+        <label class="search find-search">
+            <${Icon} name="search" size=${16} />
+            <input
+                class="find-input"
+                ref=${box}
+                type="search"
+                aria-label="Find in session"
+                placeholder="Words in a message, a command, a file…"
+                value=${query}
+                onInput=${(event) => {
+                    setQuery(event.currentTarget.value);
+                    setPick(0);
+                }}
+                onKeyDown=${onKey}
+            />
+            ${
+                needle &&
+                html`<span class="find-count mono" role="status">
+                    ${results.length}
+                </span>`
+            }
+        </label>
         ${
             needle !== "" &&
             results.length === 0 &&

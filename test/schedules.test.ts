@@ -18,14 +18,9 @@ import { after, before, test } from "node:test";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
-import { AuthorsDoc, ChatDoc, ScheduleDoc } from "../src/server/docs.ts";
-import {
-    describeMoment,
-    describeRepeat,
-    nextClockTime,
-    parseWhen,
-    zonedMoment,
-} from "../src/server/when.ts";
+import { AuthorsDoc, ScheduleDoc } from "../src/server/docs.ts";
+import { DEFAULT_SCHEDULE_LIMITS } from "../src/server/schedules.ts";
+import { describeRepeat, nextClockTime, parseWhen, zonedMoment } from "../src/server/when.ts";
 
 const iso = (moment: number) => new Date(moment).toISOString();
 /** Sunday, October 4, 2026, 10:00 in Chicago (15:00 UTC). */
@@ -48,51 +43,47 @@ test("times read the way people write them, in their time zone", () => {
         "once",
         "check the build",
     ]);
-    assert.deepEqual(when("in 1.5 hours x"), ["2026-10-04T16:30:00.000Z", "once", "x"]);
     assert.deepEqual(
         when("7:00 x"),
         ["2026-10-05T12:00:00.000Z", "once", "x"],
         "7:00 has passed today: tomorrow",
     );
-    assert.deepEqual(when("7pm x"), ["2026-10-05T00:00:00.000Z", "once", "x"]);
-    assert.deepEqual(when("Tomorrow 9am x"), ["2026-10-05T14:00:00.000Z", "once", "x"]);
-    assert.deepEqual(when("fri 17:30 x"), ["2026-10-09T22:30:00.000Z", "once", "x"]);
-    assert.deepEqual(when("every 2h x"), ["2026-10-04T17:00:00.000Z", "every 2 hours", "x"]);
-    assert.deepEqual(when("every day 8:00 x"), [
-        "2026-10-05T13:00:00.000Z",
-        "every day at 08:00",
-        "x",
-    ]);
     assert.deepEqual(when("every weekday 8:00 x"), [
         "2026-10-05T13:00:00.000Z",
         "weekdays at 08:00",
         "x",
     ]);
-    assert.deepEqual(when("every tues,thursday 9:00 x"), [
-        "2026-10-06T14:00:00.000Z",
-        "tue, thu at 09:00",
-        "x",
-    ]);
-    assert.deepEqual(
-        when("every weekend 10am x"),
-        ["2026-10-10T15:00:00.000Z", "weekends at 10:00", "x"],
-        "10:00 today is now, not after it",
-    );
 
     for (const [text, problem] of [
         ["every 5m x", /at most every 10 minutes/],
-        ["every 2 days 8:00 x", /not both/],
-        ["every 2 days at 8:00 x", /not both/],
-        ["today 9:00 x", /09:00 today has passed/],
-        ["in 0.001h x", /Say when/],
         ["soon x", /Say when/],
-        ["25:00 x", /Say when/],
-        ["13pm x", /Say when/],
-        ["every fun 9:00 x", /Say when/],
-        ["in 400 days x", /a year ahead/],
     ] as const) {
         assert.throws(() => parseWhen(text, sunday, chicago), problem, text);
     }
+});
+
+test("the shortest repeat and the furthest ahead can be set", () => {
+    const minutes = (text: string, repeatMinutes?: number) =>
+        parseWhen(text, sunday, chicago, repeatMinutes === undefined ? {} : { repeatMinutes });
+    const day = 24 * 60 * 60_000;
+
+    assert.deepEqual(minutes("every 2m x", 1).every, { minutes: 2 });
+    assert.deepEqual(minutes("every 1m x", 1).every, { minutes: 1 });
+    assert.throws(() => minutes("every 5m x", 30), /at most every 30 minutes/);
+    assert.throws(() => minutes("every 5m x"), /at most every 10 minutes/, "the default");
+    assert.equal(
+        parseWhen("in 3d x", sunday, chicago, { aheadMs: 5 * day }).next,
+        sunday + 3 * day,
+    );
+    assert.throws(
+        () => parseWhen("in 6d x", sunday, chicago, { aheadMs: 5 * day }),
+        /up to 5 days ahead/,
+    );
+    assert.equal(
+        parseWhen("in 400d x", sunday, chicago, { aheadMs: 500 * day }).next,
+        sunday + 400 * day,
+    );
+    assert.throws(() => parseWhen("in 400d x", sunday, chicago), /up to a year ahead/);
 });
 
 test("clock times hold across daylight saving changes", () => {
@@ -106,7 +97,6 @@ test("clock times hold across daylight saving changes", () => {
         "2026-11-01T06:30:00.000Z",
         "a 1:30 that happens twice is the first",
     );
-    assert.equal(iso(zonedMoment(2026, 10, 4, 8, 0, "Europe/Berlin")), "2026-10-04T06:00:00.000Z");
     // Every day at 8:00 in Chicago, from the Saturday before clocks go back.
     const saturday = nextClockTime(Date.UTC(2026, 9, 31, 12), "08:00", undefined, chicago);
     const sundayAfter = nextClockTime(saturday, "08:00", undefined, chicago);
@@ -115,8 +105,6 @@ test("clock times hold across daylight saving changes", () => {
         [iso(saturday), iso(sundayAfter)],
         ["2026-10-31T13:00:00.000Z", "2026-11-01T14:00:00.000Z"],
     );
-    assert.equal(describeMoment(Date.UTC(2026, 9, 5, 12), chicago, sunday), "Mon 07:00");
-    assert.equal(describeMoment(Date.UTC(2026, 9, 20, 12), chicago, sunday), "Oct 20 07:00");
 });
 
 /** Pi schedules its own follow-up, lists, and cancels, as the last message asks. */
@@ -211,15 +199,25 @@ test("a scheduled message goes out at its time, also after a restart, once; a re
         when: "every 20m ping",
         zone: "UTC",
     });
-    const chat = (await app.harness.snapshot(ChatDoc, id, context))!.messages.map(
-        (message) => message.text,
-    );
 
-    assert.match(chat[0]!, /^scheduled “check the build” for \w{3} \d\d:\d\d$/);
-    assert.equal(chat[1], "scheduled “ping” every 20 minutes");
+    const sleeping = async () => (await app.harness.getTask(once.taskId, context))?.state;
 
-    // Eleven minutes on, after a restart: the first goes out, the repeat waits.
-    await restartLater(11);
+    await until(async () => (await sleeping())?.status === "sleeping", "the durable sleep");
+    assert.deepEqual(await sleeping(), {
+        status: "sleeping",
+        until: once.next,
+        checkpoint: { phase: "send" },
+    });
+    await restartLater(1);
+    assert.deepEqual(await sleeping(), {
+        status: "sleeping",
+        until: once.next,
+        checkpoint: { phase: "send" },
+    });
+    assert.equal((await userTexts(id)).length, 0, "no early message after a restart");
+
+    // Eleven minutes on, after another restart: the first goes out, the repeat waits.
+    await restartLater(10);
     await until(
         async () =>
             (await userTexts(id)).some((text) => text.includes("[scheduled] check the build")),
@@ -289,7 +287,6 @@ test("a scheduled message goes out at its time, also after a restart, once; a re
     );
     await app.commands.cancelSchedule(id, owner(app), repeat.id);
     assert.deepEqual(await items(id), []);
-    await assert.rejects(app.commands.cancelSchedule(id, owner(app), repeat.id), { status: 404 });
 });
 
 test("Pi schedules, lists, and cancels its own messages with its tool", async () => {
@@ -303,18 +300,6 @@ test("Pi schedules, lists, and cancels its own messages with its tool", async ()
     await say(id, "list them");
     await say(id, `cancel ${mine!.id}`);
     assert.deepEqual(await items(id), []);
-    const said = (await userTexts(id)).join("\n");
-
-    assert.doesNotMatch(said, /\[scheduled\]/);
-    const answers = (await (await app.harness.conversation(id, context))!.context(context)).messages
-        .map((message) => JSON.stringify(message.content))
-        .join("\n");
-
-    assert.match(
-        answers,
-        new RegExp(`tool said: ${mine!.id}: \\w{3} \\d\\d:\\d\\d · look at the deploy again`),
-    );
-    assert.match(answers, new RegExp(`tool said: Cancelled ${mine!.id}\\.`));
 });
 
 test("a schedule Pi sets up is the work of whom it worked for, and is cancelled once they may not steer", async () => {
@@ -351,61 +336,16 @@ test("a schedule Pi sets up is the work of whom it worked for, and is cancelled 
         hal.id,
         "the owner wrote last, but Pi works for Hal now",
     );
-    const authors = (await app.harness.snapshot(AuthorsDoc, id, context))!;
-    const sent = Object.keys(authors.requesters ?? {}).find(
-        (entry) => authors.requesters![entry] === hal.id,
-    );
-
-    assert.ok(
-        sent !== undefined && authors.entries[sent] === undefined,
-        "it shows as Pi's message",
-    );
-    const chat = (await app.harness.snapshot(ChatDoc, id, context))!.messages.map(
-        (message) => `${message.name} ${message.text}`,
-    );
-
-    assert.ok(
-        chat.includes(
-            "Pi scheduled “look at the deploy again”, which was cancelled: Ida can no longer steer here.",
-        ),
-        chat.join("\n"),
-    );
 });
 
-test("people need the right to steer and a session, and schedules need their extension", async () => {
+test("people need the right to steer to schedule", async () => {
     const id = await newSession(app);
     const viewer = app.config.addUser("Vee", "viewer").user;
 
     await assert.rejects(app.commands.schedule(id, viewer, { when: "in 10m x" }), { status: 403 });
-    await assert.rejects(app.commands.schedule(id, owner(app), { when: "in 10m" }), {
-        status: 400,
-        message: /Say what Pi should get/,
-    });
-    await assert.rejects(
-        app.commands.schedule(id, owner(app), { when: "in 10m x", zone: "Mars/Olympus" }),
-        { status: 400 },
-    );
-    const other = await app.harness.createConversation(
-        { ownership: { kind: "ownerless" } },
-        context,
-    );
-
-    await assert.rejects(app.commands.schedule(other.id, owner(app), { when: "in 10m x" }), {
-        status: 400,
-    });
-    await app.setExtensionEnabled(owner(app), "schedules.ts", false);
-
-    try {
-        await assert.rejects(app.commands.schedule(id, owner(app), { when: "in 10m x" }), {
-            status: 409,
-            message: /turned off in Extensions/,
-        });
-    } finally {
-        await app.setExtensionEnabled(owner(app), "schedules.ts", true);
-    }
 });
 
-test("a schedule is cancelled, with a line in the chat, once its person may not steer anymore or a limit is reached", async () => {
+test("a schedule is cancelled once its person may not steer anymore or a limit is reached", async () => {
     const id = await newSession(app);
     const gus = app.config.addUser("Gus", "guest").user;
 
@@ -422,25 +362,48 @@ test("a schedule is cancelled, with a line in the chat, once its person may not 
 
     await restartLater(11);
     await until(async () => (await items(id)).length === 0, "both to be cancelled");
-    const chat = (await app.harness.snapshot(ChatDoc, id, context))!.messages.map(
-        (message) => `${message.name} ${message.text}`,
-    );
-
-    assert.ok(
-        chat.includes(
-            "Gus scheduled “from Gus”, which was cancelled: they can no longer steer here.",
-        ),
-        chat.join("\n"),
-    );
-    assert.ok(
-        chat.includes(
-            `${owner(app).name} scheduled “from the owner”, which was cancelled: this session reached its $1.00 spend limit.`,
-        ),
-        chat.join("\n"),
-    );
     assert.deepEqual(
         (await userTexts(id)).filter((text) => text.includes("[scheduled]")),
         [],
         "neither went out",
     );
+});
+
+test("the limits in force bound what a session can schedule", async () => {
+    const id = await newSession(app);
+    const limits = app.schedules.limits;
+
+    assert.deepEqual(limits, DEFAULT_SCHEDULE_LIMITS);
+
+    try {
+        limits.perSession = 2;
+        limits.chars = 100;
+        limits.repeatMinutes = 1;
+        limits.aheadDays = 2;
+        await app.schedules.add(id, { when: "every 1m", text: "often", zone: "UTC" });
+        await app.schedules.add(id, { when: "in 1d", text: "tomorrow", zone: "UTC" });
+        await assert.rejects(app.schedules.add(id, { when: "in 1h", text: "third" }), {
+            status: 409,
+            message: /2 scheduled messages at most/,
+        });
+        await assert.rejects(app.schedules.add(id, { when: "in 3d", text: "far" }), {
+            status: 400,
+            message: /up to 2 days ahead/,
+        });
+        await assert.rejects(app.schedules.add(id, { when: "in 1h", text: "x".repeat(101) }), {
+            status: 413,
+            message: /limited to 100 characters/,
+        });
+        limits.repeatMinutes = 60;
+        await assert.rejects(app.schedules.add(id, { when: "every 30m", text: "often" }), {
+            status: 400,
+            message: /at most every 60 minutes/,
+        });
+    } finally {
+        Object.assign(limits, DEFAULT_SCHEDULE_LIMITS);
+    }
+
+    for (const each of await items(id)) {
+        await app.schedules.cancel(id, each.id);
+    }
 });

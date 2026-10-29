@@ -5,7 +5,8 @@
 import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import type { EntryRecord, LiveState, UsageState } from "@earendil-works/pi-durable";
 import {
-    ATTACHMENTS_HEADING,
+    COMMAND_ENTRY,
+    type CommandData,
     FILE_BLOCK,
     FROM_PI_ENTRY,
     FROM_PREFIX,
@@ -13,21 +14,25 @@ import {
     NOTE_ENTRY,
     SHELL_ENTRY,
     type ShellData,
+    splitAttachments,
 } from "./entry-format.ts";
+import type { WaitView } from "./limit-gate.ts";
 import type { StreamTiming } from "./timing.ts";
 
 /** Shortest first-to-last-token window, in ms, that reads as a genuine stream rather than one buffered flush. */
 const MIN_STREAM_WINDOW_MS = 250;
 
+/** `partial`: the first part of a view has it without its words, or with its input cut short (`lightEntry`). */
 export type ClientBlock =
     | { type: "text"; text: string }
-    | { type: "thinking"; text: string; redacted?: boolean }
+    | { type: "thinking"; text: string; redacted?: boolean; partial?: boolean }
     | {
           type: "toolCall";
           id: string;
           name: string;
           args: Record<string, unknown>;
           clipped?: Record<string, number>;
+          partial?: boolean;
       };
 
 /** `at`: when the message was made, by the server's clock (milliseconds), where the message says. */
@@ -50,6 +55,7 @@ export type ClientEntry =
           model?: string;
           provider?: string;
           at?: number;
+          partial?: boolean;
       }
     | {
           id: number;
@@ -63,13 +69,171 @@ export type ClientEntry =
           clipped?: number;
           /** Image parts in the result; browsers load them from `/api/c/:id/image/:entry/:index`. */
           images?: number;
+          partial?: boolean;
       }
     | { id: number; kind: "compaction"; summary: string }
     | { id: number; kind: "reset"; text?: string }
     | ({ id: number; kind: "shell"; truncated?: number } & ShellData)
+    | ({ id: number; kind: "command"; truncated?: number } & CommandData)
     | { id: number; kind: "note"; text: string; name: string }
     | { id: number; kind: "fromPi"; title: string; file: string }
     | { id: number; kind: "other"; entryKind: string };
+
+/** Entry kinds that show as transcript rows: a tool's result shows in its call's card. As `isRow` in `web/store.js`. */
+const ROW_KINDS = new Set([
+    "user",
+    "assistant",
+    "compaction",
+    "reset",
+    "shell",
+    "command",
+    "note",
+    "fromPi",
+]);
+
+/** Rows a tab of protocol 4 gets the entries of when it opens a session: those it draws (`TRANSCRIPT_ROWS`), and PiP's. */
+export const FIRST_ROWS = 80;
+
+/**
+ * Where the turn the entry at `index` is in begins: the row before the answers that run up to it. A tab works out from
+ * those rows what was open there (`rowsBefore` in `web/turns.js`), so it gets them with what follows. At most
+ * `FIRST_ROWS` rows back: a run of Pi's alone can be thousands of answers.
+ */
+export function turnStart(entries: readonly ClientEntry[], index: number): number {
+    let start = index;
+    let rows = 0;
+
+    for (let at = index - 1; at >= 0 && rows <= FIRST_ROWS; at--) {
+        const entry = entries[at]!;
+
+        if (!ROW_KINDS.has(entry.kind)) {
+            continue;
+        }
+
+        start = at;
+        rows++;
+
+        if (entry.kind !== "assistant") {
+            break;
+        }
+    }
+
+    return start;
+}
+
+/**
+ * The index of the first entry a tab needs to draw the newest `rows` rows: from the row that many back, with the turn it
+ * is in, and every tool result after it.
+ */
+export function firstEntries(entries: readonly ClientEntry[], rows = FIRST_ROWS): number {
+    let seen = 0;
+
+    for (let at = entries.length - 1; at >= 0; at--) {
+        if (ROW_KINDS.has(entries[at]!.kind) && ++seen === rows) {
+            return turnStart(entries, at);
+        }
+    }
+
+    return 0;
+}
+
+/** Characters of a tool's input or output that the first part of a view keeps (`lightEntry`). */
+const PREVIEW = 300;
+/** Details, as JSON, that the first part keeps whole: a call's line reads small ones (an artifact's version). */
+const DETAILS_PREVIEW = 1000;
+const lightEntries = new WeakMap<ClientEntry, ClientEntry | null>();
+
+/**
+ * An entry for the first part of a view (`Room.push`), marked `partial`: without what shows only when a step is opened,
+ * which is most of a session's weight (a thought's words, a tool's long input and output, large details). Null when it
+ * has none of that. The whole entry follows in the next update, at once. A failed call's result stays whole: a group's
+ * line reads it.
+ */
+export function lightEntry(entry: ClientEntry): ClientEntry | null {
+    let light = lightEntries.get(entry);
+
+    if (light === undefined) {
+        light = lighten(entry);
+        lightEntries.set(entry, light);
+    }
+
+    return light;
+}
+
+function lighten(entry: ClientEntry): ClientEntry | null {
+    if (entry.kind === "assistant") {
+        let partial = false;
+        const blocks = entry.blocks.map((block): ClientBlock => {
+            if (block.type === "thinking" && block.text !== "") {
+                partial = true;
+
+                return { ...block, text: "", partial: true };
+            }
+
+            if (block.type === "toolCall") {
+                const args = shorten(block.args) as Record<string, unknown>;
+
+                if (args !== block.args) {
+                    partial = true;
+
+                    return { ...block, args, partial: true };
+                }
+            }
+
+            return block;
+        });
+
+        return partial ? { ...entry, blocks, partial: true } : null;
+    }
+
+    if (entry.kind === "toolResult" && !entry.isError) {
+        const long = entry.text.length > PREVIEW;
+        const heavy =
+            entry.details !== undefined && JSON.stringify(entry.details).length > DETAILS_PREVIEW;
+
+        if (!long && !heavy) {
+            return null;
+        }
+
+        const { details, ...rest } = entry;
+
+        return {
+            ...rest,
+            text: long ? entry.text.slice(0, PREVIEW) : entry.text,
+            ...(heavy || details === undefined ? {} : { details }),
+            partial: true,
+        };
+    }
+
+    return null;
+}
+
+/** A value with each string longer than `PREVIEW` cut to it, however deep; the same value when none is. */
+function shorten(value: unknown): unknown {
+    if (typeof value === "string") {
+        return value.length > PREVIEW ? value.slice(0, PREVIEW) : value;
+    }
+
+    if (typeof value !== "object" || value === null) {
+        return value;
+    }
+
+    let changed = false;
+
+    const each = (item: unknown) => {
+        const short = shorten(item);
+
+        changed ||= short !== item;
+
+        return short;
+    };
+
+    const out = Array.isArray(value)
+        ? value.map(each)
+        : Object.fromEntries(Object.entries(value).map(([key, item]) => [key, each(item)]));
+
+    return changed ? out : value;
+}
 
 export type ClientToolSlot = {
     callId: string;
@@ -80,8 +244,28 @@ export type ClientToolSlot = {
     details?: unknown;
 };
 
+/** A run waiting for a provider's limit to clear (`limit-gate.ts`), as a tab shows it. Times are the server's clock. */
+export type ClientLimit = {
+    provider: string;
+    modelId?: string;
+    /** `account`: every model of the provider waits. `model`: this one does. */
+    scope: "account" | "model";
+    /** `reset`: until a time the provider gave. `backoff`: no time is known, so it tries again at intervals. */
+    kind: "reset" | "backoff";
+    /** When the next request goes out. */
+    until: number;
+    /** The reset the provider gave, when it gave one. */
+    resetAt?: number;
+    /** What the provider said, as one short line of plain text. */
+    reason: string;
+    tries: number;
+    /** The request that finds out is out now. */
+    probing: boolean;
+};
+
 export type ClientLive = {
     busy: boolean;
+    limit?: ClientLimit;
     generation?: {
         attempt: number;
         message?: { blocks: ClientBlock[] };
@@ -383,6 +567,21 @@ export function projectEntry(entry: EntryRecord, full = false): ClientEntry | un
             };
         }
 
+        case COMMAND_ENTRY: {
+            const data = entry.data as CommandData;
+            const { text, clipped } = full
+                ? { text: data.output, clipped: undefined }
+                : clip(data.output, OUTPUT_LIMIT);
+
+            return {
+                id,
+                kind: "command",
+                ...data,
+                output: text,
+                ...(clipped === undefined ? {} : { truncated: clipped }),
+            };
+        }
+
         case SHELL_ENTRY: {
             const data = entry.data as ShellData;
             const { text, clipped } = full
@@ -401,6 +600,21 @@ export function projectEntry(entry: EntryRecord, full = false): ClientEntry | un
         default:
             return { id, kind: "other", entryKind: entry.kind };
     }
+}
+
+/** A wait for a limit as a tab gets it: no gate key, which names the sign-in. */
+export function projectLimit(wait: WaitView): ClientLimit {
+    return {
+        provider: wait.provider,
+        ...(wait.modelId === undefined ? {} : { modelId: wait.modelId }),
+        scope: wait.scope,
+        kind: wait.kind,
+        until: wait.until,
+        ...(wait.resetAt === undefined ? {} : { resetAt: wait.resetAt }),
+        reason: wait.reason,
+        tries: wait.tries,
+        probing: wait.probing,
+    };
 }
 
 export function projectLive(live: LiveState | undefined): ClientLive {
@@ -443,6 +657,71 @@ export function projectLive(live: LiveState | undefined): ClientLive {
     }
 
     return out;
+}
+
+/**
+ * The live message for a tab of protocol 3 as what changed: the tab keeps its first `keep` blocks and puts `blocks`
+ * after them. A first block with `from` is not a whole block: it adds its text to the tab's block `keep`, which has
+ * `from` characters. A stream grows its newest block, so each update carries only the new characters, where the whole
+ * message every 90 ms made a long answer cost its length squared. `web/live.js` puts it together.
+ */
+export type LiveMessageDelta = {
+    keep: number;
+    blocks: (ClientBlock | { type: "text" | "thinking"; from: number; text: string })[];
+};
+
+/** The live run as a tab that takes protocol 3 gets it: the message whole, or what changed. */
+export type ClientLiveUpdate = Omit<ClientLive, "generation"> & {
+    generation?: Omit<NonNullable<ClientLive["generation"]>, "message"> & {
+        message?: { blocks: ClientBlock[] } | LiveMessageDelta;
+    };
+};
+
+/** What changed from the blocks a tab has, `sent`, to `blocks`. */
+export function liveMessageDelta(sent: ClientBlock[], blocks: ClientBlock[]): LiveMessageDelta {
+    let keep = 0;
+
+    while (keep < sent.length && keep < blocks.length && sameBlock(sent[keep]!, blocks[keep]!)) {
+        keep++;
+    }
+
+    const before = sent[keep];
+    const now = blocks[keep];
+
+    if (
+        before !== undefined &&
+        now !== undefined &&
+        now.type !== "toolCall" &&
+        before.type === now.type &&
+        (before.type !== "thinking" || before.redacted === (now as typeof before).redacted) &&
+        now.text.startsWith(before.text)
+    ) {
+        return {
+            keep,
+            blocks: [
+                {
+                    type: now.type,
+                    from: before.text.length,
+                    text: now.text.slice(before.text.length),
+                },
+                ...blocks.slice(keep + 1),
+            ],
+        };
+    }
+
+    return { keep, blocks: blocks.slice(keep) };
+}
+
+function sameBlock(a: ClientBlock, b: ClientBlock): boolean {
+    if (a.type === "toolCall" || b.type === "toolCall") {
+        return JSON.stringify(a) === JSON.stringify(b);
+    }
+
+    return (
+        a.type === b.type &&
+        a.text === b.text &&
+        (a.type !== "thinking" || a.redacted === (b as typeof a).redacted)
+    );
 }
 
 export type ClientStats = {
@@ -615,7 +894,10 @@ export function snippet(text: string, max = 280): string {
 /** The visible text of a projected entry, as plain text: what a person or Pi wrote. */
 export function entryText(entry: ClientEntry): string {
     if (entry.kind === "user") {
-        return entry.text.split(ATTACHMENTS_HEADING)[0] ?? "";
+        const [written, files] = splitAttachments(entry.text);
+
+        // A message of files alone says so: a quote or a pin of it is not empty.
+        return written.trim() === "" && files !== undefined ? "(attachments)" : written;
     }
 
     if (entry.kind === "assistant") {
@@ -763,6 +1045,10 @@ export function peekLines(
 
     if (live.generation?.message !== undefined) {
         blocks(live.generation.message.blocks, true);
+    }
+
+    if (live.limit !== undefined) {
+        lines.push({ kind: "event", text: `Waiting for ${live.limit.provider}'s limit to clear` });
     }
 
     return lines.slice(-count);

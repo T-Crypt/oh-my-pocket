@@ -150,11 +150,16 @@ export function InviteSheet({ session = null }) {
             html`<div class="field">
                 <div class="label">They can</div>
                 <div class="segmented">
-                    <button class=${role === "guest" ? "on" : ""} onClick=${() => setRole("guest")}>
+                    <button
+                        class=${role === "guest" ? "on" : ""}
+                        aria-pressed=${role === "guest"}
+                        onClick=${() => setRole("guest")}
+                    >
                         Steer
                     </button>
                     <button
                         class=${role === "viewer" ? "on" : ""}
+                        aria-pressed=${role === "viewer"}
                         onClick=${() => setRole("viewer")}
                     >
                         View only
@@ -169,10 +174,18 @@ export function InviteSheet({ session = null }) {
                 html`<div class="field">
                     <div class="label">In</div>
                     <div class="segmented">
-                        <button class=${!only ? "on" : ""} onClick=${() => setOnly(false)}>
+                        <button
+                            class=${!only ? "on" : ""}
+                            aria-pressed=${!only}
+                            onClick=${() => setOnly(false)}
+                        >
                             Every session
                         </button>
-                        <button class=${only ? "on" : ""} onClick=${() => setOnly(true)}>
+                        <button
+                            class=${only ? "on" : ""}
+                            aria-pressed=${only}
+                            onClick=${() => setOnly(true)}
+                        >
                             Only this session
                         </button>
                     </div>
@@ -216,6 +229,7 @@ export function InviteSheet({ session = null }) {
                             This link only works on this device. To let other devices in, press <span class="mono">a</span> in the Pi Pocket terminal (or start it with <span class="mono">--access</span>) and pick Local network, Cloudflare Tunnel, or Tailscale. Then make a new invite.
                         </div>`
                     }
+                    <div class="invite-details">
                     <div class="qr" dangerouslySetInnerHTML=${{ __html: invite.svg }}></div>
                     <div class="invite-code">
                         <div class="invite-code-head">
@@ -241,6 +255,7 @@ export function InviteSheet({ session = null }) {
                         <div class="muted small">
                             Or enter it on the other device's sign-in screen.
                         </div>
+                    </div>
                     </div>
                     <div class="row">
                         <input
@@ -305,10 +320,16 @@ function PeopleList() {
 
     return html`<div class="group">
         <div class="group-title">People</div>
+        <div class="sheet-list">
         ${ordered.map(
             (person) => html`<div class="person-row" key=${person.id}>
-                <span class=${`online-dot ${person.online ? "on" : ""}`}></span>
-                <${Avatar} person=${person} size=${26} />
+                <span class="people-here">
+                    <${Avatar} person=${person} size=${32} />
+                    <span
+                        class=${`online-mark ${person.online ? "" : "away"}`}
+                        aria-hidden="true"
+                    ></span>
+                </span>
                 <div class="person-main">
                     <div>
                         ${person.name}
@@ -363,6 +384,7 @@ function PeopleList() {
                 }
             </div>`,
         )}
+        </div>
     </div>`;
 }
 
@@ -377,7 +399,10 @@ export function PeopleSheet() {
             </button>`
         }
         <${PeopleList} />
-        <button class="button wide" onClick=${() => openSheet({ type: "notifications" })}>
+        <button
+            class="button ghost wide sheet-footer"
+            onClick=${() => openSheet({ type: "notifications" })}
+        >
             Notifications on this device…
         </button>
     <//>`;

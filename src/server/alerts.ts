@@ -8,6 +8,7 @@ import type { PocketApp } from "./app.ts";
 import { AuthorsDoc, ChatDoc } from "./docs.ts";
 import { describe } from "./errors.ts";
 import { entryText, projectEntry, snippet } from "./projection.ts";
+import { span, type WaitView } from "./limit-gate.ts";
 import type { PushMessage, PushPrefs } from "./push.ts";
 
 const context = BACKGROUND_CONTEXT;
@@ -135,6 +136,42 @@ export class Alerts {
         }
     }
 
+    /**
+     * A run began to wait a long while for its provider's limit to clear: one push to the people in its session, who may
+     * want to come back at the time, or stop it. When the run ends, "Pi finished" goes as always.
+     */
+    limitWait(conversationId: number, view: WaitView): void {
+        const app = this.#app;
+        const id = conversationId as unknown as ConversationId;
+        const root = app.rootOf(id);
+
+        if (app.pushStore === undefined || app.sessionMeta(root) === undefined) {
+            return;
+        }
+
+        void (async () => {
+            const title = await app.conversationTitle(root);
+            const who = app.sessionMeta(root)?.pip === undefined ? "" : "PiP: ";
+            const message: PushMessage = {
+                title: `Waiting for a usage limit · ${who}${title}`,
+                body: snippet(
+                    `${view.reason}. Pi tries again in ${span(view.until - Date.now())} and goes on by itself. Open the session to try now or stop.`,
+                    400,
+                ),
+                url: app.sessionMeta(root)?.pip === undefined ? `/s/${String(root)}` : "/?pip=1",
+                tag: `limit-${String(root)}`,
+            };
+
+            for (const userId of await this.participants(root)) {
+                const user = app.config.userById(userId);
+
+                if (user !== undefined && user.role !== "viewer") {
+                    void this.push(userId, root, "limit", message);
+                }
+            }
+        })().catch((error: unknown) => app.log(`push failed: ${describe(error)}`));
+    }
+
     /** New approvals go out to everyone in the session who can answer them. */
     announceApprovals(): void {
         const app = this.#app;
@@ -164,6 +201,26 @@ export class Alerts {
                     const user = app.config.userById(userId);
 
                     if (user === undefined || user.role === "viewer") {
+                        continue;
+                    }
+
+                    // An ask goes to the person who answers it, and is answered in the app: its fields need typing.
+                    if (approval.form !== undefined) {
+                        if (app.cannotAllow(user, approval) === undefined) {
+                            void this.push(
+                                userId,
+                                approval.conversationId,
+                                "approval",
+                                {
+                                    title: `Pi asks you · ${title}`,
+                                    body: snippet(approval.form.title, 400),
+                                    url: `/s/${String(approval.conversationId)}`,
+                                    tag: `approval-${approval.id}`,
+                                },
+                                "high",
+                            );
+                        }
+
                         continue;
                     }
 

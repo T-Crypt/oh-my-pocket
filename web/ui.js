@@ -3,8 +3,8 @@
 import DOMPurify from "dompurify";
 import htm from "htm";
 import { marked } from "marked";
-import { Component, h } from "preact";
-import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import { Component, createContext, h } from "preact";
+import { useContext, useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { useDragToClose } from "./gestures.js";
 import { highlight, langOf } from "./highlight.js";
 import { actions, filesShown, notify, openSheet, store } from "./store.js";
@@ -109,7 +109,8 @@ marked.use({
 
 /**
  * Replies are untrusted: a file or page Pi read can steer what it writes. No forms or controls, no media that loads by
- * itself, and no style, class, or id hooks that could lay a fake screen over the app.
+ * itself, and no style, class, id, or data hooks that could lay a fake screen over the app: a theme styles
+ * `[data-part="approval"]`, and a reply must not wear it. A code block's language is the one data attribute kept.
  */
 const PURIFY = {
     FORBID_TAGS: [
@@ -126,6 +127,8 @@ const PURIFY = {
         "track",
         "picture",
     ],
+    ALLOW_DATA_ATTR: false,
+    ADD_ATTR: ["data-lang"],
     // `data-path` is the app's own mark for file paths (`sanitize`): a reply may not set it.
     FORBID_ATTR: [
         "style",
@@ -140,6 +143,15 @@ const PURIFY = {
     ],
     RETURN_DOM_FRAGMENT: true,
 };
+
+/**
+ * The app's own sanitizer, with its settings read once (`setConfig`): given them on each call, it reads them again for
+ * each reply. Its own instance, so what it is set to and its hooks (below) change nothing for an extension's module that
+ * imports `dompurify` too.
+ */
+const purify = DOMPurify(window);
+
+purify.setConfig(PURIFY);
 
 /** Images the app serves for a conversation (files, stored images, artifacts), or inline data. Nothing else loads. */
 const localImage = (src) =>
@@ -200,6 +212,7 @@ function codeBlock(pre, fold) {
     }
 
     wrap.className = "code";
+    wrap.dataset.part = "code-block";
     copy.className = "copy";
     copy.type = "button";
     copy.dataset.copy = "";
@@ -215,6 +228,7 @@ function codeBlock(pre, fold) {
     const label = document.createElement("span");
 
     head.className = "code-head";
+    head.dataset.part = "code-head";
     label.className = "code-lang";
     label.textContent = name || "text";
     head.append(label, copy);
@@ -240,12 +254,20 @@ function codeBlock(pre, fold) {
  * it loads, and code blocks are drawn by `codeBlock` (folded when long, if `fold`). Returns the element holding it.
  */
 function sanitize(html, fold) {
-    const fragment = DOMPurify.sanitize(html, PURIFY);
+    const fragment = purify.sanitize(html);
 
     // `src/app.ts` in a reply opens the file: inline code that is a path, not code blocks.
     for (const code of fragment.querySelectorAll("code")) {
+        // Code in a line of words, for themes; a code block is `code-block`.
+        if (!code.closest("pre")) {
+            code.dataset.part = "inline-code";
+        }
+
         if (!code.closest("pre, a") && looksLikePath(code.textContent ?? "")) {
             code.dataset.path = code.textContent;
+            // Keys open it too (`openFile` below).
+            code.tabIndex = 0;
+            code.setAttribute("role", "button");
         }
     }
 
@@ -354,19 +376,35 @@ function fencePage(text) {
 /** The conversation whose markdown is being sanitized, for image paths relative to its folder. */
 let rendering = null;
 
-DOMPurify.addHook("uponSanitizeAttribute", (node, data) => {
-    // Before the URL check, so file:// and plain paths become app URLs instead of being dropped.
-    if (node.nodeName === "IMG" && data.attrName === "src") {
-        data.attrValue = imageSource(data.attrValue, rendering);
-    } else if (node.nodeName === "A" && data.attrName === "href") {
-        // `app.ts:42` looks like a URL scheme to the sanitizer; `./app.ts:42` is the same local file.
-        if (/^[a-z][a-z0-9+.-]*:/i.test(data.attrValue) && linkedPath(data.attrValue) !== null) {
-            data.attrValue = `./${data.attrValue}`;
+/**
+ * An element's attribute as the sanitizer reads it next. Before any of its checks (the URL check too), and before the
+ * attributes are read: a hook on each attribute would make it copy its lists of allowed names on each call.
+ */
+function rewrite(node, name, change) {
+    const value = node.getAttribute(name);
+
+    if (value !== null) {
+        const next = change(value.trim());
+
+        if (next !== value) {
+            node.setAttribute(name, next);
         }
+    }
+}
+
+purify.addHook("beforeSanitizeAttributes", (node) => {
+    // Before the URL check, so file:// and plain paths become app URLs instead of being dropped.
+    if (node.nodeName === "IMG") {
+        rewrite(node, "src", (src) => imageSource(src, rendering));
+    } else if (node.nodeName === "A") {
+        // `app.ts:42` looks like a URL scheme to the sanitizer; `./app.ts:42` is the same local file.
+        rewrite(node, "href", (href) =>
+            /^[a-z][a-z0-9+.-]*:/i.test(href) && linkedPath(href) !== null ? `./${href}` : href,
+        );
     }
 });
 
-DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+purify.addHook("afterSanitizeAttributes", (node) => {
     if (node.tagName === "A") {
         node.setAttribute("target", "_blank");
         node.setAttribute("rel", "noopener noreferrer");
@@ -403,11 +441,7 @@ function markdownParts(
         return out;
     }
 
-    rendering = conversationId ?? null;
-    linkBase = base;
-    out = partsOf(sanitize(marked.parse(fencePage(text), { async: false, breaks }), cache));
-    rendering = null;
-    linkBase = null;
+    out = renderParts(fencePage(text), conversationId, base, breaks, cache);
 
     if (cache) {
         if (markdownCache.size >= MARKDOWN_CACHE) {
@@ -415,6 +449,51 @@ function markdownParts(
         }
 
         markdownCache.set(key, out);
+    }
+
+    return out;
+}
+
+/** Markdown parsed, sanitized, and split into parts (`partsOf`), for the conversation and folder given. */
+function renderParts(text, conversationId, base, breaks, fold) {
+    rendering = conversationId ?? null;
+    linkBase = base;
+
+    try {
+        return partsOf(sanitize(marked.parse(text, { async: false, breaks }), fold));
+    } finally {
+        rendering = null;
+        linkBase = null;
+    }
+}
+
+/**
+ * Markdown still growing, as parts: each top-level block (a paragraph, a list, a code block) drawn on its own, and kept
+ * in `kept` from one update to the next, so an update draws again only the blocks that changed, mostly the last. The
+ * blocks are found again in the whole text each time (block level only, which is quick), so a block that a later line
+ * turns into another (a paragraph into a heading, a list that goes on) is drawn as it is now. A reference link whose
+ * definition is in another block shows as written until the text is whole. Returns `{ key, parts }` for each block.
+ */
+function liveBlocks(text, conversationId, base, breaks, kept) {
+    const blocks = new marked.Lexer(marked.defaults)
+        .blockTokens(text.replace(/\r\n|\r/g, "\n"), [])
+        .filter((token) => token.type !== "space");
+    const next = new Map();
+    const out = blocks.map((token, index) => {
+        const parts =
+            next.get(token.raw) ??
+            kept.get(token.raw) ??
+            renderParts(token.raw, conversationId, base, breaks, false);
+
+        next.set(token.raw, parts);
+
+        return { key: index, parts };
+    });
+
+    kept.clear();
+
+    for (const [raw, parts] of next) {
+        kept.set(raw, parts);
     }
 
     return out;
@@ -439,8 +518,31 @@ export function Markdown({
     cache = true,
     base = null,
     breaks = true,
+    conversationId = currentConversation(),
 }) {
-    const parts = markdownParts(text, undefined, cache, base, breaks);
+    const live = useRef(null);
+
+    // Growing text, block by block (`liveBlocks`); a whole page is fenced as one block (`fencePage`), as before.
+    if (!cache && fencePage(text) === text) {
+        const settings = `${conversationId ?? ""}\u0000${base ?? ""}\u0000${breaks}`;
+
+        if (live.current?.settings !== settings) {
+            live.current = { settings, kept: new Map() };
+        }
+
+        const blocks = liveBlocks(text, conversationId, base, breaks, live.current.kept);
+
+        return html`<div class=${`md ${className}`}>
+            ${blocks.flatMap(({ key, parts }) =>
+                parts
+                    .filter((part) => part.kind !== undefined || part.html.trim() !== "")
+                    .map((part, index) => drawPart(part, `${key}.${index}`, true)),
+            )}
+        </div>`;
+    }
+
+    live.current = null;
+    const parts = markdownParts(text, conversationId, cache, base, breaks);
 
     if (parts.length === 1 && parts[0].kind === undefined) {
         return html`<div
@@ -450,17 +552,19 @@ export function Markdown({
     }
 
     return html`<div class=${`md ${className}`}>
-        ${parts.map((part, index) =>
-            part.kind === undefined || RichBlock === null
-                ? html`<div
-                      key=${index}
-                      class="md-part"
-                      dangerouslySetInnerHTML=${{ __html: part.html }}
-                  ></div>`
-                : html`<${RichBlock} key=${index} ...${part} streaming=${!cache} />`,
-        )}
+        ${parts.map((part, index) => drawPart(part, index, !cache))}
     </div>`;
 }
+
+/** One part of rendered markdown (`partsOf`): a run of HTML, or a code block that shows more than code. */
+const drawPart = (part, key, streaming) =>
+    part.kind === undefined || RichBlock === null
+        ? html`<div
+              key=${key}
+              class="md-part"
+              dangerouslySetInnerHTML=${{ __html: part.html }}
+          ></div>`
+        : html`<${RichBlock} key=${key} ...${part} streaming=${streaming} />`;
 
 /** File types common enough that `name.ext` alone is surely a file, not code like `store.state`. */
 const FILE_TYPES = new Set(
@@ -564,11 +668,36 @@ export function openFile(path) {
     openSheet({ type: "file", id: target.path, line: target.line });
 }
 
-/** File paths in rendered markdown open in the viewer. */
+/**
+ * Whether a click or key asks to show a path in the file manager rather than the viewer: Ctrl (⌘ on a Mac) held, by the
+ * owner, whose machine the server runs on.
+ */
+export const revealAsked = (event) =>
+    (APPLE ? event.metaKey : event.ctrlKey) && store.state.me?.role === "owner";
+
+/** Show a file (or folder) of the session in the file manager of the machine the server runs on, selected. */
+export function revealFile(path) {
+    const match = /^(.*?):(\d+)(?:-\d+)?$/.exec(path);
+
+    actions.reveal(match ? match[1] : path).then(
+        () => notify("info", "Shown in the file manager on the server's machine."),
+        (error) => notify("error", error.message ?? String(error)),
+    );
+}
+
+/** File paths in rendered markdown open in the viewer, or with Ctrl (⌘) held, in the file manager. */
 document.addEventListener("click", (event) => {
     const target = event.target.closest?.(".md code[data-path], .md a[data-path]");
 
     if (!target) {
+        return;
+    }
+
+    if (revealAsked(event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        revealFile(target.dataset.path);
+
         return;
     }
 
@@ -584,6 +713,21 @@ document.addEventListener("click", (event) => {
 
     event.stopPropagation();
     openFile(target.dataset.path);
+});
+
+// Enter or Space on a file path in inline code opens it, as a tap does: it is a button for keys.
+document.addEventListener("keydown", (event) => {
+    const target = event.target.closest?.(".md code[data-path]");
+
+    if (target && (event.key === "Enter" || event.key === " ") && !event.repeat) {
+        event.preventDefault();
+
+        if (revealAsked(event)) {
+            revealFile(target.dataset.path);
+        } else {
+            openFile(target.dataset.path);
+        }
+    }
 });
 
 /** Images in rendered markdown open full screen, unless they are links. */
@@ -718,21 +862,86 @@ export function formatBytes(bytes) {
     return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+// Times as this device writes them, each format made once: making one costs more than using it, and a transcript
+// writes a time for each message.
+const TIME = new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" });
+const DAY = new Intl.DateTimeFormat([], { month: "short", day: "numeric" });
+const WEEKDAY = new Intl.DateTimeFormat([], { weekday: "short" });
+
+/** Whether a date is today, on this device's clock. */
+function isToday(date) {
+    const now = new Date();
+
+    return (
+        date.getDate() === now.getDate() &&
+        date.getMonth() === now.getMonth() &&
+        date.getFullYear() === now.getFullYear()
+    );
+}
+
+/** When something happened, on this device's clock: "10:42" today, "Oct 3 10:42" before. */
+export function clockTime(date) {
+    const time = TIME.format(date);
+
+    return isToday(date) ? time : `${DAY.format(date)} ${time}`;
+}
+
 /** A time ahead, on this device's clock: "14:30" today, "Mon 09:00" this week, "Oct 20 09:00" later. */
 export function formatWhen(ms) {
     const at = new Date(ms);
-    const time = at.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const time = TIME.format(at);
 
-    if (at.toDateString() === new Date().toDateString()) {
+    if (isToday(at)) {
         return time;
     }
 
-    const day =
-        ms - Date.now() < 6 * 86_400_000
-            ? at.toLocaleDateString([], { weekday: "short" })
-            : at.toLocaleDateString([], { month: "short", day: "numeric" });
+    const day = ms - Date.now() < 6 * 86_400_000 ? WEEKDAY.format(at) : DAY.format(at);
 
     return `${day} ${time}`;
+}
+
+/** The minute now, for what shows a time ago: a memo that keys on it draws again as the minute turns (`useMinute`). */
+const minuteNow = () => Math.floor(Date.now() / 60_000);
+
+/** Listeners to the minute's turn, and its timer while any listen. */
+const minuteListeners = new Set();
+let minuteTimer = 0;
+
+function tickMinute() {
+    minuteTimer = setTimeout(tickMinute, 60_000 - (Date.now() % 60_000));
+
+    for (const listener of minuteListeners) {
+        listener(minuteNow());
+    }
+}
+
+/**
+ * The minute now, which draws the component again as it turns: memoized rows that show "5m" would otherwise keep it.
+ * One timer for every component that uses it.
+ */
+export function useMinute() {
+    const [minute, setMinute] = useState(minuteNow);
+
+    useEffect(() => {
+        minuteListeners.add(setMinute);
+
+        if (minuteListeners.size === 1) {
+            minuteTimer = setTimeout(tickMinute, 60_000 - (Date.now() % 60_000));
+        }
+
+        // A minute that turned before this effect ran.
+        setMinute(minuteNow());
+
+        return () => {
+            minuteListeners.delete(setMinute);
+
+            if (minuteListeners.size === 0) {
+                clearTimeout(minuteTimer);
+            }
+        };
+    }, []);
+
+    return minute;
 }
 
 export function timeAgo(ms) {
@@ -771,9 +980,19 @@ export function plainText(markdown) {
 /** What separates a message to Pi from the list of files attached to it, which the server adds. */
 export const ATTACHMENTS_HEADING = "\n\nAttached files (saved on the server):\n";
 
+/**
+ * A message to Pi in two: what the person wrote, and the list of attached files if any. One with files alone, sent
+ * before 0.14.0, has the heading without the blank line before it.
+ */
+export function splitAttachments(text) {
+    return (text.startsWith(ATTACHMENTS_HEADING.trimStart()) ? `\n\n${text}` : text).split(
+        ATTACHMENTS_HEADING,
+    );
+}
+
 /** What a person wrote in a message to Pi, without the list of attached files. */
 export function writtenText(entry) {
-    return entry.text.split(ATTACHMENTS_HEADING)[0];
+    return splitAttachments(entry.text)[0];
 }
 
 /** What Pi wrote in a reply: its text blocks, without thinking or tool calls. */
@@ -810,8 +1029,11 @@ const ICONS = {
     file: "M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8zM14 3v5h5",
     diff: "M14 3H7a2 2 0 00-2 2v14a2 2 0 002 2h10a2 2 0 002-2V8zM14 3v5h5M9 11.5h6M12 8.5v6M9 17.5h6",
     back: "M15 18l-6-6 6-6",
+    clock: "M12 21a9 9 0 100-18 9 9 0 000 18zM12 7v5l3 2",
     chevron: "M9 6l6 6-6 6",
     down: "M6 9l6 6 6-6",
+    up: "M12 19V5M5 12l7-7 7 7",
+    eye: "M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z",
     search: "M11 18a7 7 0 100-14 7 7 0 000 14zM21 21l-4.3-4.3",
     shield: "M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z",
     external: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 01-1 1H5a1 1 0 01-1-1V7a1 1 0 011-1h5",
@@ -825,6 +1047,7 @@ const ICONS = {
     tiles: "M3 5h12v14H3zM17 5h4v6h-4zM17 13h4v6h-4z",
     grid: "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
     pin: "M9 4h6M10 4v6l-3 4h10l-3-4V4M12 14v6",
+    star: "M12 3.5l2.6 5.3 5.9.9-4.3 4.1 1 5.8-5.2-2.7-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z",
     palette:
         "M12 3a9 9 0 100 18c1 0 1.5-.8 1.5-1.5 0-.4-.2-.8-.4-1.1-.3-.3-.4-.7-.4-1.1 0-.8.7-1.5 1.5-1.5H16a5 5 0 005-5c0-4.4-4-7.8-9-7.8zM7.5 12.5h.01M9.5 8h.01M14.5 8h.01M17 11.5h.01",
     pulse: "M3 12h4l2-6 4 12 2-6h6",
@@ -839,6 +1062,8 @@ const ICONS = {
     logout: "M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10",
     globe: "M12 21a9 9 0 100-18 9 9 0 000 18zM3.5 9h17M3.5 15h17M12 3a14 14 0 010 18M12 3a14 14 0 000 18",
     reload: "M20 12a8 8 0 11-2.3-5.7M20 4v5h-5",
+    copy: "M9 9h10a1 1 0 011 1v10a1 1 0 01-1 1H9a1 1 0 01-1-1V10a1 1 0 011-1zM5 15H4a1 1 0 01-1-1V4a1 1 0 011-1h10a1 1 0 011 1v1",
+    undo: "M9 14L4 9l5-5M4 9h11a5 5 0 010 10h-4",
     phone: "M8 3h8a1 1 0 011 1v16a1 1 0 01-1 1H8a1 1 0 01-1-1V4a1 1 0 011-1zM11 18h2",
     tablet: "M5 4h14a1 1 0 011 1v14a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1zM11 17h2",
     monitor: "M3 4h18v12H3zM8 20h8M12 16v4",
@@ -846,10 +1071,49 @@ const ICONS = {
     fit: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
     // Compact: two rules, and what is between them pressed toward the middle.
     compact: "M4 3h16M4 21h16M12 6v5M9 8l3 3 3-3M12 18v-5M9 16l3-3 3 3",
+    // Taking turns: a steering wheel.
+    wheel: "M12 3a9 9 0 1 0 0 18 9 9 0 1 0 0-18zM12 10a2 2 0 1 0 0 4 2 2 0 1 0 0-4zM3.3 11.2l6.7.6M20.7 11.2l-6.7.6M12 14v6.9",
 };
 
-/** An icon's SVG path, for marks drawn outside Preact (gestures.js). */
-export const iconPath = (name) => ICONS[name] ?? "";
+/** How far each key scrolls a sheet's body, by its height. */
+const SCROLL_KEYS = {
+    ArrowDown: 0.1,
+    ArrowUp: -0.1,
+    PageDown: 0.9,
+    PageUp: -0.9,
+    " ": 0.9,
+    End: 1e6,
+    Home: -1e6,
+};
+
+/**
+ * The keys that scroll a page scroll a sheet focused as a whole (as it is when it opens), when its body holds nothing to
+ * focus: a sheet only read, such as Keyboard shortcuts. One with controls keeps its keys (the menu's arrows).
+ */
+function scrollFromKeys(event) {
+    const share = SCROLL_KEYS[event.key];
+    const body = event.currentTarget.querySelector(":scope > .sheet-body");
+
+    if (
+        share === undefined ||
+        event.defaultPrevented ||
+        event.target !== event.currentTarget ||
+        !body ||
+        body.querySelector("a[href], button, input, select, textarea, [tabindex]") ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey
+    ) {
+        return;
+    }
+
+    event.preventDefault();
+    body.scrollTop += (event.shiftKey && event.key === " " ? -1 : 1) * share * body.clientHeight;
+}
+
+/** An icon's SVG path, for marks drawn outside Preact (gestures.js); "" for a name that is not one of the icons. */
+export const iconPath = (name) =>
+    typeof name === "string" && Object.hasOwn(ICONS, name) ? ICONS[name] : "";
 
 /** Text with the letters at `hits` (indexes) marked, as matches of what someone searched for. */
 export function Marked({ text, hits }) {
@@ -881,9 +1145,11 @@ export function Marked({ text, hits }) {
     return parts;
 }
 
-export function Icon({ name, size = 20, class: className = "", stroke = 2 }) {
+/** One of the app's icons by `name`, or any 24×24 stroked path as `path` (extensions' own icons). */
+export function Icon({ name, path, size = 20, class: className = "", stroke = 2, part }) {
     return html`<svg
         class=${`icon ${className}`}
+        data-part=${part}
         width=${size}
         height=${size}
         viewBox="0 0 24 24"
@@ -894,7 +1160,7 @@ export function Icon({ name, size = 20, class: className = "", stroke = 2 }) {
         stroke-linejoin="round"
         aria-hidden="true"
     >
-        <path d=${ICONS[name] ?? ""} />
+        <path d=${typeof path === "string" ? path : iconPath(name)} />
     </svg>`;
 }
 
@@ -919,8 +1185,13 @@ export function Loader({ label = "Loading" }) {
 
 /** The full-screen loader: π over Omarchy's boot bar, and what is happening under it. */
 export function Boot({ caption = "starting", detail = "", inline = false }) {
-    return html`<div class=${`boot ${inline ? "inline" : ""}`} role="status" aria-live="polite">
-        <div class="boot-mark" aria-hidden="true">π</div>
+    return html`<div
+        class=${`boot ${inline ? "inline" : ""}`}
+        data-part="boot"
+        role="status"
+        aria-live="polite"
+    >
+        <div class="boot-mark" data-part="brand-mark" aria-hidden="true">π</div>
         <div class="boot-bar" aria-hidden="true"><span></span></div>
         <div class="boot-caption">${caption}</div>
         ${detail && html`<div class="boot-detail">${detail}</div>`}
@@ -957,12 +1228,18 @@ export function useEdge(name, measure) {
                 }
             };
 
+            // Its first measure too, once the page is laid out and before it paints: measured as it mounts, it would lay
+            // out the page in the middle of a draw.
             const observer = new ResizeObserver(update);
             // A pane popping in (`popin` scales it) moves the element without resizing it: measured again as an
-            // animation around it ends.
+            // animation around it ends. Not for the others (a row that rose in, a group that unrolled).
             let frame = 0;
 
-            const settled = () => {
+            const settled = (event) => {
+                if (!(event.target instanceof Node) || !event.target.contains(element)) {
+                    return;
+                }
+
                 cancelAnimationFrame(frame);
                 frame = requestAnimationFrame(update);
             };
@@ -971,7 +1248,6 @@ export function useEdge(name, measure) {
             observer.observe(element);
             addEventListener("resize", update);
             document.addEventListener("animationend", settled);
-            update();
 
             return () => {
                 observer.disconnect();
@@ -989,6 +1265,61 @@ export function useEdge(name, measure) {
         return (element) => {
             stop?.();
             stop = element ? publish(element) : null;
+        };
+    });
+
+    return ref;
+}
+
+/**
+ * Say where a scroller has more than it shows: `data-more` is "up", "down", or "both" while it can scroll that way, and
+ * gone while everything shows. The stylesheet fades that edge, so a list whose scrollbar is hidden still says it
+ * scrolls. It follows scrolling, the scroller's size, and what is added to it or taken away. Returns a ref callback:
+ * give it to the scroller as its `ref`.
+ */
+export function useScrollMore() {
+    const [ref] = useState(() => {
+        let stop = null;
+
+        const watch = (element) => {
+            let frame = 0;
+
+            const update = () => {
+                frame = 0;
+                const up = element.scrollTop > 1;
+                const down = element.scrollTop + element.clientHeight < element.scrollHeight - 1;
+                const more = up && down ? "both" : up ? "up" : down ? "down" : null;
+
+                if (more === null) {
+                    element.removeAttribute("data-more");
+                } else if (element.dataset.more !== more) {
+                    element.dataset.more = more;
+                }
+            };
+
+            const later = () => {
+                frame ||= requestAnimationFrame(update);
+            };
+
+            const sizes = new ResizeObserver(later);
+            const content = new MutationObserver(later);
+
+            sizes.observe(element);
+            content.observe(element, { childList: true, subtree: true });
+            element.addEventListener("scroll", later, { passive: true });
+            later();
+
+            return () => {
+                cancelAnimationFrame(frame);
+                sizes.disconnect();
+                content.disconnect();
+                element.removeEventListener("scroll", later);
+            };
+        };
+
+        return (element) => {
+            stop?.();
+            stop = element ? watch(element) : null;
         };
     });
 
@@ -1032,11 +1363,13 @@ export function usePresence(value, ms = 200) {
 }
 
 /**
- * Where a sliding indicator goes: the offset and size of the element matching `selector` inside `ref`, measured after
- * every render. null when there is none, or it is in a folded group. `instant` is true the first time it shows, so it
- * appears in place instead of sliding in from the top.
+ * Where a sliding indicator goes: the offset and size of the element matching `selector` inside `ref`. null when there
+ * is none, or it is in a folded group. `instant` is true the first time it shows, so it appears in place instead of
+ * sliding in from the top. `key` says which element is selected: it is measured again when `key` changes, and when the
+ * list resizes or settles, not after every render. Measured after every render, each copy of the list laid the page out
+ * early, and Back to the list on a phone froze the longer for it.
  */
-export function useSlide(ref, selector, axis = "y") {
+export function useSlide(ref, selector, axis = "y", key = undefined) {
     const [box, setBox] = useState(null);
     const hidden = useRef(true);
 
@@ -1052,7 +1385,7 @@ export function useSlide(ref, selector, axis = "y") {
         setBox((box) => (next?.at === box?.at && next?.size === box?.size ? box : next));
     };
 
-    useLayoutEffect(measure);
+    useLayoutEffect(measure, [key]);
     // Rows move without a render while a group folds, or the window resizes: measure again when they settle.
     useEffect(() => {
         const host = ref.current;
@@ -1062,8 +1395,11 @@ export function useSlide(ref, selector, axis = "y") {
         }
 
         const settle = (event) => event.target !== host && measure();
+        // A theme's stylesheets can move the element without resizing the list.
+        const again = () => measure();
 
         host.addEventListener("transitionend", settle);
+        document.addEventListener("pocket:theme", again);
         const observer =
             typeof ResizeObserver === "function" ? new ResizeObserver(() => measure()) : null;
 
@@ -1071,6 +1407,7 @@ export function useSlide(ref, selector, axis = "y") {
 
         return () => {
             host.removeEventListener("transitionend", settle);
+            document.removeEventListener("pocket:theme", again);
             observer?.disconnect();
         };
     }, [ref.current]);
@@ -1096,10 +1433,74 @@ export function Slide({ box, axis = "y" }) {
 
     return html`<span
         class=${`slide-${axis} ${box.instant ? "instant" : ""}`}
+        data-part="segment-thumb"
         style=${style}
         aria-hidden="true"
     ></span>`;
 }
+
+/**
+ * Which side of the screen an element stands on, `left` or `right`, as it is laid out now: a theme may move the sidebar
+ * or the drawer to the right, and what is dragged by its edge must follow. Looked at again as the window resizes and
+ * when a theme's stylesheets load (`pocket:theme`, from `theme.js`). `of` gives the element from the ref's.
+ */
+export function useSide(ref, of = (element) => element) {
+    const [side, setSide] = useState("left");
+    const look = useRef(null);
+
+    const watched = useRef(null);
+    const watcher = useRef(null);
+
+    look.current = () => {
+        const element = ref.current && of(ref.current);
+        const box = element?.getBoundingClientRect();
+
+        if (box && box.width > 0) {
+            setSide(box.left + box.width / 2 > innerWidth / 2 ? "right" : "left");
+        }
+    };
+
+    // Measured when the browser lays the element out anyway, before the frame is painted: as it comes, shows, or changes
+    // size (a ResizeObserver says so). Measured after each draw instead, it laid the whole page out early, and opening a
+    // session froze the longer for it on a phone.
+    useLayoutEffect(() => {
+        const element = ref.current && of(ref.current);
+
+        if (element === watched.current) {
+            return;
+        }
+
+        watched.current = element;
+        watcher.current ??= new ResizeObserver(() => look.current());
+        watcher.current.disconnect();
+
+        if (element) {
+            watcher.current.observe(element);
+        }
+    });
+    // And when the window or the theme changes, which can move it without resizing it.
+    useLayoutEffect(() => {
+        const again = () => look.current();
+
+        addEventListener("resize", again);
+        document.addEventListener("pocket:theme", again);
+
+        return () => {
+            removeEventListener("resize", again);
+            document.removeEventListener("pocket:theme", again);
+            watcher.current?.disconnect();
+        };
+    }, []);
+
+    return side;
+}
+
+/**
+ * A rail button's state for themes (`data-state`): `open` while what it opens shows, `busy` while it counts work that
+ * goes on; both, or neither (undefined).
+ */
+export const railState = (open, busy = false) =>
+    [open && "open", busy && "busy"].filter(Boolean).join(" ") || undefined;
 
 /** Keys as they are on this device: ⌘ on Apple keyboards, Ctrl elsewhere. */
 export const APPLE = /Mac|iPhone|iPad/.test(navigator.platform ?? "");
@@ -1134,53 +1535,272 @@ export class Boundary extends Component {
     }
 }
 
-/** Sheets come up from the bottom edge below this width, and drag back down to close; above it they are popups. */
-const BOTTOM_SHEETS = matchMedia("(max-width: 699px)");
+/**
+ * Whether the store changed in none of `keys` between two states. A change to nothing at all is a change:
+ * `store.set({})` draws everything again (a media query that changed, say).
+ */
+function quietFor(keys, before, after) {
+    if (before === after) {
+        return false;
+    }
+
+    let changed = false;
+
+    for (const key in after) {
+        if (before[key] !== after[key]) {
+            if (keys.has(key)) {
+                return false;
+            }
+
+            changed = true;
+        }
+    }
+
+    for (const key in before) {
+        if (!(key in after)) {
+            return false;
+        }
+    }
+
+    return changed;
+}
+
+const sameProps = (a, b) =>
+    Object.keys(a).length === Object.keys(b).length &&
+    Object.keys(a).every((key) => Object.is(a[key], b[key]));
+
+class DrawnFor extends Component {
+    shouldComponentUpdate(next) {
+        return !(
+            next.component === this.props.component &&
+            quietFor(next.keys, this.props.state, next.state) &&
+            sameProps(this.props.props, next.props)
+        );
+    }
+
+    render({ component, props }) {
+        return h(component, props);
+    }
+}
+
+/**
+ * `component`, drawn again only when the store changes in one of `keys`, its props change, or `store.set({})` asks
+ * everything to draw again: for big parts that read little of the store, such as the session list. `keys` must name
+ * every key of the store it reads as it draws, and every key the functions it calls read (`prefs()` reads
+ * `appearance`, `canSteer()` reads `me`): a key left out shows stale data. What it reads only in an event handler
+ * does not count. Its own state draws it again as usual.
+ */
+export function drawnFor(keys, component) {
+    const set = new Set(keys);
+    const Wrapped = (props) => h(DrawnFor, { component, props, keys: set, state: store.state });
+
+    Wrapped.displayName = component.name;
+
+    return Wrapped;
+}
+
+class Memo extends Component {
+    shouldComponentUpdate(next) {
+        const { ignored } = next;
+        const before = this.props.props;
+        const after = next.props;
+        const keys = Object.keys(after).filter((key) => !ignored.includes(key));
+
+        return (
+            next.component !== this.props.component ||
+            Object.keys(before).length !== Object.keys(after).length ||
+            keys.some((key) => !Object.is(before[key], after[key]))
+        );
+    }
+
+    render({ component, props }) {
+        return h(component, props);
+    }
+}
+
+/**
+ * `component`, drawn again only when its props change (each compared with `Object.is`) or its own state does. It must
+ * read nothing else as it draws, such as `store.state`: what it needs comes as props. `ignored` names props it reads
+ * only as it mounts, whose change alone does not draw it again.
+ */
+export function memo(component, ignored = []) {
+    const Wrapped = (props) => h(Memo, { component, props, ignored });
+
+    Wrapped.displayName = component.name;
+
+    return Wrapped;
+}
+
+/** Phones: sheets from the bottom edge, which drag back down to close, and menus that a swipe closes. */
+export const BOTTOM_SHEETS = matchMedia("(max-width: 699px)");
+
+/**
+ * Wide screens, where the sidebar and the home screen's splash show (style.css's 960px). Narrower, the app does not
+ * draw them at all: hidden, they cost a phone the list's whole draw again.
+ */
+export const WIDE = matchMedia("(min-width: 960px)");
+
+/** No pointer that hovers (a touch screen): what only hovering shows, such as a row's buttons, is not drawn. */
+export const NO_HOVER = matchMedia("(hover: none)");
+
+// Each changing (a window resized, a phone turned, a mouse plugged in) draws the app again, with or without them: a sheet
+// open as the phone turns gets its drag to close, or lets go of it.
+for (const query of [WIDE, NO_HOVER, BOTTOM_SHEETS]) {
+    query.addEventListener("change", () => store.set({}));
+}
+
+/** The sheet host supplies a back action only when another sheet is under this one. */
+export const SheetBack = createContext(null);
+
+/**
+ * The open sheet's type and whether it is closing (`sheets.js`), which `Sheet` puts on itself for themes: `data-sheet`,
+ * and `data-state="closing"`.
+ */
+export const SheetInfo = createContext(null);
+
+/**
+ * A scrim's press: it closes its layer only when it starts on the scrim itself, not on what the scrim holds, and only
+ * with the main button (a right click opens the browser's menu, and must not close anything; on a Mac, Ctrl+click is
+ * one).
+ */
+export const scrimPress = (close) => (event) =>
+    event.button === 0 &&
+    !(APPLE && event.ctrlKey) &&
+    event.target === event.currentTarget &&
+    close();
 
 /** A bottom sheet on phones, a centered dialog on wide screens. */
-export function Sheet({ title, onClose, children, wide = false, actions = null }) {
+export function Sheet({ title, onClose, children, wide = false, actions = null, className = "" }) {
     const ref = useRef(null);
+    const onBack = useContext(SheetBack);
+    const info = useContext(SheetInfo);
 
     useDragToClose(ref, { dir: "down", onClose, enabled: BOTTOM_SHEETS.matches });
 
+    // Not the Esc that ends an input method's composing, which belongs to the field.
     useEffect(() => {
-        const onKey = (event) => event.key === "Escape" && onClose();
+        const onKey = (event) =>
+            event.key === "Escape" && !event.isComposing && event.keyCode !== 229 && onClose();
 
         addEventListener("keydown", onKey);
 
         return () => removeEventListener("keydown", onKey);
     }, [onClose]);
-    // Keys go to the sheet, not the message box behind it, unless something inside already took focus.
+    // Keys go to the sheet, not the message box behind it, unless something inside already took focus. Its field marked
+    // autofocus takes them where a keyboard is at hand (the browser skips the attribute, the page already having focus);
+    // on touch screens the sheet does, so no keyboard pops up over it.
     useEffect(() => {
-        if (ref.current && !ref.current.contains(document.activeElement)) {
-            ref.current.focus({ preventScroll: true });
+        const sheet = ref.current;
+
+        if (sheet && !sheet.contains(document.activeElement)) {
+            const field = matchMedia("(pointer: coarse)").matches
+                ? null
+                : sheet.querySelector("[autofocus]");
+
+            (field ?? sheet).focus({ preventScroll: true });
         }
     }, []);
 
     return html`<div
         class="overlay"
-        onClick=${(event) => event.target === event.currentTarget && onClose()}
+        data-part="scrim"
+        data-for="sheet"
+        onMouseDown=${scrimPress(onClose)}
     >
         <section
-            class=${`sheet ${wide ? "wide" : ""}`}
+            class=${`sheet ${wide ? "wide" : ""} ${className}`}
+            data-part="sheet"
+            data-sheet=${info?.type ?? undefined}
+            data-size=${wide ? "wide" : undefined}
+            data-state=${info?.closing ? "closing" : undefined}
             ref=${ref}
             role="dialog"
             aria-modal="true"
             aria-label=${title}
             tabindex="-1"
+            onKeyDown=${scrollFromKeys}
         >
-            <header class="sheet-head">
-                <div class="grip"></div>
+            <header class="sheet-head" data-part="sheet-head">
+                <div class="grip" aria-hidden="true"></div>
+                ${
+                    onBack &&
+                    html`<button class="icon-button sheet-back" onClick=${onBack} aria-label="Back">
+                        <${Icon} name="back" size=${18} />
+                    </button>`
+                }
                 <h2>${title}</h2>
                 ${actions}
                 <button class="icon-button" onClick=${onClose} aria-label="Close">
                     <${Icon} name="close" />
                 </button>
             </header>
-            <div class="sheet-body">${children}</div>
+            <div class="sheet-body" data-part="sheet-body">${children}</div>
         </section>
     </div>`;
 }
+
+/** What Tab reaches in `box`, in order. */
+function tabStops(box) {
+    const all = box.querySelectorAll(
+        'a[href], button, input, select, textarea, iframe, summary, [tabindex], [contenteditable="true"]',
+    );
+
+    return [...all].filter(
+        (each) =>
+            each.tabIndex >= 0 &&
+            !each.disabled &&
+            !each.closest("[inert]") &&
+            (each.checkVisibility?.({ visibilityProperty: true, checkVisibilityCSS: true }) ??
+                each.getClientRects().length > 0),
+    );
+}
+
+// Tab stays in the dialog on top (a sheet, a menu, the Files tile or Browser panel over the app), as in a browser's own
+// modal dialog: past its last control it goes round to the first, and from outside it goes in.
+addEventListener("keydown", (event) => {
+    if (
+        event.key !== "Tab" ||
+        event.defaultPrevented ||
+        event.altKey ||
+        event.ctrlKey ||
+        event.metaKey
+    ) {
+        return;
+    }
+
+    const box = [...document.querySelectorAll('[aria-modal="true"]')]
+        .filter((each) => !each.closest("[inert]"))
+        .at(-1);
+
+    if (!box) {
+        return;
+    }
+
+    const active = document.activeElement;
+
+    // Focus in a layer that comes after the dialog and is not one itself (PiP's window, or the drawer, over a covering
+    // Files tile or Browser panel) is above it: Tab moves there, as before.
+    if (
+        active !== null &&
+        !box.contains(active) &&
+        box.compareDocumentPosition(active) & Node.DOCUMENT_POSITION_FOLLOWING
+    ) {
+        return;
+    }
+
+    const stops = tabStops(box);
+    const toward = event.shiftKey
+        ? Node.DOCUMENT_POSITION_PRECEDING
+        : Node.DOCUMENT_POSITION_FOLLOWING;
+    const more =
+        box.contains(active) &&
+        stops.some((each) => each !== active && active.compareDocumentPosition(each) & toward);
+
+    if (!more) {
+        event.preventDefault();
+        (event.shiftKey ? stops.at(-1) : stops[0])?.focus();
+    }
+});
 
 /**
  * Where a menu opens from the control `selector` names: above it and aligned with it, or below it for a control near the
@@ -1264,4 +1884,24 @@ export function readable(text) {
     } catch {
         return text;
     }
+}
+
+/** A place's tile: its icon, with a count or a dot, and its label. */
+export function PlaceTile({ place }) {
+    return html`<button
+        type="button"
+        class=${`place ${place.on ? "on" : ""}`}
+        data-place=${place.id}
+        aria-label=${place.count > 0 ? `${place.label}, ${place.count} ${place.counted ?? ""}`.trim() : place.badge ? `${place.label}, ${place.badge}` : place.dot ? `${place.label}, ${place.dotLabel ?? "a page open"}` : place.label}
+        aria-pressed=${place.on === undefined ? undefined : place.on ? "true" : "false"}
+        onClick=${place.run}
+    >
+        <span class="place-icon badge-host">
+            <${Icon} name=${place.icon} path=${place.iconPath} size=${20} />
+            ${place.count > 0 && html`<span class="badge">${place.count}</span>`}
+            ${place.badge && html`<span class="badge">${place.badge}</span>`}
+            ${place.dot && html`<span class="browser-dot" aria-hidden="true"></span>`}
+        </span>
+        <span class="place-label">${place.label}</span>
+    </button>`;
 }

@@ -17,7 +17,15 @@ import {
     scoped,
     store,
 } from "./store.js";
-import { chooseTheme, THEMES } from "./theme.js";
+import {
+    BASE_LOOK,
+    chooseLook,
+    chooseTheme,
+    folderPaletteIds,
+    lookIds,
+    paletteOf,
+    THEMES,
+} from "./theme.js";
 import { trustAvailable } from "./trust.js";
 import { copyText, formatTokens, formatWhen, modelLabel, replyText, shortPath } from "./ui.js";
 
@@ -238,7 +246,7 @@ export async function showContext(arg) {
 
     if (arg === "baseline") {
         const taken = await attempt(() =>
-            api(`c/${id}/context/baseline`, undefined, { method: "POST" }),
+            api(`c/${id}/context-meter/baseline`, undefined, { method: "POST" }),
         );
 
         if (taken !== undefined) {
@@ -253,7 +261,7 @@ export async function showContext(arg) {
 
     if (arg === "clear") {
         const cleared = await attempt(() =>
-            api(`c/${id}/context/baseline`, undefined, { method: "DELETE" }),
+            api(`c/${id}/context-meter/baseline`, undefined, { method: "DELETE" }),
         );
 
         if (cleared !== undefined) {
@@ -263,7 +271,7 @@ export async function showContext(arg) {
         return;
     }
 
-    const meter = await attempt(() => api(`c/${id}/context`));
+    const meter = await attempt(() => api(`c/${id}/context-meter`));
 
     if (meter === undefined) {
         return;
@@ -310,7 +318,10 @@ export async function showContext(arg) {
     );
 }
 
-/** `args` in brackets is optional. `available` hides a command where it does not apply. */
+/**
+ * `args` in brackets is optional. `available` hides a command where it does not apply. Keep the names the same as
+ * `BUILT_IN_COMMANDS` in `src/server/extension-web.ts`, which keeps them from extensions' commands.
+ */
 const COMMANDS = [
     {
         name: "compact",
@@ -542,38 +553,96 @@ const COMMANDS = [
     {
         name: "theme",
         args: "[name]",
-        description: "Change the theme: an Omarchy theme, or desktop to follow yours",
+        description:
+            "Change the theme or the colors: a theme, an Omarchy palette, or desktop to follow yours",
         run: setTheme,
     },
 ];
 
-/** `/theme gruvbox`, `/theme rose`, `/theme desktop`; without a name, the Appearance sheet. */
+/**
+ * `/theme lantern` (a theme folder), `/theme gruvbox`, `/theme rose`, `/theme desktop` (colors); without a name, the
+ * Appearance sheet. A theme's name wins over colors' of the same name.
+ */
 function setTheme(arg) {
     if (arg === "") {
         return openSheet({ type: "appearance" });
     }
 
     const needle = arg.toLowerCase().replace(/\s+/g, "-");
-    const ids = ["desktop", ...Object.keys(THEMES)];
-    const id =
-        ids.find((each) => each === needle) ??
-        ids.find(
-            (each) =>
-                each.startsWith(needle) ||
-                THEMES[each]?.name.toLowerCase().startsWith(arg.toLowerCase()),
-        );
+    const words = arg.toLowerCase();
+    // Themes that work: one broken, which Appearance shows greyed out, would leave the app on Pocket.
+    const looks = lookIds().flatMap((id) => {
+        const listed = store.state.themeList?.find((each) => each.id === id);
 
-    if (!id) {
+        return id === BASE_LOOK || listed?.usable
+            ? [{ id, name: id === BASE_LOOK ? "Pocket" : (listed?.name ?? id) }]
+            : [];
+    });
+    // The desktop's colors only where the server has a desktop: elsewhere "desktop" would show Tokyo Night.
+    const desktop = paletteOf("desktop").desktop === true;
+    const palettes = [
+        ...(desktop ? ["desktop"] : []),
+        ...Object.keys(THEMES),
+        ...folderPaletteIds(),
+    ].map((id) => ({
+        id,
+        name: id === "desktop" ? "desktop" : paletteOf(id).name,
+    }));
+    const find = (list) =>
+        list.find((each) => each.id === needle) ??
+        list.find(
+            (each) => each.id.startsWith(needle) || each.name.toLowerCase().startsWith(words),
+        );
+    const look = find(looks);
+
+    if (look) {
+        chooseLook(look.id);
+        notify("info", `Theme: ${look.name}.`);
+
+        return;
+    }
+
+    const palette = find(palettes);
+
+    if (!palette) {
+        const some = [
+            "pocket",
+            ...Object.keys(THEMES).slice(0, 3),
+            ...(desktop ? ["desktop"] : []),
+        ];
+
         throw new Error(
-            `No theme called “${arg}”. Try ${Object.keys(THEMES).slice(0, 4).join(", ")}, or desktop.`,
+            `No theme or colors called “${arg}”. Try ${some.slice(0, -1).join(", ")}, or ${some.at(-1)}.`,
         );
     }
 
-    chooseTheme(id);
-    notify("info", `Theme: ${id === "desktop" ? "follows your desktop" : THEMES[id].name}.`);
+    chooseTheme(palette.id);
+    notify("info", `Colors: ${palette.id === "desktop" ? "follow your desktop" : palette.name}.`);
 }
 
-const available = () => COMMANDS.filter((command) => command.available?.() ?? true);
+/** Extensions' commands this person may run (`hello` lists them). A prompt template of the same name keeps it. */
+function extensionCommands() {
+    const prompts = new Set(templates().map((template) => template.name));
+
+    return (store.state.server?.extensionCommands ?? [])
+        .filter((command) => !prompts.has(command.name))
+        .map((command) => ({
+            ...command,
+            extension: true,
+            run: async (args, requestId) => {
+                const result = await actions.extensionCommand(command.id, args, requestId);
+
+                if (result?.type === "toast") {
+                    notify(result.level, result.message);
+                }
+            },
+        }));
+}
+
+const available = () => [
+    ...COMMANDS.filter((command) => command.available?.() ?? true),
+    ...extensionCommands(),
+];
 
 /** The command a message runs, or null for a message to Pi (such as one starting with a path like /etc/hosts). */
 export function parseCommand(text) {

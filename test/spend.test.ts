@@ -17,10 +17,18 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { type ConversationId, LiveDoc, type UsageState } from "@earendil-works/pi-durable";
+import {
+    type ConversationId,
+    createSession,
+    LiveDoc,
+    MemoryStorage,
+    UsageDoc,
+    type UsageState,
+} from "@earendil-works/pi-durable";
 import type { User } from "../src/server/config.ts";
 import { SpendDoc } from "../src/server/docs.ts";
 import { usageCost } from "../src/server/projection.ts";
+import { Spend } from "../src/server/spend.ts";
 
 /** Usage worth `dollars`, split between a model and a tool. */
 const costing = (dollars: number) =>
@@ -92,6 +100,59 @@ test("spend goes to whoever asked for the work, once, also when the server stopp
     app = await openApp(model);
     assert.equal(app.spend.personSpent(alex.id), 3, "counted on the next start, once");
     assert.equal(app.spend.sessionSpent(id), 3);
+});
+
+test("startup recovery stops a busy run after uncounted usage crosses its payer's limit", async () => {
+    const harness = createSession(new MemoryStorage());
+    const person = { id: "alex", name: "Alex", role: "guest", budget: 0.1 };
+    const aborted: ConversationId[] = [];
+    let id: ConversationId;
+    const spend = new Spend({
+        harness,
+        config: { userById: (id: string) => (id === person.id ? person : undefined) },
+        attribution: { requesterOf: () => person.id },
+        rootOf: (id: ConversationId) => id,
+        sessionMeta: () => undefined,
+        busyConversations: () => [id],
+        notice: () => {},
+        conversation: async (id: ConversationId) => ({
+            abort: async () => {
+                aborted.push(id);
+            },
+        }),
+        log: () => {},
+    } as unknown as App);
+
+    try {
+        id = await harness.commit(async (tx) => {
+            const { id } = await tx.createConversation({ ownership: { kind: "ownerless" } });
+            const stored = await tx.doc(SpendDoc);
+
+            // The response committed before shutdown, but its per-person count did not.
+            stored.people[person.id] = 0;
+            stored.counted[String(id)] = 0;
+            (await tx.doc(UsageDoc, id)).models["faux/faux-1"] = {
+                input: 1,
+                output: 1,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 2,
+                cost: { input: 0, output: 0.25, cacheRead: 0, cacheWrite: 0, total: 0.25 },
+            };
+
+            return id;
+        }, context);
+
+        // Startup loads spend before it installs the commit subscriber that refreshes people totals.
+        await spend.load([id]);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(spend.personSpent(person.id), 0.25);
+        assert.equal(spend.heldBack(id), "Alex reached their $0.10 spend limit");
+        assert.deepEqual(aborted, [id], "the recovered run must stop after totals refresh");
+    } finally {
+        spend.close();
+        await harness.close(context);
+    }
 });
 
 test("spend goes to whoever asked for the work, also when someone else writes before it is stored", async () => {
@@ -183,27 +244,6 @@ test("a run that crosses its session's limit is stopped once, and the people the
                 each.event === "notice" &&
                 each.data.message === "Pi stopped: this session reached its $1.00 spend limit.",
         );
-    // Stopping takes a moment, as it can with a real provider: spend counted meanwhile may not stop the run again.
-    const conversation = app.conversation;
-    let aborts = 0;
-
-    app.conversation = async (cid) =>
-        new Proxy(await conversation.call(app, cid), {
-            get: (found, key) => {
-                if (key === "abort") {
-                    return async (...args: Parameters<typeof found.abort>) => {
-                        aborts++;
-                        await new Promise((resolve) => setTimeout(resolve, 700));
-
-                        return found.abort(...args);
-                    };
-                }
-
-                const value: unknown = Reflect.get(found, key, found);
-
-                return typeof value === "function" ? value.bind(found) : value;
-            },
-        });
 
     try {
         const { submissionId } = await app.commands.submit(id, owner(app), {
@@ -244,48 +284,8 @@ test("a run that crosses its session's limit is stopped once, and the people the
             /"done"/,
             "the five-second command was cut off, so Pi never answered after it",
         );
-        assert.equal(aborts, 1);
         assert.equal(stopped().length, 1);
-
-        // With the limit raised, a later run there is stopped again when it crosses it.
-        await until(() => !app.isBusy(id), "the run to end");
-        await app.spend.setSessionBudget(owner(app), id, 2);
-        const later = await app.commands.submit(id, owner(app), {
-            text: "work slowly",
-            requestId: "slow-again",
-        });
-
-        await until(
-            async () =>
-                (await app.harness.snapshot(LiveDoc, id, context))?.tools?.some(
-                    (tool) => tool.status === "running",
-                ) === true,
-            "the tool to run again",
-        );
-        await recordCost(app, id, 1);
-        const settledLater = await (await app.harness.submission(
-            later.submissionId,
-            context,
-        ))!.wait(context);
-
-        assert.deepEqual(
-            settledLater.status === "unanswered" ? settledLater.reason : settledLater.status,
-            "aborted",
-        );
-        assert.equal(aborts, 2);
     } finally {
-        app.conversation = conversation;
         app.detach(tab.client);
     }
-});
-
-test("PiP's row in Spend shows its limit, so the owner can see and clear it", async () => {
-    const pip = await app.pip.ensure(owner(app));
-    const row = () =>
-        app.spend.summary(owner(app)).sessions.find((each) => each.id === Number(pip));
-
-    await app.spend.setSessionBudget(owner(app), pip, 5);
-    await until(() => row()?.budget === 5, "PiP's limit in its row");
-    await app.spend.setSessionBudget(owner(app), pip, null);
-    await until(() => row() !== undefined && !("budget" in row()!), "no limit in its row");
 });

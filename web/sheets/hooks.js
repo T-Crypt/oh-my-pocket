@@ -215,16 +215,18 @@ export function HooksSheet() {
         }).finally(load);
     };
 
-    return html`<${Sheet} title="Webhooks and watches" onClose=${closeSheet}>
+    return html`<${Sheet} title="Webhooks and watches" onClose=${closeSheet} wide=${true}>
         <p class="muted small">
             Other services (GitHub, a deploy, a monitor) post to a webhook's address, and each post becomes a message to Pi in a session, or to PiP: your instructions, then what came.
         </p>
         ${
             steer &&
             targets.length > 0 &&
-            html`<div class="field">
+            html`<div class="hook-form">
+                <div class="field">
                     <div class="label">Name</div>
                     <input
+                        aria-label="Name"
                         placeholder="Deploys"
                         maxlength="60"
                         value=${name}
@@ -234,6 +236,7 @@ export function HooksSheet() {
                 <div class="field">
                     <div class="label">What Pi should do with each post</div>
                     <textarea
+                        aria-label="What Pi should do with each post"
                         rows="3"
                         maxlength="2000"
                         placeholder="When a deploy fails, find out why and fix it. Ignore the ones that pass."
@@ -244,10 +247,18 @@ export function HooksSheet() {
                 <div class="field">
                     <div class="label">Posted by</div>
                     <div class="segmented">
-                        <button class=${github ? "on" : ""} onClick=${() => setGithub(true)}>
+                        <button
+                            class=${github ? "on" : ""}
+                            aria-pressed=${github}
+                            onClick=${() => setGithub(true)}
+                        >
                             GitHub
                         </button>
-                        <button class=${github ? "" : "on"} onClick=${() => setGithub(false)}>
+                        <button
+                            class=${github ? "" : "on"}
+                            aria-pressed=${!github}
+                            onClick=${() => setGithub(false)}
+                        >
                             Another service
                         </button>
                     </div>
@@ -277,6 +288,7 @@ export function HooksSheet() {
                             ${targets.map(
                                 ([value, label]) => html`<button
                                     class=${target === value ? "on" : ""}
+                                    aria-pressed=${target === value}
                                     onClick=${() => setTarget(value)}
                                 >
                                     ${label}
@@ -294,7 +306,8 @@ export function HooksSheet() {
                     onClick=${make}
                 >
                     Make webhook
-                </button>`
+                </button>
+            </div>`
         }
         ${list === null && html`<p class="muted">Loading…</p>`}
         ${

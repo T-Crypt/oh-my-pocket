@@ -119,24 +119,28 @@ test("the routes: take over POST, clear over DELETE, and GET carries the baselin
     await say(app, id, "hello");
 
     try {
-        const before = await (await get(`c/${id}/context`)).json();
+        const before = await (await get(`c/${id}/context-meter`)).json();
 
         assert.equal(before.baseline, undefined);
 
-        const taken = await (await get(`c/${id}/context/baseline`, { method: "POST" })).json();
+        const taken = await (
+            await get(`c/${id}/context-meter/baseline`, { method: "POST" })
+        ).json();
 
         assert.ok(taken.takenAt > 0);
         assert.ok(taken.rows.length > 0);
 
-        const withBaseline = await (await get(`c/${id}/context`)).json();
+        const withBaseline = await (await get(`c/${id}/context-meter`)).json();
 
         assert.ok(withBaseline.baseline.takenAt > 0);
         assert.ok(Array.isArray(withBaseline.diff));
 
-        const cleared = await (await get(`c/${id}/context/baseline`, { method: "DELETE" })).json();
+        const cleared = await (
+            await get(`c/${id}/context-meter/baseline`, { method: "DELETE" })
+        ).json();
 
         assert.deepEqual(cleared, { ok: true });
-        assert.equal((await (await get(`c/${id}/context`)).json()).baseline, undefined);
+        assert.equal((await (await get(`c/${id}/context-meter`)).json()).baseline, undefined);
     } finally {
         server.closeAllConnections();
         server.close();

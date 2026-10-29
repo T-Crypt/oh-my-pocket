@@ -11,6 +11,7 @@ import { type ConversationId, ProviderDoc, UsageDoc } from "@earendil-works/pi-d
 import type { PocketApp } from "./app.ts";
 import { SessionsDoc } from "./docs.ts";
 import { describe } from "./errors.ts";
+import { noWait } from "./limit-gate.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -130,7 +131,8 @@ export async function writeTitle(
                     },
                 ],
             },
-            { maxTokens: 1024, cacheRetention: "none", sessionId },
+            // A title is never worth a wait for a limit.
+            noWait({ maxTokens: 1024, cacheRetention: "none", sessionId }),
         );
         const title = cleanTitle(
             reply.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join(""),

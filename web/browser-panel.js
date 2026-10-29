@@ -625,7 +625,7 @@ function StartScreen({ steer }) {
     }, []);
 
     return html`<div class="browser-start">
-        <${Icon} name="globe" size=${28} />
+        <h2>Browser</h2>
         <p>
             ${steer ? "Type an address above, such as localhost:5173, or ask Pi to open one." : "Nothing is open yet. Pi, or someone who can steer, opens pages here."}
         </p>
@@ -633,17 +633,20 @@ function StartScreen({ steer }) {
         ${
             servers?.length > 0 &&
             html`<div class="browser-servers">
-                <div class="muted small">Running on this machine</div>
-                ${servers.slice(0, 8).map(
-                    (server) => html`<button
-                        key=${server.port}
-                        class="chip"
-                        onClick=${() => openInBrowser(server.url)}
-                    >
-                        <span class="mono">localhost:${server.port}</span>
-                        ${server.title && html`<span class="muted"> · ${server.title}</span>`}
-                    </button>`,
-                )}
+                <div class="browser-servers-label">Running on this machine</div>
+                <div class="browser-server-list">
+                    ${servers.slice(0, 8).map(
+                        (server) => html`<button
+                            key=${server.port}
+                            class="browser-server"
+                            onClick=${() => openInBrowser(server.url)}
+                        >
+                            <span class="browser-live" aria-hidden="true"></span>
+                            <span class="mono">localhost:${server.port}</span>
+                            ${server.title && html`<span class="browser-server-title">${server.title}</span>`}
+                        </button>`,
+                    )}
+                </div>
             </div>`
         }
     </div>`;
@@ -726,9 +729,12 @@ export function BrowserPanel({ leaving = false }) {
     const wasOpen = useRef(false);
     const stageRef = useRef(null);
     const typeInput = useRef(null);
+    /** The size this tab last fitted the page to: the page follows the panel only while it still has it. */
+    const fittedHere = useRef(null);
+    const beside = panelsBeside();
 
     // Over the conversation, back closes the panel.
-    useBack(!panelsBeside() && !leaving, () => setBrowserOpen(false));
+    useBack(!beside && !leaving, () => setBrowserOpen(false));
 
     if (open) {
         wasOpen.current = true;
@@ -752,6 +758,8 @@ export function BrowserPanel({ leaving = false }) {
         // The size of a page that has none yet: a phone's, or the panel's.
         const phone = matchMedia("(max-width: 700px)").matches;
         const viewport = phone ? "mobile" : stageRef.current && fitViewport(stageRef.current);
+
+        fittedHere.current = phone ? null : viewport;
 
         browserApi("open", viewport ? { viewport } : {}).catch((error) =>
             setProblem(error.message),
@@ -790,10 +798,62 @@ export function BrowserPanel({ leaving = false }) {
                 ? stageRef.current && fitViewport(stageRef.current)
                 : nextPreset.id;
 
+        fittedHere.current = nextPreset.id === "fit" ? viewport : null;
+
         if (viewport) {
             run("viewport", { viewport });
         }
     };
+
+    // Fitted here, the page follows the panel's size (a dragged edge, a folded sidebar, a resized window) once it
+    // settles; not a size Pi or another tab chose since, which reads as "fit" too.
+    const fitted = open && steer && preset.id === "fit";
+    const shown = useRef(state?.viewport);
+
+    shown.current = state?.viewport;
+
+    useEffect(() => {
+        const element = stageRef.current;
+
+        if (!fitted || !element) {
+            return;
+        }
+
+        let timer = 0;
+        let size = `${element.clientWidth}×${element.clientHeight}`;
+        const observer = new ResizeObserver(() => {
+            const now = `${element.clientWidth}×${element.clientHeight}`;
+
+            if (now === size) {
+                return;
+            }
+
+            size = now;
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                const viewport = fitViewport(element);
+                const { width, height } = shown.current ?? {};
+                const mine = fittedHere.current;
+
+                if (
+                    viewport &&
+                    mine?.width === width &&
+                    mine?.height === height &&
+                    (viewport.width !== width || viewport.height !== height)
+                ) {
+                    fittedHere.current = viewport;
+                    run("viewport", { viewport });
+                }
+            }, 300);
+        });
+
+        observer.observe(element);
+
+        return () => {
+            clearTimeout(timer);
+            observer.disconnect();
+        };
+    }, [fitted, conversationId]);
 
     const blank = open && (state.url === "" || state.url === "about:blank");
     const touch = matchMedia("(pointer: coarse)").matches;
@@ -848,7 +908,12 @@ export function BrowserPanel({ leaving = false }) {
 
     return html`<section
         class=${`browser window ${leaving ? "leaving" : ""}`}
+        data-part="browser-panel"
+        data-state=${leaving ? "closing" : undefined}
+        role=${beside ? undefined : "dialog"}
+        aria-modal=${beside ? undefined : "true"}
         aria-label="Browser"
+        tabindex="-1"
         inert=${leaving}
     >
         <${ResizeEdge} />
@@ -893,6 +958,7 @@ export function BrowserPanel({ leaving = false }) {
                     </button>`
             }
             <form class="browser-address" onSubmit=${go}>
+                ${open && !blank && html`<span class="browser-live" aria-hidden="true"></span>`}
                 <input
                     value=${address ?? displayUrl(state?.url)}
                     placeholder=${steer ? "Address, such as localhost:5173" : ""}
@@ -912,6 +978,7 @@ export function BrowserPanel({ leaving = false }) {
                     onBlur=${() => setTimeout(() => setAddress(null), 150)}
                     onKeyDown=${(event) => {
                         if (event.key === "Escape") {
+                            event.preventDefault();
                             event.currentTarget.blur();
                         }
                     }}
@@ -920,7 +987,7 @@ export function BrowserPanel({ leaving = false }) {
             <button
                 class="icon-button"
                 aria-label=${`Size: ${preset.id === "fit" ? `${state?.viewport?.width ?? ""}×${state?.viewport?.height ?? ""}` : preset.label}. Switch to ${nextPreset.label}`}
-                title=${`${preset.id === "fit" ? `${state?.viewport?.width}×${state?.viewport?.height}` : preset.label} · tap for ${nextPreset.label}`}
+                title=${`${preset.id === "fit" ? `${state?.viewport?.width}×${state?.viewport?.height}` : preset.label} · next: ${nextPreset.label}`}
                 disabled=${!steer || !open}
                 onClick=${resize}
             >
@@ -1020,6 +1087,7 @@ export function BrowserButton() {
     return html`<button
         class=${`icon-button badge-host ${browserOpen ? "on" : live ? "quiet-phone" : "quiet"}`}
         aria-label="Browser"
+        aria-pressed=${browserOpen}
         title="Browser (Alt+B)"
         onClick=${toggleBrowser}
     >

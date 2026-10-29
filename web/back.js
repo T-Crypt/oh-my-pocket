@@ -7,9 +7,10 @@
 // changes one, and components register their layers with `useBack` (or `addLayer` and `removeLayer`).
 //
 // Each entry this module writes says how many layers it stands for (`history.state.pocket.layers`), and how many steps
-// back the session list's entry is (`back`), when known. The app is the truth and history follows it: a layer closed
-// by a tap takes its entry back off; one opened adds an entry. Going back (the person's own) closes the layers above the
-// entry it lands on.
+// back the session list's entry is (`back`), when known. A home screen app keeps an entry of the list's under the list
+// itself: the system's swipe back there has no browser page to land on, and would otherwise leave the app blank.
+// The app is the truth and history follows it: a layer closed by a tap takes its entry back off; one opened adds an
+// entry. Going back (the person's own) closes the layers above the entry it lands on.
 
 import { useEffect, useLayoutEffect, useRef } from "preact/hooks";
 
@@ -17,6 +18,8 @@ import { useEffect, useLayoutEffect, useRef } from "preact/hooks";
 const layers = [];
 /** How many layers the current history entry stands for. Entries from before this app wrote any count none. */
 const depth = () => history.state?.pocket?.layers ?? 0;
+/** An iPhone or iPad home screen app: no browser around it, so a back it takes must find something of the app's. */
+const homeScreen = () => navigator.standalone === true;
 /** How long to wait for layers that open and close together (one sheet swapped for another) before writing history. */
 const SETTLE_MS = 40;
 /** How long a traversal this module asked for may take to arrive; one that cannot happen never does. */
@@ -94,6 +97,8 @@ async function reconcile() {
             for (let count = at + 1; count <= layers.length; count++) {
                 history.pushState(entry(count), "", location.href);
             }
+
+            guardRoot();
 
             return;
         }
@@ -187,6 +192,11 @@ addEventListener("popstate", (event) => {
     if (at > layers.length) {
         settle();
     }
+
+    // A home screen app has no browser page behind it: the swipe must find the app's own list, not a blank page.
+    if (homeScreen()) {
+        guardRoot();
+    }
 });
 
 // ─── Taps that land on what just moved ─────────────────────────────────────────────
@@ -220,7 +230,16 @@ const tooSoon = (event) =>
     event.isTrusted && event.detail > 0 && performance.now() - movedAt < SETTLING_MS;
 
 // Held back from the press too: a field that slid in under the finger does not take the focus (and the keyboard).
-addEventListener("mousedown", (event) => tooSoon(event) && event.preventDefault(), true);
+addEventListener(
+    "mousedown",
+    (event) => {
+        if (tooSoon(event)) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+    },
+    true,
+);
 addEventListener(
     "click",
     (event) => {
@@ -313,16 +332,62 @@ const HOME = "/";
 let shown = location.pathname;
 let shownBack = history.state?.pocket?.back;
 let routeTimer = 0;
+let homeRequest = 0;
+
+/**
+ * One entry of the list's under it, where the app is a home screen app's root: the system's swipe back then lands on
+ * the app, not on the blank page outside it. An entry already guarded adds none.
+ */
+function guardRoot() {
+    if (
+        !homeScreen() ||
+        location.pathname !== HOME ||
+        layers.length > 0 ||
+        history.state?.pocket?.guard
+    ) {
+        return;
+    }
+
+    history.pushState({ pocket: { layers: 0, back: 0, guard: true } }, "", location.href);
+    shownBack = 0;
+}
+
+/** The window a route slides into (the conversation's, or the list's on phones), whose mark says which way. */
+let routeWindow = null;
+
+/** The route slide ended: its mark goes. A slide that never played (a wide screen, reduced motion) ends on a timer. */
+function landed() {
+    clearTimeout(routeTimer);
+    routeWindow?.removeEventListener("animationend", slid);
+    delete routeWindow?.dataset.route;
+    routeWindow = null;
+}
+
+const slid = (event) => /^route-(forward|back)$/.test(event.animationName) && landed();
 
 /**
  * Which way the last route change went, for the screen it brings to slide in from that side (style.css): `forward` to
- * a session, `back` to the one before or up to the list. Only while it slides.
+ * a session, `back` to the one before or up to the list. Only while it slides. On the window, not the page's root: a
+ * mark there would restyle the whole page twice for each route.
  */
 function heading(way) {
-    document.documentElement.dataset.route = way;
-    clearTimeout(routeTimer);
-    routeTimer = setTimeout(() => delete document.documentElement.dataset.route, 600);
+    landed();
+    routeWindow = document.querySelector(".pane");
+
+    if (routeWindow === null) {
+        return;
+    }
+
+    routeWindow.dataset.route = way;
+    routeWindow.addEventListener("animationend", slid);
+    routeTimer = setTimeout(landed, 600);
 }
+
+/**
+ * A route's slide plays now: what it brings in needs no entrance of its own (`transcript.js`). Only narrower than the
+ * sidebar shows (style.css).
+ */
+export const routeSliding = () => routeWindow !== null && matchMedia("(max-width: 959px)").matches;
 
 /**
  * Show a route: its own entry, after the layers above this one, so back from it comes back here. With `replace`, it
@@ -334,6 +399,7 @@ export function pushRoute(path, { replace = false } = {}) {
         return;
     }
 
+    homeRequest++;
     heading(path === HOME ? "back" : "forward");
     moved();
     shown = path;
@@ -364,13 +430,46 @@ export function pushRoute(path, { replace = false } = {}) {
  * list leaves the app as it would from any first page. Otherwise `fallback`, which shows the list some other way.
  */
 export function goHome(fallback) {
-    const back = history.state?.pocket?.back;
+    const request = ++homeRequest;
 
-    if (typeof back === "number" && back > 0) {
-        history.go(-(back + depth()));
-    } else {
-        fallback();
-    }
+    return queue(() => {
+        if (request !== homeRequest) {
+            return;
+        }
+
+        const state = history.state;
+        const path = shown;
+        const back = state?.pocket?.back;
+        const steps = typeof back === "number" && back > 0 ? back + depth() : 0;
+
+        // Old entries can be dropped. The length also counts forward entries, so even a jump within it may fail.
+        if (steps <= 0 || steps > history.length - 1) {
+            fallback();
+
+            return;
+        }
+
+        return new Promise((resolve) => {
+            const done = () => {
+                clearTimeout(timer);
+                removeEventListener("popstate", done);
+                resolve();
+            };
+
+            const timer = setTimeout(() => {
+                done();
+
+                // A newer request or route must not be undone by recovery from this one.
+                if (request === homeRequest && shown === path && history.state === state) {
+                    fallback();
+                }
+            }, TRAVERSE_MS);
+
+            // Keep normal popstate handling: Home closes layers as well as changing the route.
+            addEventListener("popstate", done);
+            history.go(-steps);
+        });
+    });
 }
 
 /**
@@ -389,14 +488,32 @@ export function startHistory({ home }) {
 
     if (location.pathname === HOME) {
         history.replaceState({ pocket: { layers: 0, back: 0 } }, "", location.href);
+        guardRoot();
     } else if (home) {
-        listUnderOnFirstTap();
+        if (homeScreen()) {
+            listUnderNow();
+        } else {
+            listUnderOnFirstTap();
+        }
     } else {
         history.replaceState({ pocket: { layers: 0 } }, "", location.href);
     }
 
     shownBack = history.state.pocket.back;
     settle();
+}
+
+/**
+ * Put the list's entry under a conversation opened in a home screen app at once, not at the first tap: a system swipe
+ * back there must find the list before anyone has touched the page. The list's own entry under it keeps the next one
+ * from leaving too (`guardRoot`).
+ */
+function listUnderNow() {
+    const here = location.pathname + location.search + location.hash;
+
+    history.replaceState({ pocket: { layers: 0, back: 0 } }, "", HOME);
+    history.pushState({ pocket: { layers: 0, back: 0, guard: true } }, "", HOME);
+    history.pushState({ pocket: { layers: 0, back: 1 } }, "", here);
 }
 
 /**

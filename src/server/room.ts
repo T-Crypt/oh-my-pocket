@@ -10,6 +10,7 @@ import type {
     ConversationId,
     ConversationView,
     EntryRecord,
+    InboxItem,
     InboxState,
     LiveState,
     UsageState,
@@ -45,17 +46,25 @@ import {
     TurnsDoc,
     WatchDoc,
 } from "./docs.ts";
-import { SHELL_ENTRY } from "./entry-format.ts";
+import { COMMAND_ENTRY, SHELL_ENTRY } from "./entry-format.ts";
 import { agentInfo } from "./models.ts";
 import type { SubagentPolicy } from "./subagent-policy.ts";
 import {
+    type ClientBlock,
     type ClientEntry,
+    type ClientLive,
+    type ClientLiveUpdate,
+    firstEntries,
+    lightEntry,
+    liveMessageDelta,
     PEEK_LINES,
     type PeekLine,
     peekLines,
     projectEntry,
+    projectLimit,
     projectLive,
     projectStats,
+    turnStart,
 } from "./projection.ts";
 import { describeRepeat } from "./when.ts";
 
@@ -92,11 +101,23 @@ const HEAD_MS = 3000;
 /** How much of a waiting call's command and reason a tile gets: the tile allows only short commands anyway. */
 const PEEK_SUBJECT = 500;
 const PEEK_REASON = 300;
+/**
+ * How much of a waiting message the queue gets: its row shows one line. A long paste or a batch of subagents' reports
+ * can be megabytes, which every open tab would download each time the queue changes.
+ */
+const QUEUED_TEXT = 500;
 
-/** What a peek tile shows of a session: its last steps, and the calls waiting for approval. */
+/** What a peek tile shows of a session: its last steps, the subagents at work there, and the calls waiting. */
 export type PeekSummary = {
     conversationId: ConversationId;
     lines: PeekLine[];
+    /** The session's subagents at work now, newest asked first: a tile says what each does from its own peek. */
+    agents: {
+        name: string;
+        conversationId: ConversationId;
+        asked?: string;
+        askedAt?: number;
+    }[];
     approvals: {
         id: string;
         conversationId: ConversationId;
@@ -104,8 +125,13 @@ export type PeekSummary = {
         subject: string;
         reason: string;
         requestedBy?: string;
+        /** An extension's question (`host.ask`): answered on its card, where its fields are. */
+        form?: true;
     }[];
 };
+
+/** How much of a message's text `userMessages` sends: enough to show, and to cut where the browser wants. */
+const USER_MESSAGE_TEXT = 4000;
 
 /** One browser tab's event stream. */
 export interface Client {
@@ -124,6 +150,15 @@ export interface Client {
     /** The JSON of each slow-changing view field this client last got, so updates repeat only those that changed. */
     sentFields?: Map<string, string>;
     /**
+     * What the tab's code understands of updates (`PROTOCOL` in `web/store.js`): 2 keeps the queue an update leaves out;
+     * 3 also takes the live message as what changed (`liveMessageDelta`); 4 also takes a full view with only the newest
+     * entries (`firstEntries`); 5 also takes them light at first (`lightEntry`), whole in the update after. A tab below
+     * 3 gets the whole live message with each update; older code, which names none, also gets the queue.
+     */
+    readonly protocol?: number;
+    /** The blocks of the live message this tab has, for protocol 3: undefined when it has none. */
+    liveBlocks?: ClientBlock[];
+    /**
      * This connection, apart from others of the same tab id: a duplicated browser tab keeps the id, and a reconnect
      * briefly overlaps the old connection. Sent in `hello`; peek lists name it.
      */
@@ -138,6 +173,8 @@ export interface Client {
     boardSeq?: number;
     /** The JSON of the subagents this tab's board last got, so an unchanged list is not sent again. */
     boardSent?: string;
+    /** The JSON of the session list this tab last got, so an unchanged list is not sent again. */
+    sessionsSent?: string;
     /**
      * This tab's PiP panel, while open: a view of PiP's conversation beside the one the tab shows, which reaches the tab
      * as `pipview` events (`PocketApp.setPip`).
@@ -175,6 +212,60 @@ export function reportingOf(
     );
 }
 
+/**
+ * What a waiting message says: its own text, which comes first, not the files it mentions (text parts after it) or the
+ * images it carries. A message of images alone says how many.
+ */
+function queuedText(content: unknown): string {
+    if (typeof content === "string") {
+        return content;
+    }
+
+    if (!Array.isArray(content)) {
+        return "";
+    }
+
+    const parts = content as ({ type?: unknown; text?: unknown } | null)[];
+    const text = parts.find((part) => part?.type === "text" && typeof part.text === "string")
+        ?.text as string | undefined;
+    const images = parts.filter((part) => part?.type === "image").length;
+
+    // A blank text says nothing: a message of it and images says how many.
+    if (text?.trim() || images === 0) {
+        return text ?? "";
+    }
+
+    return images === 1 ? "1 image" : `${images} images`;
+}
+
+/** The start of `text`, at most `QUEUED_TEXT` characters, ending with "…" when it is cut, and never inside a character. */
+function cutQueued(text: string): string {
+    if (text.length <= QUEUED_TEXT) {
+        return text;
+    }
+
+    const end = /[\uD800-\uDBFF]/.test(text[QUEUED_TEXT - 1] ?? "") ? QUEUED_TEXT - 1 : QUEUED_TEXT;
+
+    return `${text.slice(0, end)}…`;
+}
+
+/**
+ * The subagents a message of reports carries (`extensions/subagents.ts` joins those that arrive together into one), or
+ * undefined for any other message. Read from the whole text: the queue gets only its start.
+ */
+function reportNames(text: string): string[] | undefined {
+    // Only a message that starts with a report is one: a person's own may begin "[subagent " too.
+    if (!/^\[subagent \S+ (?:answered|failed)/.test(text)) {
+        return undefined;
+    }
+
+    return [
+        ...new Set(
+            [...text.matchAll(/\[subagent (\S+) (?:answered|failed)/g)].map((match) => match[1]!),
+        ),
+    ];
+}
+
 /** Whether a subagent failed (not stopped), and a person dealt with that failure: the one it has now. */
 function failureDealtWith(record: SubagentRecord): boolean {
     return (
@@ -195,11 +286,14 @@ export function subagentView(
     record: SubagentRecord,
     busy: boolean,
     reporting: boolean,
+    limited?: number,
 ) {
     return {
         name,
         conversationId: record.conversationId,
         busy,
+        // Its request waits for its provider's limit to clear: when the next request goes out.
+        ...(limited === undefined ? {} : { limited }),
         ...(record.asked === undefined ? {} : { asked: record.asked }),
         ...(record.askedAt === undefined ? {} : { askedAt: record.askedAt }),
         ...(record.answeredAt === undefined ? {} : { answeredAt: record.answeredAt }),
@@ -231,6 +325,10 @@ export class Room {
     /** The branch this view last read, as JSON. */
     #head = "";
     readonly #projected = new Map<number, ClientEntry | null>();
+    /** The live run as tabs get it, projected once for each state of it, not once for each tab. */
+    #live: { from: LiveState | undefined; limit: string; projected: ClientLive } | undefined;
+    /** Each waiting message's text for the queue, and the subagents it reports from: what it says does not change. */
+    readonly #queued = new Map<number, { text: string; reports: string[] | undefined }>();
     authors: Record<string, string> = {};
     artifacts: Record<string, ArtifactMeta> = {};
     subagents: Record<string, SubagentRecord> = {};
@@ -448,7 +546,13 @@ export class Room {
         return router === undefined ? null : { id: router.id, label: router.label };
     }
 
-    /** Send this client what changed since its last update, or everything with `full`. */
+    /**
+     * Send this client what changed since its last update, or everything with `full`. A tab of protocol 4 gets the
+     * whole order but, in full, only the entries of the newest rows (`firstEntries`): it asks for earlier ones
+     * (`entriesBefore`) as it shows them. A long session's every entry, in one event, made opening it slow. A tab of
+     * protocol 5 gets those entries light (`lightEntry`), so the rows show at once, and whole in an update right after:
+     * what shows only when a step is opened was most of what it waited for.
+     */
     push(client: Client, full: boolean): void {
         const view = this.#view?.value;
 
@@ -462,24 +566,47 @@ export class Room {
             client.sentEntries.clear();
             client.orderKey = "";
             sentFields.clear();
+            client.liveBlocks = undefined;
         }
 
+        const projected = this.#projectedEntries(view.entries);
+        const order = projected.map((entry) => entry.id);
+        const from = full && (client.protocol ?? 1) >= 4 ? firstEntries(projected) : 0;
+        const light = full && (client.protocol ?? 1) >= 5;
         const entries: ClientEntry[] = [];
-        const order: number[] = [];
+        let partial = false;
 
-        for (const entry of view.entries) {
-            const projected = this.#entry(entry);
-
-            if (projected === null) {
-                continue;
+        projected.forEach((entry, index) => {
+            if (client.sentEntries.has(entry.id)) {
+                return;
             }
 
-            order.push(projected.id);
+            // One before the newest rows is the tab's to ask for: it is not sent with a later update either.
+            if (index < from) {
+                client.sentEntries.add(entry.id);
 
-            if (!client.sentEntries.has(projected.id)) {
-                client.sentEntries.add(projected.id);
-                entries.push(projected);
+                return;
             }
+
+            const lighter = light ? lightEntry(entry) : null;
+
+            // A light one is not counted as sent: the next update brings it whole.
+            if (lighter === null) {
+                client.sentEntries.add(entry.id);
+            } else {
+                partial = true;
+            }
+
+            entries.push(lighter ?? entry);
+        });
+
+        // That update goes at once, after the rest of what a tab gets as it opens the session (`PocketApp.attach`).
+        if (partial) {
+            setImmediate(() => {
+                if (this.clients.has(client)) {
+                    this.push(client, false);
+                }
+            });
         }
 
         const orderKey = order.join(",");
@@ -488,14 +615,18 @@ export class Room {
         client.orderKey = orderKey;
         const agentState = (view.docs["pi.agent"] ?? {}) as AgentState;
         const inbox = (view.docs["pi.inbox"] ?? { items: [] }) as unknown as InboxState;
-        const live = view.docs["pi.live"] as LiveState | undefined;
         // These grow with the session (authors has one item per message) but rarely change: streaming sends an update
         // every 90 ms, which would repeat them all each time. Send each only when it differs from what this client has.
+        const queue = this.#inbox(inbox.items);
         const fields: Record<string, unknown> = {
+            // A turn's updates would repeat it every 90 ms, and a waiting paste or batch of reports can be large.
+            inbox: queue,
             artifacts: Object.entries(this.artifacts).map(([id, meta]) => ({
                 id,
                 title: meta.title,
                 type: meta.type,
+                ...(meta.group === undefined ? {} : { group: meta.group }),
+                ...(meta.kind === undefined ? {} : { kind: meta.kind }),
                 versions: meta.versions.map((version) => ({
                     version: version.version,
                     size: version.size,
@@ -508,6 +639,7 @@ export class Room {
                     record,
                     this.#app.isBusy(record.conversationId),
                     this.#reporting.has(name),
+                    this.#app.limits.waitFor(Number(record.conversationId))?.until,
                 ),
             ),
             // Reports on their way that a spend limit holds back, and why: the subagents bar says so.
@@ -576,33 +708,18 @@ export class Room {
             }
         }
 
+        // Older browser code drops a queue that an update leaves out: it gets the queue with each update, as before.
+        if ((client.protocol ?? 1) < 2) {
+            fields.inbox = queue;
+        }
+
         client.send("view", {
             full,
             conversation: this.#app.conversationInfo(this),
             entries,
             ...(orderChanged || full ? { order } : {}),
-            live: projectLive(live),
-            inbox: inbox.items.map((item) =>
-                item.mode === "write"
-                    ? {
-                          id: item.id,
-                          mode: item.mode,
-                          ...(item.entry.kind === SHELL_ENTRY
-                              ? {
-                                    text: `$ ${String((item.entry.data as { command?: unknown } | undefined)?.command ?? "")}`,
-                                }
-                              : {}),
-                      }
-                    : {
-                          id: item.id,
-                          mode: item.mode,
-                          text:
-                              typeof item.content === "string"
-                                  ? item.content
-                                  : JSON.stringify(item.content).slice(0, 500),
-                          ...this.#app.attribution.submitterOf(item.id as unknown as number, this),
-                      },
-            ),
+            // Last, so that nothing that throws before the send leaves the server thinking the tab has these blocks.
+            live: this.#liveFor(client, view.docs["pi.live"] as LiveState | undefined),
             agent: agentInfo(
                 this.#app.models,
                 agentState,
@@ -615,6 +732,190 @@ export class Room {
             approvals: this.#app.approvals.forConversation(this.id),
             ...fields,
         });
+    }
+
+    /** The active context's entries as tabs get them, oldest first; the ones tabs do not show are left out. */
+    #projectedEntries(records: readonly EntryRecord[]): ClientEntry[] {
+        const out: ClientEntry[] = [];
+
+        for (const record of records) {
+            const projected = this.#entry(record);
+
+            if (projected !== null) {
+                out.push(projected);
+            }
+        }
+
+        return out;
+    }
+
+    /**
+     * The active context's entries before `before` (an entry id in it), oldest first: from entry `from`, or those of
+     * `rows` rows, with the turn the first is in (`turnStart`); all of them with neither. None when `before` (or `from`)
+     * is not in it, as after a compaction: the tab's next update has the new order.
+     */
+    entriesBefore(
+        before: number,
+        { rows, from }: { rows?: number; from?: number } = {},
+    ): ClientEntry[] {
+        const view = this.#view?.value;
+
+        if (view === undefined) {
+            return [];
+        }
+
+        const projected = this.#projectedEntries(view.entries);
+        const end = projected.findIndex((entry) => entry.id === before);
+
+        if (end === -1) {
+            return [];
+        }
+
+        const earlier = projected.slice(0, end);
+
+        if (from !== undefined) {
+            const start = earlier.findIndex((entry) => entry.id === from);
+
+            return start === -1 ? [] : earlier.slice(turnStart(earlier, start));
+        }
+
+        return rows === undefined ? earlier : earlier.slice(firstEntries(earlier, rows));
+    }
+
+    /**
+     * The people's messages in the active context, for extensions (`pocket.messages`): a page of up to `limit`, oldest
+     * first, from before the message `before` (or the newest), with the cursor of the page before it, or null at the
+     * start. Each text is cut at `USER_MESSAGE_TEXT` characters. Null when `before` is not a message in the context
+     * now, as after a compaction, so a stale cursor is not taken for the start.
+     */
+    userMessages(
+        before: number | undefined,
+        limit: number,
+    ): { messages: ClientEntry[]; before: number | null } | null {
+        const view = this.#view?.value;
+        const all = (view === undefined ? [] : this.#projectedEntries(view.entries)).filter(
+            (entry) => entry.kind === "user",
+        );
+        const end =
+            before === undefined ? all.length : all.findIndex((entry) => entry.id === before);
+
+        if (end === -1) {
+            return null;
+        }
+
+        const start = Math.max(0, end - limit);
+
+        return {
+            messages: all
+                .slice(start, end)
+                .map((entry) =>
+                    entry.kind === "user" && entry.text.length > USER_MESSAGE_TEXT
+                        ? { ...entry, text: entry.text.slice(0, USER_MESSAGE_TEXT) }
+                        : entry,
+                ),
+            before: start === 0 ? null : all[start]!.id,
+        };
+    }
+
+    /** The live run as tabs get it, projected once for each state of it. */
+    #projectLive(live: LiveState | undefined): ClientLive {
+        // The wait for a provider's limit is not in the run's documents: it comes from the app's limit gate.
+        const wait = this.#app.limits.waitFor(Number(this.id));
+        const limit = wait === undefined ? "" : JSON.stringify(wait);
+
+        if (this.#live === undefined || this.#live.from !== live || this.#live.limit !== limit) {
+            const projected = projectLive(live);
+
+            this.#live = {
+                from: live,
+                limit,
+                projected:
+                    wait === undefined ? projected : { ...projected, limit: projectLimit(wait) },
+            };
+        }
+
+        return this.#live.projected;
+    }
+
+    /**
+     * The live run for this client. One whose code takes protocol 3 gets the message as what changed since its last
+     * update; older code, the whole message each time.
+     */
+    #liveFor(client: Client, state: LiveState | undefined): ClientLiveUpdate {
+        const live = this.#projectLive(state);
+        const generation = live.generation;
+        const sent = client.liveBlocks;
+
+        client.liveBlocks = generation?.message?.blocks;
+
+        if (generation?.message === undefined || sent === undefined || (client.protocol ?? 1) < 3) {
+            return live;
+        }
+
+        return {
+            ...live,
+            generation: {
+                ...generation,
+                message: liveMessageDelta(sent, generation.message.blocks),
+            },
+        };
+    }
+
+    /** The queue as its rows show it: each message's start, who sent it, and the subagents a message of reports is from. */
+    #inbox(items: InboxItem[]) {
+        const waiting = new Set<number>();
+        const rows = items.map((item) => {
+            const id = item.id as unknown as number;
+
+            waiting.add(id);
+
+            if (item.mode === "write") {
+                const command = String(
+                    (item.entry.data as { command?: unknown } | undefined)?.command ?? "",
+                );
+
+                // A `!` command, or an extension command's card written while Pi works.
+                return {
+                    id,
+                    mode: item.mode,
+                    ...(item.entry.kind === SHELL_ENTRY
+                        ? { text: cutQueued(`$ ${command}`) }
+                        : item.entry.kind === COMMAND_ENTRY
+                          ? { text: cutQueued(`/${command}`) }
+                          : {}),
+                };
+            }
+
+            let queued = this.#queued.get(id);
+
+            if (queued === undefined) {
+                const text = queuedText(item.content);
+
+                queued = { text: cutQueued(text), reports: reportNames(text) };
+                this.#queued.set(id, queued);
+            }
+
+            const submitter = this.#app.attribution.submitterOf(id, this);
+
+            return {
+                id,
+                mode: item.mode,
+                text: queued.text,
+                ...submitter,
+                // A person's message is not one of reports, whatever it starts with.
+                ...(submitter.by === undefined && queued.reports !== undefined
+                    ? { reports: queued.reports }
+                    : {}),
+            };
+        });
+
+        for (const id of this.#queued.keys()) {
+            if (!waiting.has(id)) {
+                this.#queued.delete(id);
+            }
+        }
+
+        return rows;
     }
 
     /** Update the peek tiles soon: at most once every `PEEK_MS`, and only for tabs whose tile changed. */
@@ -681,15 +982,36 @@ export class Room {
             }
         }
 
+        const approvals = this.#app.approvals.all();
+        const waiting = new Set(
+            approvals
+                .filter((request) => request.conversationId !== this.id)
+                .map((request) => request.conversationId),
+        );
+
         return {
             conversationId: this.id,
             lines: peekLines(
                 recent.reverse(),
-                projectLive(view.docs["pi.live"] as LiveState | undefined),
+                this.#projectLive(view.docs["pi.live"] as LiveState | undefined),
             ),
+            // The subagents at work here, as the subagents bar lists them: the tile rows get what each does from
+            // their own peeks, which the tab asks for while the rows are on its screen.
+            agents: Object.entries(this.subagents)
+                .filter(
+                    ([, record]) =>
+                        this.#app.isBusy(record.conversationId) ||
+                        waiting.has(record.conversationId),
+                )
+                .sort(([, a], [, b]) => (b.askedAt ?? 0) - (a.askedAt ?? 0))
+                .map(([name, record]) => ({
+                    name,
+                    conversationId: record.conversationId,
+                    ...(record.asked === undefined ? {} : { asked: record.asked }),
+                    ...(record.askedAt === undefined ? {} : { askedAt: record.askedAt }),
+                })),
             // Its own calls waiting for someone; for a session, its subagents' too, as they make the session wait.
-            approvals: this.#app.approvals
-                .all()
+            approvals: approvals
                 .filter(
                     (request) =>
                         request.conversationId === this.id ||
@@ -704,6 +1026,7 @@ export class Room {
                     ...(request.requestedBy === undefined
                         ? {}
                         : { requestedBy: request.requestedBy }),
+                    ...(request.form === undefined ? {} : { form: true as const }),
                 })),
         };
     }
@@ -831,5 +1154,6 @@ export class Room {
         this.#view?.dispose();
         this.#view = undefined;
         this.#projected.clear();
+        this.#queued.clear();
     }
 }

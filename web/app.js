@@ -1,10 +1,10 @@
 // Pi Pocket web app. No build step: edit a file under web/ and every open browser reloads.
 import { render } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { folderColor } from "./avatar.js";
-import { canGoBack, goBack, goHome, replaceAddress, startHistory, useBack } from "./back.js";
+import { canGoBack, goBack, replaceAddress, startHistory, useBack } from "./back.js";
 import { BrowserButton, BrowserPanel } from "./browser-panel.js";
-import { browserAvailable, toggleBrowser } from "./browser.js";
+import { browserAvailable, setBrowserOpen, toggleBrowser } from "./browser.js";
 import { PeopleButton, PeoplePanel } from "./chat.js";
 import { Composer, openingByAlt } from "./composer.js";
 import { useChanges } from "./diff.js";
@@ -15,7 +15,8 @@ import {
     setFilesOpen,
     toggleFiles,
 } from "./files-panel.js";
-import { startEdgeBack, startSwipes } from "./gestures.js";
+import { ExtensionPage, ExtensionPanel, extPanelShown } from "./extension-ui.js";
+import { startEdgeBack, startSwipes, useDragToClose } from "./gestures.js";
 import { Splash } from "./home.js";
 import { Launcher } from "./launcher.js";
 import { registerWorker, updateBadge } from "./notify.js";
@@ -29,11 +30,12 @@ import {
     togglePeeks,
 } from "./peeks.js";
 import { closePip, openPip, PipHost, pipAvailable, togglePip } from "./pip.js";
-import { Drawer, RailNav, ResizeHandle, SessionList, workspaceOrder } from "./sessions.js";
+import { Drawer, RailNav, ResizeHandle, SessionList, toSessions } from "./sessions.js";
 // Loaded for what it does: it gives replies' Markdown the component for pages, images, and diffs in code blocks.
 import "./rich.js";
 import { takeShare } from "./share.js";
 import { Sheets } from "./sheets.js";
+import { defineItem, slotItems } from "./slots.js";
 import { branchAvailable, headLabel } from "./sheets/branch.js";
 import { SignIn } from "./signin.js";
 import { openSubagents } from "./subagents.js";
@@ -45,6 +47,7 @@ import {
     canSteer,
     dismiss,
     filesShown,
+    holdNotice,
     navigate,
     notify,
     openSheet,
@@ -53,17 +56,23 @@ import {
     scoped,
     start,
     store,
+    workspaceOrder,
 } from "./store.js";
 import { prefs, setPrefs, startTheme } from "./theme.js";
 import { Transcript } from "./transcript.js";
-import { APPLE, Boot, html, Icon, iconPath, shortPath, useEdge, usePresence } from "./ui.js";
+import {
+    APPLE,
+    Boot,
+    BOTTOM_SHEETS,
+    html,
+    Icon,
+    iconPath,
+    shortPath,
+    useEdge,
+    usePresence,
+    WIDE,
+} from "./ui.js";
 import { toggleDictation } from "./voice.js";
-
-/**
- * Back to the session list, where it is not beside the conversation: back past the sessions opened from it, as a
- * phone's back would go, or to it in this session's place when history does not lead there.
- */
-const toSessions = () => goHome(() => navigate(null, { replace: true }));
 
 /** What changed in the session's folder: lines added and removed, and how many files. It opens Changes. */
 function ChangesButton() {
@@ -94,30 +103,122 @@ function ChangesButton() {
     </button>`;
 }
 
+// The top bar's buttons after the title: the app's own items of the `topbar` slot (slots.js), which a person can hide
+// and reorder in Appearance, with extensions' between them. The menu stays last.
+defineItem("topbar", {
+    id: "core:subagents",
+    label: "Subagents working",
+    order: 100,
+    render() {
+        const busy = (store.state.view.subagents ?? []).filter((agent) => agent.busy).length;
+
+        return (
+            busy > 0 &&
+            html`<button
+                class="icon-button"
+                aria-label=${`Subagents: ${busy} working`}
+                title="Subagents working"
+                onClick=${openSubagents}
+            >
+                <span class="pulse"></span>
+                <span class="count">${busy}</span>
+            </button>`
+        );
+    },
+});
+defineItem("topbar", {
+    id: "core:changes",
+    label: "Changes",
+    order: 200,
+    render: () => filesAvailable() && html`<${ChangesButton} key=${store.state.conversationId} />`,
+});
+defineItem("topbar", {
+    id: "core:peeks",
+    label: "Peek tiles",
+    order: 300,
+    render: () => html`<${PeeksButton} />`,
+});
+defineItem("topbar", {
+    id: "core:files",
+    label: "Files",
+    order: 400,
+    render: () => html`<${FilesButton} />`,
+});
+defineItem("topbar", {
+    id: "core:browser",
+    label: "Browser",
+    order: 500,
+    render: () => html`<${BrowserButton} />`,
+});
+defineItem("topbar", {
+    id: "core:artifacts",
+    label: "Artifacts",
+    order: 600,
+    render() {
+        const artifacts = store.state.view.artifacts?.length ?? 0;
+
+        return html`<button
+            class=${`icon-button badge-host ${artifacts > 0 ? "quiet-phone" : "quiet"}`}
+            aria-label="Artifacts"
+            title="Artifacts"
+            onClick=${() => openSheet({ type: "artifacts" })}
+        >
+            <${Icon} name="artifact" />
+            ${artifacts > 0 && html`<span class="badge">${artifacts}</span>`}
+        </button>`;
+    },
+});
+defineItem("topbar", {
+    id: "core:people",
+    label: "People",
+    order: 700,
+    render: () => html`<${PeopleButton} />`,
+});
+defineItem("topbar", {
+    id: "core:menu",
+    label: "Menu",
+    order: 1000,
+    fixed: true,
+    render: () =>
+        html`<button
+            class="icon-button"
+            aria-label="Menu"
+            title="Menu"
+            aria-haspopup="dialog"
+            aria-expanded=${store.state.sheet?.type === "menu"}
+            onClick=${() => openSheet({ type: "menu" })}
+        >
+            <${Icon} name="more" />
+        </button>`,
+});
+
 function Topbar() {
-    const { view, server, conversationId } = store.state;
+    const { view, server } = store.state;
     const conversation = view.conversation;
-    const artifacts = view.artifacts?.length ?? 0;
     const cwd = view.agent?.cwd ?? conversation?.cwd;
     const folder = String(cwd ?? "")
         .replace(/\/+$/, "")
         .split("/")
         .pop();
     const branch = headLabel(view.branch) || conversation?.worktree?.branch;
-    const title =
-        conversation?.title ??
-        store.state.sessions.find((session) => session.id === store.state.conversationId)?.title ??
-        "Loading…";
-    const busySubagents = (view.subagents ?? []).filter((agent) => agent.busy).length;
-    // Other sessions waiting for an approval, counted on the way back to them.
-    const waiting = store.state.sessions.filter(
-        (session) =>
-            session.waiting && !session.archived && session.id !== store.state.conversationId,
-    ).length;
+    const { sessions, conversationId } = store.state;
+    // The top bar draws with each update of the conversation, as an answer streams: the session list is looked
+    // through again only when it changes.
+    const { listed, waiting } = useMemo(
+        () => ({
+            listed: sessions.find((session) => session.id === conversationId)?.title,
+            // Other sessions waiting for an approval, counted on the way back to them.
+            waiting: sessions.filter(
+                (session) => session.waiting && !session.archived && session.id !== conversationId,
+            ).length,
+        }),
+        [sessions, conversationId],
+    );
+    const title = conversation?.title ?? listed ?? (store.state.missing ? "Not found" : "Loading…");
     // How far down it reaches: PiP's window on a short wide screen stops below its buttons.
     const edge = useEdge("--topbar-h", (rect) => rect.bottom);
 
-    return html`<header class="topbar" ref=${edge}>
+    return html`<header class="topbar" data-part="topbar" ref=${edge}>
         <button
             class="icon-button badge-host topbar-back"
             aria-label=${waiting > 0 ? `Back to sessions, ${waiting} waiting for you` : "Back to sessions"}
@@ -135,8 +236,8 @@ function Topbar() {
                 disabled=${!conversation}
                 onClick=${() => openSheet({ type: "menu" })}
             ></button>
-            <span class="title-main" aria-hidden="true">${title}</span>
-            <span class="title-sub">
+            <span class="title-main" data-part="topbar-title" aria-hidden="true">${title}</span>
+            <span class="title-sub" data-part="topbar-sub">
                 ${
                     folder &&
                     html`<span
@@ -147,14 +248,13 @@ function Topbar() {
                 }
                 ${
                     conversation?.kind === "subagent"
-                        ? html`<span class="title-folder">
+                        ? html`<span class="title-folder title-parent">
                               subagent of ${conversation.parent?.title ?? "?"}
                           </span>`
                         : html`${
                               folder &&
                               html`<span class="title-folder" aria-hidden="true">${folder}</span>`
                           }
-                          ${branch && html`<span class="faint" aria-hidden="true">·</span>`}
                           ${
                               branch &&
                               (branchAvailable()
@@ -164,52 +264,65 @@ function Topbar() {
                                         title=${view.branch?.detached ? "No branch: switch to one" : "Switch or make a branch"}
                                         onClick=${() => openSheet({ type: "branch" })}
                                     >
-                                        ⎇ ${branch}
+                                        <${Icon} name="fork" size=${10} /><span class="title-branch-name">${branch}</span>
                                     </button>`
                                   : html`<span class="title-branch" title="The git branch">
-                                        ⎇ ${branch}
+                                        <${Icon} name="fork" size=${10} /><span class="title-branch-name">${branch}</span>
                                     </span>`)
+                          }
+                          ${
+                              conversation?.worktree &&
+                              html`<span class="title-worktree" aria-hidden="true">worktree</span>`
                           }`
                 }
             </span>
         </div>
-        ${
-            busySubagents > 0 &&
-            html`<button
-                class="icon-button"
-                aria-label=${`Subagents: ${busySubagents} working`}
-                title="Subagents working"
-                onClick=${openSubagents}
-            >
-                <span class="pulse"></span>
-                <span class="count">${busySubagents}</span>
-            </button>`
-        }
-        <${PeeksButton} />
-        <${FilesButton} />
-        <${BrowserButton} />
-        <button
-            class=${`icon-button badge-host ${artifacts > 0 ? "quiet-phone" : "quiet"}`}
-            aria-label="Artifacts"
-            onClick=${() => openSheet({ type: "artifacts" })}
-        >
-            <${Icon} name="artifact" />
-            ${artifacts > 0 && html`<span class="badge">${artifacts}</span>`}
-        </button>
-        ${filesAvailable() && html`<${ChangesButton} key=${conversationId} />`}
-        <${PeopleButton} />
-        <button
-            class="icon-button"
-            aria-label="Menu"
-            title="More"
-            onClick=${() => openSheet({ type: "menu" })}
-        >
-            <${Icon} name="more" />
-        </button>
+        ${slotItems("topbar").map(({ node }) => node)}
     </header>`;
 }
 
-/** Notices, Omarchy's notification style: each slides in, counts down, and slides out when it goes. */
+/**
+ * A notice, as a small tile: a state square in its level's color, the message, and a countdown line until it goes. A
+ * tap dismisses it, or does what it offers (a chevron says so); on a phone, a swipe up puts it away.
+ */
+function Notice({ notice, leaving }) {
+    const ref = useRef(null);
+    const [pointed, setPointed] = useState(false);
+    const [focused, setFocused] = useState(false);
+    const held = (pointed || focused) && !leaving;
+
+    // Its countdown, and the line that shows it, wait while it is being read or reached for.
+    useEffect(() => holdNotice(notice.id, held), [held]);
+
+    useDragToClose(ref, {
+        dir: "up",
+        onClose: () => dismiss(notice.id),
+        enabled: BOTTOM_SHEETS.matches,
+        // It fades as it goes, not the stack behind it.
+        scrim: ref,
+    });
+
+    return html`<button
+        ref=${ref}
+        class=${`notice ${notice.level} ${notice.action ? "acts" : ""} ${held ? "held" : ""} ${leaving ? "leaving" : ""}`}
+        data-part="notice"
+        style=${`--life:${notice.life ?? 4500}ms`}
+        onPointerEnter=${() => setPointed(true)}
+        onPointerLeave=${() => setPointed(false)}
+        onFocus=${() => setFocused(true)}
+        onBlur=${() => setFocused(false)}
+        onClick=${() => {
+            dismiss(notice.id);
+            notice.action?.();
+        }}
+    >
+        <span class="notice-mark" aria-hidden="true"></span>
+        <span class="notice-text">${notice.message}</span>
+        <${Icon} name=${notice.action ? "chevron" : "close"} size=${14} />
+    </button>`;
+}
+
+/** Notices: each slides in, counts down, and slides out when it goes. */
 function Notices() {
     const { notices } = store.state;
     const [gone, setGone] = useState([]);
@@ -241,32 +354,54 @@ function Notices() {
         return null;
     }
 
-    return html`<div class="notices" role="status" aria-live="polite">
-        ${all.map((notice) => {
-            const leaving = !notices.includes(notice);
-
-            return html`<button
-                key=${notice.id}
-                class=${`notice ${notice.level} ${leaving ? "leaving" : ""}`}
-                style=${`--life:${notice.level === "error" ? 9 : 4.5}s`}
-                onClick=${() => {
-                    dismiss(notice.id);
-                    notice.action?.();
-                }}
-            >
-                ${notice.message}
-            </button>`;
-        })}
+    return html`<div class="notices" data-part="notices" role="status" aria-live="polite">
+        ${all.map(
+            (notice) =>
+                html`<${Notice}
+                    key=${notice.id}
+                    notice=${notice}
+                    leaving=${!notices.includes(notice)}
+                />`,
+        )}
     </div>`;
 }
 
 /** The launcher, kept on screen a moment after it closes so it can fade out. */
 function LauncherHost() {
-    const [open, leaving] = usePresence(store.state.launcher || null, 150);
+    const [opening, setOpening] = useState({ n: 0, returnTo: document.activeElement });
+    const wasOpen = useRef(Boolean(store.state.launcher));
+
+    // Observe logical openings before batched renders: even a close/reopen in one task gets a fresh launcher.
+    // Issue #62, reported by @arunsathiya: a retained, inert launcher must not reopen without its input focused.
+    useLayoutEffect(
+        () =>
+            store.subscribe((state) => {
+                const next = Boolean(state.launcher);
+
+                if (next && !wasOpen.current) {
+                    const target = document.activeElement;
+
+                    setOpening((previous) => ({
+                        n: previous.n + 1,
+                        returnTo:
+                            target === document.body || target?.closest(".launcher-overlay")
+                                ? previous.returnTo
+                                : target,
+                    }));
+                }
+
+                wasOpen.current = next;
+            }),
+        [],
+    );
+
+    const [open, leaving] = usePresence(store.state.launcher ? opening : null, 150);
 
     useBack(Boolean(store.state.launcher), () => store.set({ launcher: false }));
 
-    return open ? html`<${Launcher} leaving=${leaving} />` : null;
+    return open
+        ? html`<${Launcher} key=${open.n} leaving=${leaving} returnTo=${open.returnTo} />`
+        : null;
 }
 
 /**
@@ -289,6 +424,41 @@ function PeopleHost({ shown, replaced }) {
  */
 function PanelHost({ shown, panel }) {
     const [kept, leaving] = usePresence(shown || null, 240);
+    const covering = shown && !panelsBeside();
+
+    // Over the conversation, keys go to the panel (a dialog then, with Tab kept in it), unless something in it already
+    // took them; when it goes, they go back to what had them before, unless something else took them meanwhile.
+    useLayoutEffect(() => {
+        if (!covering) {
+            return undefined;
+        }
+
+        const opener = document.activeElement;
+        const box = document.querySelector(
+            ".layout > :is(.files-tile, .browser, .ext-panel):not(.leaving)",
+        );
+
+        if (box && !box.contains(opener)) {
+            box.focus({ preventScroll: true });
+        }
+
+        return () => {
+            const active = document.activeElement;
+
+            // Not into a text field on touch screens, where its keyboard would pop up.
+            if (
+                (active === null || active === document.body || box?.contains(active)) &&
+                opener?.isConnected &&
+                !box?.contains(opener) &&
+                !(
+                    matchMedia("(pointer: coarse)").matches &&
+                    opener.matches("input, textarea, [contenteditable]")
+                )
+            ) {
+                opener.focus({ preventScroll: true });
+            }
+        };
+    }, [covering]);
 
     if (kept === null || (leaving && panelsBeside())) {
         return null;
@@ -319,37 +489,50 @@ function App() {
 
     const inConversation = state.conversationId !== null;
     const rail = prefs().sidebar === "rail";
-    // The subagents board takes the conversation's place, and the panels beside it give it their room.
-    // The router editor takes the same place.
+    // The sidebar and the splash show only on wide screens (style.css): narrower, they are not drawn at all. A phone
+    // drew the sidebar's session list beside its own, hidden, on each change and each Back.
+    const sidebar = WIDE.matches;
+    // The subagents board, the router editor, or an extension's page takes the conversation's place, and the panels
+    // beside it give it their room.
     const board = state.board || state.routersOpen;
+    const page = !board && state.page !== null;
+    const placed = board || page;
     const browsing =
-        inConversation && !board && state.browserOpen && browserAvailable() && !state.missing;
-    const filing = !board && filesShown(state);
-    const people = !board && !browsing && !filing && peopleDocked(state);
-    const peeking = !board && peeksWanted(state);
+        inConversation && !placed && state.browserOpen && browserAvailable() && !state.missing;
+    const filing = !placed && filesShown(state);
+    // An extension's panel, in the same place: one panel at a time, so opening one closes the others.
+    const paneling = !placed && !browsing && !filing && extPanelShown(state);
+    const people = !placed && !browsing && !filing && !paneling && peopleDocked(state);
+    const peeking = !placed && peeksWanted(state);
     const tiles = peeking ? peekTiles(state) : [];
     // The column takes the place beside the conversation when Browser and People leave it free; otherwise a strip,
     // which only shows when there are tiles.
-    const peekColumn = peeking && PEEK_WIDE.matches && !browsing && !filing && !people;
+    const peekColumn = peeking && PEEK_WIDE.matches && !browsing && !filing && !paneling && !people;
 
     return html`<div
-        class=${`layout ${inConversation || board ? "" : "home"} ${browsing ? "browsing" : ""} ${filing ? "filing" : ""}`}
+        class=${`layout ${inConversation || placed ? "" : "home"} ${browsing ? "browsing" : ""} ${filing ? "filing" : ""} ${paneling ? "paneling" : ""}`}
+        data-part="app"
     >
-        <aside class="sidebar window">
-            <div class="sidebar-clip">
-                <${RailNav} foldable=${true} folded=${rail} />
-                ${!rail && html`<${SessionList} />`}
-            </div>
-            ${!rail && html`<${ResizeHandle} />`}
+        <aside class="sidebar window" data-part="sidebar">
+            ${
+                sidebar &&
+                html`<div class="sidebar-clip">
+                        <${RailNav} foldable=${true} folded=${rail} />
+                        ${!rail && html`<${SessionList} />`}
+                    </div>
+                    ${!rail && html`<${ResizeHandle} />`}`
+            }
         </aside>
-        <div class=${`pane window ${board ? "boarded" : ""}`}>
+        <div class=${`pane window ${placed ? "boarded" : ""}`} data-part="pane">
             ${
                 state.routersOpen
                     ? html`<${RouterEditor} />`
                     : board
                       ? html`<${SubagentsBoard} />`
-                      : inConversation
-                        ? html`<${Topbar} />
+                      : page
+                        ? html`<${ExtensionPage} key=${`${state.page.module}:${state.page.id}`} />`
+                        : inConversation
+                          ? html`<${Topbar} />
                     ${
                         peeking &&
                         tiles.length > 0 &&
@@ -362,11 +545,11 @@ function App() {
                         !state.missing &&
                         html`<${Composer} key=${state.conversationId} />`
                     }`
-                        : html`<div class="home-list">
+                          : html`<div class="home-list" data-part="home-list">
                           <${RailNav} />
                           <${SessionList} />
                       </div>
-                      <${Splash} />`
+                      ${sidebar && html`<${Splash} />`}`
             }
         </div>
         ${
@@ -374,7 +557,7 @@ function App() {
             html`<${PeekHost}
                 shown=${peekColumn}
                 tiles=${tiles}
-                replaced=${browsing || filing || people}
+                replaced=${browsing || filing || paneling || people}
             />`
         }
         <${PanelHost}
@@ -383,7 +566,15 @@ function App() {
             panel=${BrowserPanel}
         />
         <${PanelHost} key=${`files:${state.conversationId}`} shown=${filing} panel=${FilesPanel} />
-        ${inConversation && html`<${PeopleHost} shown=${people} replaced=${browsing || filing} />`}
+        <${PanelHost}
+            key=${`ext:${state.conversationId}`}
+            shown=${paneling}
+            panel=${ExtensionPanel}
+        />
+        ${
+            inConversation &&
+            html`<${PeopleHost} shown=${people} replaced=${browsing || filing || paneling} />`
+        }
         <${Drawer} />
         <${PipHost} />
         <${Sheets} />
@@ -406,16 +597,25 @@ function focusWindow(event) {
         return;
     }
 
+    // By the window's part name, as themes know it: `sidebar`, `peeks`, `people-panel`, `browser-panel`, `files-panel`,
+    // `extension-panel`.
     const name =
-        ["sidebar", "browser", "files-tile", "people", "peeks"].find((each) =>
-            win.classList.contains(each),
-        ) ?? "pane";
+        [
+            "sidebar",
+            "peeks",
+            "people-panel",
+            "browser-panel",
+            "files-panel",
+            "extension-panel",
+        ].find((each) => win.matches(`[data-part~="${each}"]`)) ?? "pane";
 
     if (document.documentElement.dataset.focus !== name) {
         document.documentElement.dataset.focus = name;
     }
 }
 
+// The conversation's window has the focus until another takes it: `data-focus` always names one, for themes too.
+document.documentElement.dataset.focus ??= "pane";
 document.addEventListener("pointerover", focusWindow, true);
 document.addEventListener("pointerdown", focusWindow, true);
 document.addEventListener("focusin", focusWindow, true);
@@ -423,7 +623,7 @@ document.addEventListener("focusin", focusWindow, true);
 const typingIn = (target) =>
     target instanceof HTMLElement &&
     (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
-const wide = () => matchMedia("(min-width: 960px)").matches;
+const wide = () => WIDE.matches;
 
 /** Go to the session `by` places away in workspace order, wrapping around. */
 function step(by) {
@@ -454,7 +654,7 @@ addEventListener("keydown", (event) => {
     const mod = APPLE ? event.metaKey && !event.ctrlKey : event.ctrlKey && !event.metaKey;
     const key = event.key.toLowerCase();
 
-    if (!store.state.me) {
+    if (event.defaultPrevented || !store.state.me) {
         return;
     }
 
@@ -473,7 +673,8 @@ addEventListener("keydown", (event) => {
         key === "f" &&
         store.state.view.conversation &&
         !store.state.launcher &&
-        !store.state.board
+        !store.state.board &&
+        !store.state.page
     ) {
         event.preventDefault();
         openSheet({ type: "find" });
@@ -533,11 +734,20 @@ addEventListener("keydown", (event) => {
             return;
         }
 
-        // The panels are not beside the subagents board.
+        if (event.code === "KeyT") {
+            event.preventDefault();
+            setPrefs({ showThinking: !prefs().showThinking });
+            notify("info", `Show thinking: ${prefs().showThinking ? "on" : "off"}.`);
+
+            return;
+        }
+
+        // The panels are not beside the subagents board, nor an extension's page.
         if (
             event.code === "KeyB" &&
             store.state.conversationId !== null &&
             !store.state.board &&
+            !store.state.page &&
             browserAvailable()
         ) {
             event.preventDefault();
@@ -546,7 +756,7 @@ addEventListener("keydown", (event) => {
             return;
         }
 
-        if (event.code === "KeyE" && !store.state.board && filesAvailable()) {
+        if (event.code === "KeyE" && !store.state.board && !store.state.page && filesAvailable()) {
             event.preventDefault();
             toggleFiles();
 
@@ -588,6 +798,30 @@ addEventListener("keydown", (event) => {
         return;
     }
 
+    // Esc closes the Files tile or the Browser panel where it covers the conversation, as back does. What is inside
+    // takes it first: a file open over the tree, the page in the panel, a field.
+    const cover =
+        event.key === "Escape" &&
+        !event.defaultPrevented &&
+        !store.state.sheet &&
+        !store.state.launcher &&
+        !store.state.drawer &&
+        document.querySelector(
+            '.layout > [aria-modal="true"]:is(.files-tile, .browser):not(.leaving)',
+        );
+
+    if (cover) {
+        event.preventDefault();
+
+        if (cover.classList.contains("files-tile")) {
+            setFilesOpen(false);
+        } else {
+            setBrowserOpen(false);
+        }
+
+        return;
+    }
+
     if (event.key === "Escape" && !event.defaultPrevented) {
         stopOnSecondEscape();
     }
@@ -607,26 +841,33 @@ addEventListener("keydown", (event) => {
 });
 /** When Esc was last pressed while Pi worked: a second press soon after stops it. */
 let escapedAt = 0;
+/** The notice the first press shows. */
+let escapeNotice = null;
 const ESCAPE_TWICE_MS = 1500;
 
 /** Esc twice stops Pi, as Esc does in other agents' terminals. Twice, since Esc also closes things and leaves fields. */
 function stopOnSecondEscape() {
-    const { view, sheet, launcher, board } = store.state;
+    const { view, sheet, launcher, board, page, drawer } = store.state;
 
     // Esc closes these first.
-    if (sheet || launcher || board || !view.live?.busy || !canSteer()) {
+    if (sheet || launcher || board || page || drawer || !view.live?.busy || !canSteer()) {
         return;
     }
 
     if (Date.now() - escapedAt < ESCAPE_TWICE_MS) {
         escapedAt = 0;
+        // Pressed again: what it asked for is done.
+        dismiss(escapeNotice);
         attempt(actions.abort);
 
         return;
     }
 
     escapedAt = Date.now();
-    notify("info", "Press Esc again to stop Pi.");
+    const notice = (escapeNotice = notify("info", "Press Esc again to stop Pi."));
+
+    // Up only while a second press stops Pi.
+    setTimeout(() => dismiss(notice), ESCAPE_TWICE_MS);
 }
 
 const altUp = () => delete document.documentElement.dataset.alt;
@@ -645,7 +886,8 @@ startEdgeBack();
 startSwipes((where) => {
     const { conversationId, view, missing } = store.state;
 
-    // The subagents board in the conversation's place (or the home screen's): right goes back, as its × does.
+    // The subagents board or an extension's page in the conversation's place (or the home screen's): right goes back,
+    // as its × does.
     if (where === "board") {
         return { right: { path: iconPath("back"), label: "Back", run: goBack } };
     }

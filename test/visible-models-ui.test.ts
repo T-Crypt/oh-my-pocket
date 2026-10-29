@@ -132,14 +132,19 @@ const panelButton = (provider: string, label: string) =>
 async function menu(): Promise<string[]> {
     await tap(`document.querySelector(".composer-row .model-chip")`, "the model chip");
     await see(
-        `return JSON.stringify(document.querySelector(".pop-menu-list") !== null)`,
-        "the model menu",
+        `return JSON.stringify(document.querySelectorAll(".pop-menu-list .pop-menu-row:not(.router-row)").length > 0)`,
+        "the model menu and its models",
     );
     const rows = await inPage<string[]>(
         `return JSON.stringify([...document.querySelectorAll(".pop-menu-list .pop-menu-row:not(.router-row)")].map((row) => row.title.split(" · ")[0]))`,
     );
 
-    await tap(`document.querySelector(".pop-overlay")`, "the menu's backdrop");
+    // The backdrop closes on the press itself (`scrimPress`), as a mouse does it.
+    await inPage(`
+        const scrim = document.querySelector(".pop-overlay");
+        scrim?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 }));
+        return "null";
+    `);
     await see(gone(".pop-menu-list"), "the model menu closed");
 
     return rows;

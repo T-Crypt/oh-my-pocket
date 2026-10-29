@@ -7,7 +7,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
-import type { Context } from "@earendil-works/chord";
+import { type Context, copyJson } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
     clampThinkingLevel,
@@ -18,16 +18,21 @@ import {
 import { resizeImage } from "@earendil-works/pi-coding-agent";
 import {
     type AgentChange,
+    AgentDoc,
     type ConversationCreateOptions,
     type ConversationId,
     defineTask,
     type EntryId,
+    type InputEntry,
+    InboxDoc,
     LiveDoc,
     type ModelRef,
     type SettledSubmissionRecord,
     type SubmissionId,
     type Task,
+    type TaskId,
     type TaskRuntime,
+    type UserInput,
 } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
@@ -45,16 +50,32 @@ import {
     type SubagentRecord,
     SubagentsDoc,
 } from "./docs.ts";
-import { ATTACHMENTS_HEADING, FILE_BLOCK, FROM_PREFIX, NOTE_ENTRY } from "./entry-format.ts";
+import {
+    ATTACHMENTS_HEADING,
+    FILE_BLOCK,
+    FROM_PREFIX,
+    NOTE_ENTRY,
+    splitAttachments,
+} from "./entry-format.ts";
 import { describe, HttpError, optionalText } from "./errors.ts";
 import { homePath } from "./paths.ts";
 import { mentionedPaths, viewFile } from "./files.ts";
 import { isThinkingLevel, THINKING_LEVELS } from "./models.ts";
 import { writePiSession } from "./pi-sessions.ts";
 import { snippet } from "./projection.ts";
+import { globalModelSettings, projectModelDefault } from "./project-model.ts";
 import { expandPromptTemplate, expandSkillCommand, unwrapSkill } from "./prompts.ts";
 import { clientKey, ownRequest, requestFor } from "./requests.ts";
-import { type Resend, resendContent, resendRequest, ResendTask, userContent } from "./resend.ts";
+import {
+    type Interrupt,
+    interruptTask,
+    type Requeue,
+    type Resend,
+    resendContent,
+    resendRequest,
+    ResendTask,
+    userContent,
+} from "./resend.ts";
 import { SUBAGENT_MODES, type SubagentMode } from "./subagent-policy.ts";
 import { whyUnanswered } from "./subagent-runs.ts";
 import { wantsTitle, writeTitle } from "./titles.ts";
@@ -75,8 +96,11 @@ export type Attachment = { path: string; name: string; mime: string; size: numbe
 export interface SubmitRequest {
     text: string;
     attachments?: Attachment[];
-    /** `steer` joins the running work after its current tool round; anything else queues a follow-up while busy. */
-    mode?: "steer" | "followUp";
+    /**
+     * `steer` joins the running work after its current tool round; `interrupt` stops the run at once (as Stop does) and
+     * sends the message to the idle conversation; anything else queues a follow-up while busy.
+     */
+    mode?: "steer" | "followUp" | "interrupt";
     /** Client-generated, so a retried POST does not submit twice. */
     requestId: string;
     /** Send the files the message mentions with `@` along with it, so Pi need not read them first. */
@@ -296,9 +320,23 @@ export class Commands {
      * says who dealt with the failure. A message left in the queue by a run that failed ends it, settling nothing.
      */
     readonly followTask: Task<Followed, { phase: "wait" }, null, object>;
+    /** A queued message moved to Interrupt (`moveQueued`): it stops the run it was made for, by that run's id. */
+    readonly interruptTask: Task<Interrupt, { phase: "send" }, null, object>;
 
     constructor(app: PocketApp) {
         this.#app = app;
+        this.interruptTask = interruptTask(async (run, context) => {
+            const harness = this.#app.harness;
+            const task = run as unknown as TaskId;
+            const record = await harness.getTask(task, context);
+
+            if (record === undefined || record.state.status === "terminal") {
+                return;
+            }
+
+            await harness.abortTask(task, context);
+            await harness.waitForTask(task, context);
+        });
         this.followTask = defineTask<Followed, { phase: "wait" }, null>({
             name: "pocket.follow-failure",
             version: 1,
@@ -345,6 +383,7 @@ export class Commands {
     async createSession(
         user: User,
         request: { cwd?: string; title?: string; worktree?: unknown },
+        { projectDefaults = true }: { projectDefaults?: boolean } = {},
     ): Promise<{ id: ConversationId }> {
         const app = this.#app;
 
@@ -359,7 +398,6 @@ export class Commands {
         const folder = app.workspace.checkDirectory(
             optionalText(request.cwd, "cwd") ?? app.defaultCwd,
         );
-        const initial = this.#defaultModel();
         const now = Date.now();
 
         return this.#inPlace(
@@ -367,6 +405,8 @@ export class Commands {
             request.worktree === true,
             title ?? basename(folder),
             async ({ cwd, worktree }) => {
+                // An internal caller about to apply a person's explicit model keeps its previous starting pair.
+                const initial = this.#defaultModel(undefined, projectDefaults ? cwd : undefined);
                 const conversation = await app.harness.createConversation(
                     {
                         ownership: { kind: "ownerless" },
@@ -554,13 +594,17 @@ export class Commands {
      * The model a new session starts with, always one a person chose: `prefer` (with its thinking level) when it is
      * signed in here, or else the owner's default, even when it is not signed in now: the session then shows that, and
      * its first message fails in sight, where another model would spend on what nobody chose for it. Without an owner's
-     * default, the one last picked, or Pi's default, when signed in. Never the first model there is: with none of
-     * these, the session starts without a model, and someone picks one.
+     * default, ordinary sessions consult trusted project defaults in their final cwd, then the last picked model,
+     * then Pi's global default. A no-cwd caller (imports and PiP itself) keeps the legacy default selection. Never
+     * the first model there is: with none chosen, the session starts without a model, and someone picks one.
      */
-    #defaultModel(prefer?: {
-        model: { provider: string; modelId: string } | null;
-        thinkingLevel: string;
-    }): {
+    #defaultModel(
+        prefer?: {
+            model: { provider: string; modelId: string } | null;
+            thinkingLevel: string;
+        },
+        cwd?: string,
+    ): {
         model?: ModelRef;
         thinkingLevel?: ModelThinkingLevel;
     } {
@@ -575,12 +619,27 @@ export class Commands {
         const chosen = config.defaultModel;
         const owners =
             chosen === undefined ? undefined : models.getModel(chosen.provider, chosen.modelId);
-        const lastPicked = chosen === undefined ? pick(last?.provider, last?.modelId) : undefined;
-        const pis =
-            chosen === undefined && lastPicked === undefined
-                ? pick(settings.getDefaultProvider(), settings.getDefaultModel())
+        const defaults =
+            chosen === undefined && cwd !== undefined ? globalModelSettings(cwd) : settings;
+        const project =
+            chosen === undefined && cwd !== undefined
+                ? projectModelDefault(cwd, defaults, models)
                 : undefined;
-        const model = preferred ?? owners ?? lastPicked ?? pis;
+        const lastPicked =
+            chosen === undefined && project === undefined
+                ? pick(last?.provider, last?.modelId)
+                : undefined;
+        // Ordinary sessions must not inherit a different project's settings from the server's starting folder.
+        // Imported sessions and PiP's own conversation keep their existing selection behavior.
+        const global = cwd === undefined ? undefined : defaults.getGlobalSettings();
+        const pis =
+            chosen === undefined && project === undefined && lastPicked === undefined
+                ? pick(
+                      cwd === undefined ? settings.getDefaultProvider() : global?.defaultProvider,
+                      cwd === undefined ? settings.getDefaultModel() : global?.defaultModel,
+                  )
+                : undefined;
+        const model = preferred ?? owners ?? project?.model ?? lastPicked ?? pis;
 
         if (model === undefined) {
             return {};
@@ -590,9 +649,13 @@ export class Commands {
             ? prefer?.thinkingLevel
             : owners !== undefined
               ? chosen?.thinkingLevel
-              : lastPicked !== undefined
-                ? last?.thinkingLevel
-                : settings.getDefaultThinkingLevel()) ?? "off") as ModelThinkingLevel;
+              : project !== undefined
+                ? project.thinkingLevel
+                : lastPicked !== undefined
+                  ? last?.thinkingLevel
+                  : cwd === undefined
+                    ? settings.getDefaultThinkingLevel()
+                    : global?.defaultThinkingLevel) ?? "off") as ModelThinkingLevel;
 
         return {
             model: { provider: model.provider, modelId: model.id },
@@ -661,6 +724,10 @@ export class Commands {
         user: User,
         request: SubmitRequest,
         via?: string,
+        admission?: {
+            beforeSubmit(): Promise<{ user: User; context: Context }>;
+            afterSubmit(): void;
+        },
     ): Promise<{ submissionId: SubmissionId; requestId: string }> {
         const app = this.#app;
 
@@ -676,11 +743,13 @@ export class Commands {
         const conversation = await app.conversation(id);
         const typed = request.text.trim();
         // `/skill:name request` sends the skill with the request; `/name arguments`, Pi's prompt template of that name.
-        const text = typed.startsWith("/skill:")
+        const expanded = typed.startsWith("/skill:")
             ? (expandSkillCommand(typed, app.skillCommands(id)) ?? typed)
             : typed.startsWith("/")
               ? (expandPromptTemplate(typed, app.promptTemplates(id)) ?? typed)
               : typed;
+        // A value an extension hides (`host.hide`), pasted into the message, is never stored nor sent to the model.
+        const text = app.hidden.replace(expanded, id);
         const attachments = request.attachments ?? [];
 
         if (text === "" && attachments.length === 0) {
@@ -703,8 +772,9 @@ export class Commands {
             (file) =>
                 `- ${file.path} (${file.name}, ${file.mime || "unknown type"}, ${file.size} bytes)`,
         );
+        // The heading whole, with files alone too: what reads the message splits it there.
         const written =
-            lines.length === 0 ? text : `${text}${ATTACHMENTS_HEADING}${lines.join("\n")}`.trim();
+            lines.length === 0 ? text : `${text}${ATTACHMENTS_HEADING}${lines.join("\n")}`;
         const body = this.messageText(
             user,
             via === undefined ? written : `[via ${via}] ${written}`,
@@ -713,7 +783,13 @@ export class Commands {
             request.inlineFiles === true
                 ? await this.#mentionedFiles(id, user, typed, model.input.includes("image"))
                 : [];
-        const parts: (TextContent | ImageContent)[] = [{ type: "text", text: body }, ...mentioned];
+        // A file's text that a message brings along hides what extensions hide (`host.hide`), as the message does.
+        const parts: (TextContent | ImageContent)[] = [
+            { type: "text", text: body },
+            ...mentioned.map((part) =>
+                part.type === "text" ? { ...part, text: app.hidden.replace(part.text, id) } : part,
+            ),
+        ];
 
         for (const file of attachments) {
             if (
@@ -738,25 +814,103 @@ export class Commands {
                 : requestFor(user.id, clientKey(request.requestId));
         // A failed subagent's failure as the person writes to it: what their message comes to settles it.
         const failure = await this.#failureOf(id);
-        const submission = await conversation.submit(
-            {
-                type: "input",
-                content,
-                whenBusy: request.mode === "steer" ? "steer" : "followUp",
-                requestId,
-            },
-            context,
-        );
+
+        let submitContext = context;
+
+        // Human extension starts acquire a short policy lease after preparation. Its context checks policy again
+        // when durable admission reaches the mutation line, not just before it joins the queue.
+        if (admission !== undefined) {
+            const accepted = await admission.beforeSubmit();
+
+            user = accepted.user;
+            submitContext = accepted.context;
+            submitContext.abortSignal?.throwIfAborted();
+        }
+
+        // Interrupt: stop the run now, rather than waiting for its tool round or turn to end. Like Stop, this withdraws
+        // what waits in the queue. Only a person's own message interrupts, never one sent for them (`via`).
+        // A retried request finds its first submission: it must not stop the run that the first one started. (Two POSTs
+        // of one request at the same moment can both find none and both stop the run: a rare race, left as it is.)
+        if (
+            request.mode === "interrupt" &&
+            via === undefined &&
+            app.isBusy(id) &&
+            (await app.harness.commit((tx) => tx.submissionByRequest(id, requestId), context)) ===
+                undefined
+        ) {
+            await this.#discardReports(id);
+            await conversation.abort(context);
+            await app.collab.activity(id, user, "interrupted the run");
+        }
+
+        // A retry of a request finds its first submission: it is no new message, and no event goes out for it again.
+        const known =
+            app.pip.ownerOf(id) === undefined &&
+            (await app.harness.commit((tx) => tx.submissionByRequest(id, requestId), context)) !==
+                undefined;
+        const submission = await conversation
+            .submit(
+                {
+                    type: "input",
+                    content,
+                    whenBusy: request.mode === "steer" ? "steer" : "followUp",
+                    requestId,
+                },
+                submitContext,
+            )
+            .finally(() => admission?.afterSubmit());
 
         app.collab.setTyping(id, user, null);
-        await this.#touched(id, typed, text === typed ? undefined : text);
+        // The title comes from the message as it was stored: without hidden values.
+        const titled = app.hidden.replace(typed, id);
+
+        await this.#touched(id, titled, text === titled ? undefined : text);
+
+        // A person's own words: linked sessions may message each other again (`linked-sessions.ts`).
+        if (via === undefined) {
+            await app.linkedSessions.personWrote(id);
+        }
+
         this.#reportUnanswered(id, submission.wait(context));
 
         if (failure !== undefined) {
             await this.#followFailure(id, user, failure, requestId);
         }
 
+        // For extensions (`host.on`): once for each message (two retries at once, too), never for PiP's conversation,
+        // which is its person's alone.
+        if (app.pip.ownerOf(id) === undefined && !known && this.#announce(submission.id)) {
+            app.events.emit("message.sent", {
+                conversationId: Number(id),
+                by: user.id,
+                submissionId: String(submission.id),
+                text,
+                ...(via === undefined ? {} : { via }),
+            });
+        }
+
         return { submissionId: submission.id, requestId };
+    }
+
+    /** Submissions `message.sent` went out for lately: a retry that raced its first try finds its id here. */
+    readonly #announced = new Set<string>();
+
+    /** Whether to send `message.sent` for a submission: once only, as far as this process knows. */
+    #announce(submissionId: unknown): boolean {
+        const key = String(submissionId);
+
+        if (this.#announced.has(key)) {
+            return false;
+        }
+
+        this.#announced.add(key);
+
+        // The newest few hundred are enough: a retry comes within seconds.
+        if (this.#announced.size > 500) {
+            this.#announced.delete(this.#announced.values().next().value!);
+        }
+
+        return true;
     }
 
     /** When a subagent (`id`, its conversation) failed, if it is failed now (not stopped); undefined otherwise. */
@@ -1041,6 +1195,32 @@ export class Commands {
         );
     }
 
+    /**
+     * Send the request of a run that waits for a provider's limit now, rather than at its time (`limit-gate.ts`): of
+     * this conversation, or of its subagents. The request goes whether or not the limit has cleared: the provider
+     * rejects it at no cost, or answers. Who may see and steer the session may. False: nothing there waits.
+     */
+    async retryLimit(id: ConversationId, user: User): Promise<boolean> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+
+        let sent = app.limits.retryNow(Number(id));
+
+        for (const wait of app.limits.waits()) {
+            if (app.rootOf(wait.conversationId as unknown as ConversationId) === id) {
+                sent = app.limits.retryNow(wait.conversationId) || sent;
+            }
+        }
+
+        if (sent) {
+            await app.collab.activity(id, user, "tried again without waiting for the limit");
+        }
+
+        return sent;
+    }
+
     /** Stop the run. Anyone who can steer may, even while someone else drives: stopping is the safe direction. */
     async abort(id: ConversationId, user: User): Promise<void> {
         const app = this.#app;
@@ -1093,7 +1273,7 @@ export class Commands {
 
         app.requireSee(user, id);
         app.requireSteer(user);
-        const by = app.attribution.knownSubmitter(submissionId);
+        const by = await app.attribution.submitter(submissionId);
 
         if (by !== user.id) {
             await app.requireDriver(id, user);
@@ -1115,6 +1295,169 @@ export class Commands {
         return result;
     }
 
+    /**
+     * Move a queued message to Steer or Queue, or send it now as an Interrupt. Only its sender may, as with taking it
+     * back (`withdraw`): who else may move someone's message is left to the maintainers. Interrupt stops the run like
+     * the composer's Interrupt, but only this message goes now: the others in the queue, from everyone, stay queued
+     * in their order, with their senders and modes (Stop withdraws them; the stop here would, so the task queues them
+     * again). Subagents' reports it withdraws wait again for the courier. The message leaves the queue, and the others
+     * are noted in the task, in one commit.
+     */
+    async moveQueued(
+        id: ConversationId,
+        user: User,
+        submissionId: number,
+        mode: string,
+    ): Promise<void> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+
+        if (!Number.isInteger(submissionId) || submissionId <= 0) {
+            throw new HttpError(400, "Say which queued message to move.");
+        }
+
+        if (mode !== "steer" && mode !== "followUp" && mode !== "interrupt") {
+            throw new HttpError(400, "Move a message to steer, followUp, or interrupt.");
+        }
+
+        // Its sender moves it, as with taking it back: after a restart this process may not know the sender yet.
+        if ((await app.attribution.submitter(submissionId)) !== user.id) {
+            throw new HttpError(403, "Only its sender can move a queued message.");
+        }
+
+        // To the queue, it only waits longer. To Steer or Interrupt, it acts on the run now: that is the driver's turn,
+        // as sending is.
+        if (mode !== "followUp") {
+            await app.requireDriver(id, user);
+        }
+
+        // Request ids of the queued messages, from Pi Durable's records: a commit cannot read a submission by its id.
+        const requests = new Map<number, string | undefined>();
+        let moved: boolean | "again" = "again";
+
+        for (let attempt = 0; moved === "again"; attempt++) {
+            if (mode === "interrupt") {
+                const queued = (await app.harness.snapshot(InboxDoc, id, context))?.items ?? [];
+
+                for (const item of queued) {
+                    if (item.mode !== "write" && !requests.has(Number(item.id))) {
+                        const record = await (
+                            await app.harness.submission(item.id, context)
+                        )?.status(context);
+
+                        requests.set(Number(item.id), record?.requestId);
+                    }
+                }
+            }
+
+            moved = await app.harness.commit(async (tx) => {
+                const items = (await tx.doc(InboxDoc, id)).items;
+                const index = items.findIndex((entry) => Number(entry.id) === submissionId);
+                const item = items[index];
+
+                if (item === undefined || item.mode === "write") {
+                    return false;
+                }
+
+                if (mode !== "interrupt") {
+                    item.mode = mode;
+
+                    return true;
+                }
+
+                // Every table read comes before the commit's first table write.
+                const subagents = await tx.doc(SubagentsDoc, id);
+                const batch =
+                    subagents.sending === undefined
+                        ? undefined
+                        : await tx.submissionByRequest(id, subagents.sending.request);
+                const live = await tx.doc(LiveDoc, id);
+                const others: Requeue[] = [];
+                const stay: number[] = [];
+
+                for (const other of items) {
+                    // Writes stay in the queue by themselves; the reports go back to their courier when withdrawn.
+                    if (
+                        Number(other.id) === submissionId ||
+                        other.mode === "write" ||
+                        other.id === batch?.id
+                    ) {
+                        continue;
+                    }
+
+                    if (!requests.has(Number(other.id))) {
+                        // Queued since the requests were read.
+                        if (attempt >= 3) {
+                            throw new HttpError(409, "The queue is changing; try again.");
+                        }
+
+                        return "again";
+                    }
+
+                    const first = requests.get(Number(other.id));
+
+                    stay.push(Number(other.id));
+                    others.push({
+                        content: copyJson(other.content) as UserInput,
+                        mode: other.mode,
+                        // The person is in the request id: the new one keeps it, for who wrote it and whose work it is.
+                        requestId:
+                            first === undefined
+                                ? `interrupt-${submissionId}-${others.length}`
+                                : `${first.replace(/(~\d+)+$/, "")}~${submissionId}`,
+                        ...(other.entry === undefined
+                            ? {}
+                            : { entry: copyJson(other.entry) as InputEntry }),
+                    });
+                }
+
+                const content = copyJson(item.content) as UserInput;
+                const run = live.run === undefined ? undefined : Number(live.run.taskId);
+
+                // Taken out of the queue here, so the stop's withdrawal cannot reach them: the task puts them back.
+                for (let at = items.length - 1; at >= 0; at--) {
+                    const queued = Number(items[at]!.id);
+
+                    if (queued === submissionId || stay.includes(queued)) {
+                        items.splice(at, 1);
+                    }
+                }
+
+                tx.settleSubmission(item.id, { status: "unanswered", reason: "aborted" });
+
+                for (const taken of stay) {
+                    tx.settleSubmission(taken as unknown as SubmissionId, {
+                        status: "unanswered",
+                        reason: "aborted",
+                    });
+                }
+
+                await tx.createTask(
+                    this.interruptTask,
+                    {
+                        content,
+                        requestId: ownRequest(user.id, `interrupt-${submissionId}`),
+                        ...(run === undefined ? {} : { run }),
+                        others,
+                    },
+                    { ownership: { kind: "conversation" }, background: true, conversationId: id },
+                );
+
+                return true;
+            }, context);
+        }
+
+        if (!moved) {
+            throw new HttpError(409, "That message has already gone to Pi.");
+        }
+
+        if (mode === "interrupt") {
+            await app.collab.activity(id, user, "interrupted the run");
+        }
+    }
+
     async configure(
         id: ConversationId,
         user: User,
@@ -1122,12 +1465,18 @@ export class Commands {
             model?: { provider: string; modelId: string };
             thinkingLevel?: string;
             cwd?: string;
+            pipPanel?: boolean;
         },
     ): Promise<void> {
         const app = this.#app;
 
         app.requireSee(user, id);
         await app.requireDriver(id, user);
+
+        if (request.pipPanel === true && app.pip.ownerOf(id) !== user.id) {
+            throw new HttpError(403, "Only your own PiP can use this control.");
+        }
+
         const asked = request.model as { provider?: unknown; modelId?: unknown } | undefined;
 
         checkModel(asked);
@@ -1169,21 +1518,28 @@ export class Commands {
         const cwd =
             request.cwd === undefined ? undefined : app.workspace.checkDirectory(request.cwd);
 
-        await conversation.configure(
-            {
-                ...(request.model === undefined
-                    ? {}
-                    : {
-                          model: {
-                              provider: request.model.provider,
-                              modelId: request.model.modelId,
-                          },
-                      }),
-                thinkingLevel,
-                ...(cwd === undefined ? {} : { cwd }),
-            },
-            context,
-        );
+        const change = {
+            ...(request.model === undefined
+                ? {}
+                : { model: { provider: request.model.provider, modelId: request.model.modelId } }),
+            thinkingLevel,
+            ...(cwd === undefined ? {} : { cwd }),
+        };
+
+        if (request.pipPanel === true) {
+            // Check and save together: a turn may have started while the picker was open.
+            await app.harness.commit(async (tx) => {
+                const live = await tx.doc(LiveDoc, id);
+
+                if (live.run !== undefined || (live.compactions?.length ?? 0) > 0) {
+                    throw new HttpError(409, "PiP is working. Change its model when it is idle.");
+                }
+
+                Object.assign(await tx.doc(AgentDoc, id), change);
+            }, context);
+        } else {
+            await conversation.configure(change, context);
+        }
 
         if (cwd !== undefined && app.sessionMeta(id) !== undefined) {
             await app.harness.commit(async (tx) => {
@@ -1195,7 +1551,7 @@ export class Commands {
             }, context);
         }
 
-        if (ref !== undefined) {
+        if (ref !== undefined && request.pipPanel !== true) {
             app.config.lastModel = { provider: ref.provider, modelId: ref.modelId, thinkingLevel };
         }
 
@@ -1849,11 +2205,12 @@ export class Commands {
         }
 
         const original = userContent(entry.model?.[0]);
-        const [written = "", files] = original.text.split(ATTACHMENTS_HEADING);
+        // Who sent it comes first, then the heading, whole or (from before 0.14.0) without its blank line.
+        const [written, files] = splitAttachments(original.text.replace(FROM_PREFIX, ""));
         // An edit that changes nothing is the same as sending the message again.
         const edit =
-            edited !== undefined && edited !== written.replace(FROM_PREFIX, "").trim()
-                ? edited
+            edited !== undefined && edited !== written.trim()
+                ? app.hidden.replace(edited, id)
                 : undefined;
 
         if (edit === "" && files === undefined) {
@@ -1862,10 +2219,10 @@ export class Commands {
 
         // Sent again, edited or not, the message is from whoever sent it again, with the original's files attached: what
         // Pi does next is on them.
-        const body = edit ?? written.replace(FROM_PREFIX, "").trim();
+        const body = edit ?? written.trim();
         const text = this.messageText(
             user,
-            files === undefined ? body : `${body}${ATTACHMENTS_HEADING}${files}`.trim(),
+            files === undefined ? body : `${body}${ATTACHMENTS_HEADING}${files}`,
         );
         const author =
             (await app.harness.snapshot(AuthorsDoc, id, context))?.entries[String(entryId)] ??
@@ -1882,16 +2239,13 @@ export class Commands {
                 await app.conversation(id)
             ).entries({ maxEntryId: (entryId - 1) as unknown as EntryId }, 1, undefined, context)
         ).items[0];
-        const agent: AgentChange =
-            asked === undefined
-                ? {}
-                : {
-                      model: ref,
-                      thinkingLevel: clampThinkingLevel(
-                          model,
-                          (source?.thinkingLevel ?? "off") as ModelThinkingLevel,
-                      ),
-                  };
+        const agent: AgentChange = {
+            model: ref,
+            thinkingLevel: clampThinkingLevel(
+                model,
+                (source?.thinkingLevel ?? "off") as ModelThinkingLevel,
+            ),
+        };
         const label = edit !== undefined ? "edit" : asked !== undefined ? model.name : "retry";
         const forked = await this.#branch(id, user, {
             at: previous?.id as unknown as number | undefined,

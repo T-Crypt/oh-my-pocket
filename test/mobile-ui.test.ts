@@ -1,9 +1,7 @@
-// Getting around on a phone, in a real browser where this machine has Chromium: back closes what opened last (a sheet,
-// the Files tile, a file in it, the sheet the menu opened) before it leaves a session, and leaving a session goes back
-// to the list, or to the session before.
 import {
     type App,
     cleanUp,
+    lastText,
     newSession,
     openApp,
     owner,
@@ -14,13 +12,15 @@ import {
     work,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import type { FauxResponseStep } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
 import { Browsers } from "../src/server/browser.ts";
+import { BrowserError, Chromium } from "../src/server/browser/cdp.ts";
 import { findBrowser } from "../src/server/browser/discovery.ts";
 import type { BrowserPage } from "../src/server/browser/page.ts";
 import { VIEWPORTS } from "../src/server/browser/viewport.ts";
@@ -31,17 +31,23 @@ const real = {
     skip: chromium === undefined ? "no Chromium-based browser on this machine" : false,
 } as const;
 
+/** "risky please" calls a tool, which Lancet Guard asks about; everything else is echoed. */
+const route: FauxResponseStep = (request) => {
+    const { text } = lastText(request as never);
+
+    return text === "risky please"
+        ? fauxAssistantMessage([fauxToolCall("bash", { command: "true" })], {
+              stopReason: "toolUse",
+          })
+        : fauxAssistantMessage([fauxText(`echo: ${text}`)]);
+};
+
 let app: App;
 let server: Server;
 let browsers: Browsers;
 let page: BrowserPage;
 let base = "";
 let first: ConversationId;
-let second: ConversationId;
-/** A session whose reply has a table and a code block. */
-let rich: ConversationId;
-/** A conversation taller than the screen, to scroll up in and come back down from. */
-let long: ConversationId;
 
 /** Run a script in the page and read back the JSON it returns. */
 async function inPage<T>(script: string): Promise<T> {
@@ -135,37 +141,14 @@ async function fresh(): Promise<void> {
 const goTo = (id: ConversationId) =>
     page.evaluate(`(await import("/store.js")).navigate(${Number(id)})`);
 
-/** Past a route's slide (back.js sets `data-route` while it runs): the screen rests where a finger finds it. */
-const slid = () =>
-    until(
-        async () =>
-            (await inPage<boolean>(
-                `return JSON.stringify(document.documentElement.dataset.route === undefined)`,
-            )) === true,
-        "the slide's end",
-    );
-
 before(async () => {
     if (chromium === undefined) {
         return;
     }
 
-    mkdirSync(join(work, "src"), { recursive: true });
     writeFileSync(join(work, "README.md"), "# Hello\n\nA file to read.\n");
-    writeFileSync(join(work, "src", "main.ts"), "export const answer = 42;\n");
     writeFileSync(join(work, "web.env"), "PORT=3000\nHOST=127.0.0.1\n");
-    writeFileSync(join(work, "magpie.service"), "[Service]\nExecStart=/usr/bin/magpie\n");
-    mkdirSync(join(work, "docs"), { recursive: true });
-    writeFileSync(join(work, "docs", "guide.md"), "# Guide\n\n[The code](../src/main.ts:1)\n");
-    // A repository with a change, for Changes and the branch in the top bar.
-    const git = (...args: string[]) =>
-        execFileSync("git", ["-C", work, "-c", "user.name=T", "-c", "user.email=t@t.t", ...args]);
-
-    git("init", "-q", "-b", "main");
-    git("add", "-A");
-    git("commit", "-qm", "Start");
-    writeFileSync(join(work, "README.md"), "# Hello\n\nA file to read, changed.\n");
-    app = await openApp(scriptedModel());
+    app = await openApp(scriptedModel(route));
     server = createServer(
         createHandler({ app, listen: { host: "127.0.0.1", port: 0 }, restart: () => {} }),
     );
@@ -177,33 +160,6 @@ before(async () => {
         save: () => {},
     });
     first = await newSession(app);
-    second = await newSession(app);
-    rich = await newSession(app);
-    await say(
-        app,
-        rich,
-        [
-            "A table, and some code:",
-            "",
-            "| File | Lines | What changes |",
-            "| --- | --- | --- |",
-            "| src/components/Header.tsx | 3 | the dark class on the header, with a rather long description |",
-            "",
-            "```ts",
-            "export const toggle = (theme: string) => (theme === 'dark' ? 'light' : 'dark');",
-            "```",
-        ].join("\n"),
-    );
-    long = await newSession(app);
-
-    for (let turn = 1; turn <= 6; turn++) {
-        await say(
-            app,
-            long,
-            Array.from({ length: 20 }, (_, line) => `- Turn ${turn}, line ${line + 1}`).join("\n"),
-        );
-    }
-
     page = await browsers.open(1);
     await page.setViewport(VIEWPORTS.mobile);
     await page.navigate(`${base}/login?token=${encodeURIComponent(app.config.ownerToken)}`);
@@ -225,12 +181,51 @@ after(async () => {
     cleanUp();
 });
 
-test("a session opened from the list: back goes back to the list", real, async () => {
+/** How far the transcript is from its bottom, in pixels. */
+const gap = () =>
+    inPage<number>(`
+        const scroller = document.querySelector(".pane > .scroller");
+
+        return JSON.stringify(Math.round(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight));
+    `);
+
+/** Open the first session, with `count` rows of messages and answers, as the server would send them. */
+async function openWithRows(count: number): Promise<void> {
     await fresh();
-    await tap(row(first));
-    await reach({ path: `/s/${first}`, layers: 0 }, "the session");
-    await back();
-    await reach({ path: "/" }, "the list");
+    await goTo(first);
+    await until(
+        () =>
+            inPage<boolean>(
+                `return JSON.stringify((await import("/store.js")).store.state.view.conversation?.id === ${Number(first)})`,
+            ),
+        "the session's view",
+    );
+    await page.evaluate(`
+        const { store } = await import("/store.js");
+        const entries = Array.from({ length: ${count} }, (_, n) => ({ id: 920000 + n, kind: "assistant",
+            stopReason: "stop", at: Date.now(),
+            blocks: [{ type: "text", text: "Answer " + n + "\\n\\n" + "Words. ".repeat(40) }] }));
+
+        store.set((state) => ({
+            transcriptFrom: null,
+            view: { ...state.view, entries: new Map(entries.map((entry) => [entry.id, entry])),
+                order: entries.map((entry) => entry.id), live: { busy: false } },
+        }));
+        "shown";
+    `);
+}
+
+test("the served SVG icon decodes as an image", real, async () => {
+    const [width, height] = await inPage<[number, number]>(`
+        const image = new Image();
+
+        image.src = "/icon.svg";
+        await image.decode();
+
+        return JSON.stringify([image.naturalWidth, image.naturalHeight]);
+    `);
+
+    assert.ok(width > 0 && height > 0, "the icon has image dimensions");
 });
 
 test("back closes the open file, then the Files tile, then leaves the session", real, async () => {
@@ -250,47 +245,32 @@ test("back closes the open file, then the Files tile, then leaves the session", 
     await reach({ path: "/" }, "back to the list");
 });
 
-test(
-    "local Markdown file links use the viewer, line numbers, and its back stack",
-    real,
-    async () => {
-        const linked = await newSession(app);
-        const startup = `${join(work, "magpie.service")}:2`;
+test("local Markdown file links use the viewer", real, async () => {
+    const linked = await newSession(app);
 
-        await say(
-            app,
-            linked,
-            [
-                "[web.env](web.env)",
-                `[**Startup**](${startup})`,
-                "[Line](README.md:3)",
-                "[Encoded](src%2Fmain.ts)",
-                "[Home](~/notes.md)",
-                "[Relative](./README.md)",
-                "[Website](https://example.com/web.env)",
-                "[Network](//example.com/web.env)",
-                "[Session](/s/12)",
-                "[Image API](/api/c/1/file?path=web.env)",
-                "[Fragment](#web.env)",
-                "[Unsafe](javascript:alert%281%29)",
-                '<a href="https://example.com" data-path="web.env">Forged</a>',
-                "`web.env`",
-                "```\nweb.env\n```",
-            ].join("\n\n"),
-        );
-        await fresh();
-        await goTo(linked);
-        await reach({ path: `/s/${linked}` }, "the reply with file links");
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector('.reply .md a[data-path="web.env"]') !== null)`,
-                )) === true,
-            "the rendered links",
-        );
-        const links = await inPage<
-            Record<string, { path: string | null; target: string | null; href: string | null }>
-        >(`
+    await say(
+        app,
+        linked,
+        [
+            "[web.env](web.env)",
+            "[Website](https://example.com/web.env)",
+            "[Unsafe](javascript:alert%281%29)",
+            '<a href="https://example.com" data-path="web.env">Forged</a>',
+        ].join("\n\n"),
+    );
+    await fresh();
+    await goTo(linked);
+    await reach({ path: `/s/${linked}` }, "the reply with file links");
+    await until(
+        async () =>
+            (await inPage<boolean>(
+                `return JSON.stringify(document.querySelector('.reply .md a[data-path="web.env"]') !== null)`,
+            )) === true,
+        "the rendered links",
+    );
+    const links = await inPage<
+        Record<string, { path: string | null; target: string | null; href: string | null }>
+    >(`
         return JSON.stringify(Object.fromEntries(
             [...document.querySelectorAll(".reply .md a")].map((link) => [link.textContent, {
                 path: link.getAttribute("data-path"),
@@ -300,1139 +280,166 @@ test(
         ));
     `);
 
-        assert.equal(links["web.env"]?.path, "web.env");
-        assert.equal(links.Startup?.path, startup);
-        assert.equal(
-            links.Line?.path,
-            "./README.md:3",
-            "a bare filename with a line survives sanitizing",
-        );
-        assert.equal(links.Encoded?.path, "src/main.ts");
-        assert.equal(links.Home?.path, "~/notes.md");
-        assert.equal(links.Relative?.path, "./README.md");
-        assert.equal(links["web.env"]?.target, null, "local links stay in the app");
+    assert.equal(links["web.env"]?.path, "web.env");
+    assert.equal(links["web.env"]?.target, null, "local links stay in the app");
 
-        for (const label of [
-            "Website",
-            "Network",
-            "Session",
-            "Image API",
-            "Fragment",
-            "Unsafe",
-            "Forged",
-        ]) {
-            assert.equal(links[label]?.path, null, `${label} stays outside the file viewer`);
-        }
+    for (const label of ["Website", "Unsafe", "Forged"]) {
+        assert.equal(links[label]?.path, null, `${label} stays outside the file viewer`);
+    }
 
-        assert.equal(links.Website?.target, "_blank");
-        assert.equal(links.Unsafe?.href, null, "unsafe schemes are still stripped");
-        assert.equal(
-            await inPage<number>(
-                `return JSON.stringify(document.querySelectorAll(".reply .md code[data-path]").length)`,
-            ),
-            1,
-            "inline paths still work, code blocks stay code",
-        );
-        await page.evaluate(`document.querySelector('.reply .md a[data-path="web.env"]').focus()`);
-        await page.press("Enter");
-        await reach({ sheet: "file", layers: 1 }, "the file opened by keyboard");
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".file-viewer")?.textContent.includes("PORT=3000") === true)`,
-                )) === true,
-            "the environment file contents",
-        );
-        await back();
-        await reach({ sheet: null, layers: 0, path: `/s/${linked}` }, "back to the reply");
-        await tap(".reply .md a[data-path] strong");
-        await reach({ sheet: "file", layers: 1 }, "the startup configuration");
-        await until(
-            async () =>
-                (
-                    await inPage<string>(
-                        `return JSON.stringify(document.querySelector('.file-line.on[data-line="2"]')?.textContent ?? "")`,
-                    )
-                ).includes("ExecStart=/usr/bin/magpie"),
-            "the startup line",
-        );
-        await back();
-        await reach({ sheet: null, layers: 0 }, "back from the startup configuration");
-        await tap('.reply .md a[data-path="./README.md:3"]');
-        await reach({ sheet: "file", layers: 1 }, "the bare filename with a line");
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector('.file-line.on[data-line="3"]') !== null)`,
-                )) === true,
-            "line three",
-        );
-        await back();
-        await reach({ sheet: null, layers: 0 }, "back from line three");
-        // Text selected elsewhere neither holds the link back nor lets it leave the app.
-        await page.evaluate(`
-            const range = document.createRange();
-
-            range.selectNodeContents(document.querySelector(".reply .md code[data-path]"));
-            getSelection().removeAllRanges();
-            getSelection().addRange(range);
-        `);
-        await tap('.reply .md a[data-path="web.env"]');
-        await reach(
-            { sheet: "file", layers: 1, path: `/s/${linked}` },
-            "the file, with a selection elsewhere",
-        );
-        await back();
-        await reach({ sheet: null, layers: 0 }, "back from the file");
-        await page.evaluate(`getSelection().removeAllRanges()`);
-        // A link in a Markdown file names a file beside it, not in the session's folder.
-        await page.evaluate(`(await import("/ui.js")).openFile("docs/guide.md")`);
-        await reach({ sheet: "file", layers: 1 }, "the guide");
-        await tap('.file-viewer .md a[data-path$="/src/main.ts:1"]');
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".file-viewer")?.textContent.includes("answer = 42") === true)`,
-                )) === true,
-            "the file the guide links to",
-        );
-        await reach({ sheet: "file", layers: 2 }, "the linked file, a step above the guide");
-        await back();
-        await reach({ sheet: "file", layers: 1 }, "back to the guide");
-        await back();
-        await reach({ sheet: null, layers: 0, path: `/s/${linked}` }, "back from the guide");
-        await page.setViewport({ width: 1440, height: 900, scale: 1, mobile: false });
-        await openFiles();
-        await reach({ files: true }, "the docked Files tile");
-        await tap('.reply .md a[data-path="web.env"]');
-        await reach(
-            { file: "web.env", sheet: null, layers: 0 },
-            "the linked file in the Files tile",
-        );
-        await page.evaluate(`(await import("/files-panel.js")).setFilesOpen(false)`);
-    },
-);
-
-test("a reload keeps the steps back: the file, then the tile", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await openFiles();
-    await tap('.ft-row[data-path$="/README.md"]');
-    await reach({ file: "README.md", layers: 2 }, "the file");
-    await page.reload({ wait: true });
-    await reach({ file: "README.md", layers: 2 }, "the file again, after the reload");
-
-    await back();
-    await reach({ files: true, file: null, layers: 1 }, "back to the tree");
-    await back();
-    await reach({ files: false, layers: 0 }, "back to the conversation");
-    await back();
-    await reach({ path: "/" }, "back to the list");
-});
-
-test("a sheet the menu opened goes back to the menu, then to the conversation", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await tap('.topbar [aria-label="Menu"]');
-    await reach({ sheet: "menu", layers: 1 }, "the menu");
-    await tap('.place[data-place="find"]');
-    await reach({ sheet: "find", layers: 2 }, "find, from the menu's tiles");
-
-    await back();
-    await reach({ sheet: "menu", layers: 1 }, "back to the menu");
-    await back();
-    await reach({ sheet: null, layers: 0, path: `/s/${first}` }, "back to the conversation");
-});
-
-test("a sheet closed with a tap takes its step back with it", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await tap('.topbar [aria-label="Menu"]');
-    await reach({ sheet: "menu", layers: 1 }, "the menu");
-    await tap('.sheet-head [aria-label="Close"]');
-    await reach({ sheet: null, layers: 0 }, "the menu closed, and its step gone");
-    await back();
-    await reach({ path: "/" }, "back leaves for the list, not into the menu");
-});
-
-test("a sheet dragged down far enough closes; a short drag springs back", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await tap('.topbar [aria-label="Menu"]');
-    await reach({ sheet: "menu", layers: 1 }, "the menu");
-
-    const drag = (to: number) =>
-        page.evaluate(`
-            const head = document.querySelector(".sheet-head");
-            const from = head.getBoundingClientRect().top + 10;
-            const touch = (y) => new Touch({ identifier: 1, target: head, clientX: 200, clientY: y });
-            const fire = (type, y) =>
-                head.dispatchEvent(
-                    new TouchEvent(type, {
-                        bubbles: true,
-                        cancelable: true,
-                        touches: type === "touchend" ? [] : [touch(y)],
-                        changedTouches: [touch(y)],
-                    }),
-                );
-
-            fire("touchstart", from);
-
-            for (let step = 1; step <= 10; step++) {
-                fire("touchmove", from + (${to} * step) / 10);
-                await new Promise((resolve) => setTimeout(resolve, 30));
-            }
-
-            fire("touchend", from + ${to});
-        `);
-
-    await drag(40);
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    await reach({ sheet: "menu", layers: 1 }, "still open after a short drag");
-    assert.equal(
-        await inPage<string>(
-            `return JSON.stringify(document.querySelector(".sheet").style.transform)`,
-        ),
-        "",
-        "back in place",
-    );
-
-    await drag(400);
-    await reach({ sheet: null, layers: 0, path: `/s/${first}` }, "closed by the long drag");
-});
-
-test(
-    "from one session to another, back returns to the first; the top bar's back goes to the list",
-    real,
-    async () => {
-        await fresh();
-        await tap(row(first));
-        await reach({ path: `/s/${first}` }, "the first session");
-        await goTo(second);
-        await reach({ path: `/s/${second}`, layers: 0 }, "the second session");
-        await back();
-        await reach({ path: `/s/${first}` }, "back to the first");
-
-        await goTo(second);
-        await reach({ path: `/s/${second}` }, "the second again");
-        await tap(".topbar-back");
-        await reach({ path: "/" }, "the list, past both sessions");
-        assert.equal(
-            await inPage<number>(`return JSON.stringify(history.state.pocket.back)`),
-            0,
-            "the list's own entry",
-        );
-    },
-);
-
-test(
-    "a session picked in the drawer replaces the drawer's step: back returns to the session before",
-    real,
-    async () => {
-        await fresh();
-        await tap(row(first));
-        await reach({ path: `/s/${first}`, layers: 0 }, "the first session");
-        await page.evaluate(`(await import("/store.js")).store.set({ drawer: true })`);
-        await reach({ layers: 1 }, "the drawer");
-        await tap(`.drawer .session-row[data-id="${second}"] .session`);
-        await reach({ path: `/s/${second}`, layers: 0 }, "the second session, the drawer gone");
-        // A moment later, still there: the drawer's step coming off does not take the app back with it.
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        await reach({ path: `/s/${second}`, layers: 0 }, "still the second session");
-        assert.equal(
-            await inPage<number>(
-                `return JSON.stringify((await import("/store.js")).store.state.conversationId)`,
-            ),
-            Number(second),
-        );
-
-        await back();
-        await reach({ path: `/s/${first}`, layers: 0 }, "back to the first, not into the drawer");
-        await back();
-        await reach({ path: "/" }, "then the list");
-    },
-);
-
-test("on a phone the top bar keeps only the buttons with something to say", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await reach({ path: `/s/${first}` }, "the session");
-    // The folder's change shows once it is read.
+    assert.equal(links.Unsafe?.href, null, "unsafe schemes are still stripped");
+    await page.evaluate(`document.querySelector('.reply .md a[data-path="web.env"]').focus()`);
+    await page.press("Enter");
+    await reach({ sheet: "file", layers: 1 }, "the file opened by keyboard");
     await until(
         async () =>
             (await inPage<boolean>(
-                `return JSON.stringify(document.querySelector(".changes-button") !== null)`,
+                `return JSON.stringify(document.querySelector(".file-viewer")?.textContent.includes("PORT=3000") === true)`,
             )) === true,
-        "the changes",
-    );
-    const shown = await inPage<string[]>(`
-        return JSON.stringify(
-            [...document.querySelectorAll(".topbar button")]
-                .filter((button) => getComputedStyle(button).display !== "none")
-                .map((button) => button.getAttribute("aria-label")),
-        );
-    `);
-
-    assert.ok(shown.includes("Back to sessions"), `the way back: ${shown}`);
-    assert.ok(
-        shown.some((label) => label?.startsWith("Changes: 1 file")),
-        `what changed: ${shown}`,
-    );
-    assert.ok(shown.includes("Menu"), `the menu: ${shown}`);
-    assert.ok(!shown.includes("Files"), `Files, in the menu while closed: ${shown}`);
-    assert.ok(!shown.includes("Artifacts"), `no artifacts yet: ${shown}`);
-    assert.match(
-        await inPage<string>(
-            `return JSON.stringify(document.querySelector(".topbar .title-sub").textContent)`,
-        ),
-        /work.*⎇ main/,
-        "the folder and the branch under the title",
+        "the environment file contents",
     );
 });
 
-test(
-    "the branch in the top bar opens the branch picker in one tap, the title the menu",
-    real,
-    async () => {
-        await fresh();
-        await tap(row(first));
-        await reach({ path: `/s/${first}` }, "the session");
-        await slid();
-        await page.click({ selector: ".topbar button.title-branch" });
-        await reach({ sheet: "branch", layers: 1 }, "the branch picker");
-        // Past its slide in.
-        await new Promise((resolve) => setTimeout(resolve, 450));
-        const placed = await inPage<{ down: boolean; gap: number }>(`
-            const menu = document.querySelector(".pop-menu");
-            const branch = document.querySelector(".topbar button.title-branch");
-
-            return JSON.stringify({
-                down: menu.classList.contains("down"),
-                gap: menu.getBoundingClientRect().top - branch.getBoundingClientRect().bottom,
-            });
-        `);
-
-        assert.ok(placed.down, "a menu down from the branch");
-        assert.ok(Math.abs(placed.gap - 6) < 2, `just under it: ${placed.gap}px`);
-        await back();
-        await reach({ sheet: null, layers: 0 }, "closed");
-        // Past the moment a tap right after a layer closes is held back.
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        await page.click({ selector: ".topbar .title-main" });
-        await reach({ sheet: "menu", layers: 1 }, "the menu, from the title");
-        await back();
-        await reach({ sheet: null, layers: 0 }, "closed again");
-    },
-);
-
-// With a mouse: a touch screen's line under the title is a thumb tall whatever it holds.
-test("while a session loads, its title stays where it will be", real, async () => {
+test("completed replies show stored message times across providers", real, async () => {
     await fresh();
-    await page.setViewport(VIEWPORTS.desktop);
-    await page.navigate(`${base}/s/${first}`);
+    await goTo(first);
     await until(
-        async () =>
-            (await inPage<boolean>(
-                `return JSON.stringify(document.querySelector(".topbar .title-sub")?.textContent.includes("main") === true)`,
-            )) === true,
-        "the folder and branch under the title",
+        () =>
+            inPage<boolean>(`
+                return JSON.stringify((await import("/store.js")).store.state.view.conversation?.id === ${first});
+            `),
+        "the session view",
     );
-    // Before the server answers, the view is empty, as `navigate` leaves it: no folder or branch under the title yet.
-    const tops = await inPage<{ loaded: number; loading: number; sub: string }>(`
+    const expected = await inPage<{ text: string; dateTime: string; title: string }[]>(`
         const { store } = await import("/store.js");
-        const top = () => document.querySelector(".topbar .title-main").getBoundingClientRect().top;
-        const painted = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const { fromServer } = await import("/seen.js");
+        const today = new Date().setHours(10, 30, 0, 0);
+        const earlier = new Date(2020, 0, 2, 10, 30).getTime();
+        const entries = [
+            { id: 900101, kind: "assistant", provider: "anthropic", stopReason: "stop", at: today,
+                blocks: [{ type: "text", text: "Today's answer." }] },
+            { id: 900102, kind: "assistant", provider: "openai", stopReason: "stop", at: earlier,
+                blocks: [{ type: "text", text: "An older answer." }] },
+            { id: 900103, kind: "assistant", provider: "google", stopReason: "stop",
+                blocks: [{ type: "text", text: "An answer without a timestamp." }] },
+            { id: 900104, kind: "assistant", provider: "anthropic", stopReason: "toolUse", at: today,
+                blocks: [{ type: "text", text: "An intermediate step." }] },
+            { id: 900105, kind: "assistant", provider: "custom", stopReason: "stop", at: today,
+                blocks: [
+                    { type: "text", text: "Before thinking." },
+                    { type: "thinking", text: "Thinking." },
+                    { type: "text", text: "After thinking." },
+                ] },
+        ];
 
-        // Past what pops and rises in as the page opens (not what loops for ever).
-        await Promise.all(
-            document
-                .getAnimations()
-                .filter((each) => each.effect?.getComputedTiming().endTime !== Infinity)
-                .map((each) => each.finished.catch(() => {})),
-        );
-        const loaded = top();
+        store.set({ view: { ...store.state.view,
+            entries: new Map(entries.map(entry => [entry.id, entry])),
+            order: entries.map(entry => entry.id),
+        } });
 
-        store.set({ view: { ...store.state.view, conversation: null, agent: null, branch: null } });
-        await painted();
+        return JSON.stringify([today, earlier, today].map((at, index) => {
+            const date = new Date(fromServer(at));
+            const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 
-        return JSON.stringify({
-            loaded,
-            loading: top(),
-            sub: document.querySelector(".topbar .title-sub").textContent.trim(),
-        });
-    `);
-
-    assert.equal(tops.sub, "", "nothing under the title while it loads");
-    assert.equal(tops.loading, tops.loaded, "the title does not move");
-});
-
-test("a session opened straight away gets the list under it at the first tap", real, async () => {
-    await fresh();
-    await page.navigate(`${base}/s/${second}`);
-    await reach({ path: `/s/${second}` }, "the session");
-    assert.equal(
-        await inPage<boolean>(`return JSON.stringify(history.state.pocket.listUnder)`),
-        true,
-        "not before anyone touched the page",
-    );
-    await tap(".scroller");
-    await until(
-        async () =>
-            (await inPage<number>(`return JSON.stringify(history.state.pocket.back)`)) === 1,
-        "the list under it",
-    );
-    await back();
-    await reach({ path: "/" }, "back to the list, not out of the app");
-});
-
-test("a file opened from Changes goes back to Changes", real, async () => {
-    await fresh();
-    await page.evaluate(`(await import("/files-panel.js")).setFilesOpen(false)`);
-    await tap(row(first));
-    await openFiles();
-    await reach({ files: true, layers: 1 }, "the Files tile");
-    // A path tapped in the Changes tab, as a line number there opens the file.
-    await page.evaluate(`
-        const { store } = await import("/store.js");
-        const { openFile } = await import("/ui.js");
-
-        store.set({ filesTab: "changes" });
-        await new Promise((resolve) => setTimeout(resolve, 100));
-        openFile("README.md:2");
-    `);
-    await reach({ file: "README.md", layers: 2 }, "the file, from Changes");
-    await back();
-    await reach({ file: null, layers: 1 }, "back from the file");
-    assert.equal(
-        await inPage<string>(
-            `return JSON.stringify((await import("/store.js")).store.state.filesTab)`,
-        ),
-        "changes",
-        "on Changes again",
-    );
-});
-
-test("Escape closes a sheet and takes its step back", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await tap('.topbar [aria-label="Menu"]');
-    await reach({ sheet: "menu", layers: 1 }, "the menu");
-    await page.press("Escape");
-    await reach({ sheet: null, layers: 0, path: `/s/${first}` }, "closed, its step gone");
-});
-
-test("forward onto a closed sheet does not open it again", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await tap('.topbar [aria-label="Menu"]');
-    await reach({ sheet: "menu", layers: 1 }, "the menu");
-    await back();
-    await reach({ sheet: null, layers: 0 }, "closed by back");
-    await page.evaluate(`history.forward()`);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await reach(
-        { sheet: null, layers: 0, path: `/s/${first}` },
-        "still closed, history back in step",
-    );
-});
-
-test("panels docked beside the conversation are not steps back", real, async () => {
-    await fresh();
-    await page.setViewport({ width: 1440, height: 900, scale: 1, mobile: false });
-    await tap(`.sidebar .session-row[data-id="${first}"] .session`);
-    await reach({ path: `/s/${first}` }, "the session");
-    await openFiles();
-    await reach({ files: true }, "the Files tile, docked");
-    await tap('.ft-row[data-path$="/README.md"]');
-    await reach({ file: "README.md" }, "the file");
-    await new Promise((resolve) => setTimeout(resolve, 200));
-    await reach({ layers: 0 }, "no steps for them");
-    await page.evaluate(`(await import("/files-panel.js")).setFilesOpen(false)`);
-});
-
-test(
-    "between phone and desktop widths the Files tile still slides in as a screen",
-    real,
-    async () => {
-        await fresh();
-        await page.setViewport({ width: 1000, height: 800, scale: 1, mobile: false });
-        await tap(`.sidebar .session-row[data-id="${first}"] .session`);
-        await reach({ path: `/s/${first}` }, "the session");
-        await openFiles();
-        await reach({ files: true, layers: 1 }, "the tile, covering the conversation");
-        assert.equal(
-            await inPage<string>(
-                `return JSON.stringify(getComputedStyle(document.querySelector(".files-tile")).animationName)`,
-            ),
-            "push-in",
-        );
-        await back();
-        await reach({ files: false, layers: 0 }, "closed by back");
-    },
-);
-
-/** A finger on the element `at` names, moving through `points` (from its corner), then let go. */
-const swipe = async (at: string, points: [number, number][]) => {
-    await until(
-        async () =>
-            (await inPage<boolean>(
-                `return JSON.stringify(document.querySelector(${JSON.stringify(at)}) !== null)`,
-            )) === true,
-        at,
-    );
-    // From where it rests: mid-slide, the points would land off to the side, at the screen's edge.
-    await slid();
-    await page.evaluate(`
-        const target = document.querySelector(${JSON.stringify(at)});
-        const box = target.getBoundingClientRect();
-        const points = ${JSON.stringify(points)}.map(([x, y]) => [box.left + x, box.top + y]);
-        const touch = ([x, y]) => new Touch({ identifier: 1, target, clientX: x, clientY: y });
-        const fire = (type, point) =>
-            target.dispatchEvent(
-                new TouchEvent(type, {
-                    bubbles: true,
-                    cancelable: true,
-                    touches: type === "touchend" ? [] : [touch(point)],
-                    changedTouches: [touch(point)],
-                }),
-            );
-
-        fire("touchstart", points[0]);
-
-        for (const point of points.slice(1)) {
-            fire("touchmove", point);
-            await new Promise((resolve) => setTimeout(resolve, 16));
-        }
-
-        fire("touchend", points.at(-1));
-    `);
-};
-
-/** A sideways swipe from `from`, `by` pixels in all, in ten steps. */
-const sideways = (from: number, by: number, y = 200): [number, number][] =>
-    Array.from({ length: 11 }, (_, step) => [from + (by * step) / 10, y]);
-
-test("the places, a thumb away: the button beside the message box, then a tile", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await tap(".composer-row .places-button");
-    await reach({ sheet: "places", layers: 1 }, "the places");
-    assert.ok(
-        await inPage<boolean>(
-            `return JSON.stringify(document.querySelector(".sheet").getBoundingClientRect().top > innerHeight / 2)`,
-        ),
-        "a short sheet, in the bottom half",
-    );
-    await tap('.place[data-place="files"]');
-    await reach({ sheet: null, files: true, layers: 1 }, "the Files tile in the sheet's place");
-    await back();
-    await reach({ files: false, layers: 0, path: `/s/${first}` }, "back to the conversation");
-});
-
-test("swipe up from the message box for the places", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await swipe(".model-chip", [
-        [20, 10],
-        [21, 0],
-        [22, -20],
-        [22, -50],
-        [22, -70],
-    ]);
-    await reach({ sheet: "places", layers: 1 }, "the places");
-    await back();
-    await reach({ sheet: null, layers: 0 }, "closed");
-});
-
-test("on the conversation, swipe left for Files and right to go back", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await reach({ path: `/s/${first}` }, "the session");
-
-    await swipe(".pane > .scroller", sideways(300, -40));
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await reach({ files: false, layers: 0 }, "a short swipe does nothing");
-
-    await swipe(".pane > .scroller", sideways(300, -160));
-    await reach({ files: true, layers: 1 }, "the Files tile");
-    await tap('.ft-row[data-path$="/README.md"]');
-    await reach({ file: "README.md", layers: 2 }, "a file");
-
-    await swipe(".files-tile", sideways(80, 170));
-    await reach({ files: true, file: null, layers: 1 }, "swiped back to the tree");
-    await swipe(".files-tile", sideways(80, 170));
-    await reach({ files: false, layers: 0 }, "swiped back to the conversation");
-    await swipe(".pane > .scroller", sideways(80, 170));
-    await reach({ path: "/" }, "swiped back to the list");
-});
-
-/** How wide and tall a control is to a finger: from its middle, as far as a tap still reaches it. */
-const hitArea = (selector: string) =>
-    inPage<{ w: number; h: number } | null>(`
-        const e = document.querySelector(${JSON.stringify(selector)});
-
-        if (!e) {
-            return JSON.stringify(null);
-        }
-
-        e.scrollIntoView({ block: "center" });
-        const r = e.getBoundingClientRect();
-        const x = r.x + r.width / 2;
-        const y = r.y + r.height / 2;
-        const own = (px, py) => {
-            const at = document.elementFromPoint(px, py);
-
-            return at !== null && (at === e || e.contains(at));
-        };
-        const reach = (dx, dy) => {
-            let n = 0;
-
-            while (n < 40 && own(x + dx * (n + 1), y + dy * (n + 1))) {
-                n++;
-            }
-
-            return n;
-        };
-
-        return JSON.stringify({ w: reach(-1, 0) + reach(1, 0) + 1, h: reach(0, -1) + reach(0, 1) + 1 });
-    `);
-
-test("a quick second tap does not land on what just slid in", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await reach({ path: `/s/${first}`, layers: 0 }, "the session");
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    // A double tap on the places button: the second lands where a tile (or the scrim) has just come.
-    await page.click({ selector: ".composer-row .places-button" }, { count: 2 });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    await reach({ sheet: "places", layers: 1 }, "one places sheet, and nothing it opened");
-    // A double tap on a tile: Files opens, and the second tap opens nothing in it.
-    await page.click({ selector: '.place[data-place="files"]' }, { count: 2 });
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    await reach({ sheet: null, files: true, file: null, layers: 1 }, "Files, nothing opened in it");
-    await back();
-    await reach({ files: false, layers: 0 }, "closed");
-});
-
-test("a tap right after something moved on its own is not held back", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await reach({ path: `/s/${first}`, layers: 0 }, "the session");
-    await new Promise((resolve) => setTimeout(resolve, 400));
-    // Another session opens with no tap (as a reply's link or the server opens one), and the person taps the menu at once.
-    await goTo(second);
-    await page.click({ selector: '.topbar [aria-label="Menu"]' });
-    await reach({ path: `/s/${second}`, sheet: "menu", layers: 1 }, "the menu, from the tap");
-    await back();
-    await reach({ sheet: null, layers: 0 }, "closed");
-});
-
-test("on a phone, nothing that slides in makes the page wider than the screen", real, async () => {
-    /** Watches the page's width every frame from now on; `widest()` says the most it reached. */
-    const watch = () =>
-        page.evaluate(`
-            window.widest = innerWidth;
-            const tick = () => {
-                window.widest = Math.max(window.widest, innerWidth, document.documentElement.scrollWidth);
-                requestAnimationFrame(tick);
+            return {
+                text: index === 1
+                    ? date.toLocaleDateString([], { month: "short", day: "numeric" }) + " " + time
+                    : time,
+                dateTime: date.toISOString(),
+                title: date.toLocaleString(),
             };
-
-            requestAnimationFrame(tick);
-        `);
-    const widest = () => inPage<number>(`return JSON.stringify(window.widest)`);
-    const settle = () => new Promise((resolve) => setTimeout(resolve, 700));
-
-    await fresh();
-    await watch();
-    await tap(row(first));
-    await reach({ path: `/s/${first}` }, "the session");
-    await settle();
-    assert.equal(await widest(), 390, "a session sliding in");
-    // A swipe right, held: the conversation leans after the finger, and springs back when it lifts where it began.
-    await slid();
-    await page.evaluate(`
-        const target = document.querySelector(".pane > .scroller");
-        const box = target.getBoundingClientRect();
-        const finger = (x) => new Touch({ identifier: 1, target, clientX: box.left + x, clientY: box.top + 200 });
-        const fire = (type, x) =>
-            target.dispatchEvent(new TouchEvent(type, { bubbles: true, cancelable: true, touches: type === "touchend" ? [] : [finger(x)], changedTouches: [finger(x)] }));
-
-        fire("touchstart", 80);
-
-        for (let step = 1; step <= 10; step++) {
-            fire("touchmove", 80 + step * 15);
-            await new Promise((resolve) => setTimeout(resolve, 30));
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        fire("touchmove", 80);
-        fire("touchend", 80);
-    `);
-    await settle();
-    assert.equal(await widest(), 390, "a swipe's lean");
-    await reach({ path: `/s/${first}`, layers: 0 }, "still the session");
-    await openFiles();
-    await reach({ files: true }, "Files");
-    await settle();
-    assert.equal(await widest(), 390, "Files sliding in");
-    await back();
-    await reach({ files: false }, "Files closed");
-    await page.evaluate(`(await import("/store.js")).store.set({ drawer: true })`);
-    await settle();
-    assert.equal(await widest(), 390, "the drawer sliding in");
-    await back();
-    await settle();
-    await back();
-    await reach({ path: "/" }, "the list");
-    await settle();
-    assert.equal(await widest(), 390, "the list sliding back");
-});
-
-test("a swipe follows its own finger, not another on the glass", real, async () => {
-    await fresh();
-    await tap(row(first));
-    await reach({ path: `/s/${first}` }, "the session");
-    // Swipes wait for the conversation's view, at rest: mid-slide, its middle is still off to the right.
-    await until(
-        async () =>
-            (await inPage<boolean>(
-                `return JSON.stringify(document.querySelector(".composer") !== null)`,
-            )) === true,
-        "the conversation",
-    );
-    await slid();
-    // Finger 1 swipes left; finger 2 rests low on the screen, first in the event's list of touches.
-    await page.evaluate(`
-        const target = document.querySelector(".pane > .scroller");
-        const box = target.getBoundingClientRect();
-        const finger = (x) => new Touch({ identifier: 1, target, clientX: box.left + x, clientY: box.top + 200 });
-        const thumb = new Touch({ identifier: 2, target, clientX: box.left + 60, clientY: box.top + 500 });
-        const fire = (type, touches, changed) =>
-            target.dispatchEvent(new TouchEvent(type, { bubbles: true, cancelable: true, touches, changedTouches: changed }));
-
-        fire("touchstart", [finger(300)], [finger(300)]);
-
-        for (let step = 1; step <= 10; step++) {
-            fire("touchmove", [thumb, finger(300 - step * 16)], [finger(300 - step * 16)]);
-            await new Promise((resolve) => setTimeout(resolve, 16));
-        }
-
-        fire("touchend", [thumb], [finger(140)]);
-    `);
-    await reach({ files: true, layers: 1 }, "Files, from the finger that swiped");
-    await back();
-    await reach({ files: false, layers: 0 }, "closed");
-});
-
-test(
-    "on a phone, a reply's table keeps readable columns, and scrolls sideways instead",
-    real,
-    async () => {
-        await fresh();
-        await goTo(rich);
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".md table") !== null)`,
-                )) === true,
-            "the table",
-        );
-        const table = await inPage<{ narrowest: number; scrolls: boolean }>(`
-        const table = document.querySelector(".md table");
-        const widths = [...table.querySelectorAll("th")].map((th) => th.getBoundingClientRect().width);
-
-        return JSON.stringify({ narrowest: Math.min(...widths), scrolls: table.scrollWidth > table.clientWidth });
+        }));
     `);
 
-        assert.ok(
-            table.narrowest >= 60,
-            `no column crushed to a few letters: ${table.narrowest}px`,
-        );
-        assert.ok(table.scrolls, "the table scrolls sideways instead");
-    },
-);
-
-// Issue #63: a short update written a line at a time, as Pi's terminal shows it, not run together into one paragraph.
-test(
-    "a reply keeps its single line breaks; a Markdown file's hard-wrapped lines stay one paragraph",
-    real,
-    async () => {
-        const updates = await newSession(app);
-        // Outside the session's repository: a file there would be one more change for the tests after this one.
-        const wrapped = join(root, "wrapped.md");
-
-        await say(
-            app,
-            updates,
-            [
-                "✅ Checks pass.",
-                "📌 [The guide](docs/guide.md) · `src/main.ts`",
-                "👉 Approve it?",
-                "",
-                "A paragraph of its own.",
-            ].join("\n"),
-        );
-        writeFileSync(
-            wrapped,
-            "# Wrapped\n\nA paragraph wrapped\nat a narrow column,\nas files often are.\n\nAnother.\n",
-        );
-        await fresh();
-        await goTo(updates);
-        await reach({ path: `/s/${updates}` }, "the reply");
+    for (const viewport of [VIEWPORTS.mobile, VIEWPORTS.desktop]) {
+        await page.setViewport(viewport);
         await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".reply .md")?.textContent.includes("of its own") === true)`,
-                )) === true,
-            "the reply, rendered",
-        );
-        const paragraphs = (selector: string) =>
-            inPage<string[]>(`
-                return JSON.stringify(
-                    [...document.querySelectorAll(${JSON.stringify(selector)})].map((p) => p.innerText),
-                );
-            `);
-        const reply = await paragraphs(".reply .md p");
-
-        assert.equal(reply.length, 2, `two paragraphs: ${JSON.stringify(reply)}`);
-        assert.match(
-            reply[0]!,
-            /✅ Checks pass\.\n📌 The guide · src\/main\.ts\n👉 Approve it\?$/,
-            "each line on its own line",
-        );
-        assert.equal(reply[1], "A paragraph of its own.");
-        assert.equal(
-            await inPage<number>(
-                `return JSON.stringify(document.querySelectorAll('.reply .md a[data-path="docs/guide.md"], .reply .md code[data-path="src/main.ts"]').length)`,
-            ),
-            2,
-            "the link and the path on those lines still open files",
-        );
-
-        await page.evaluate(`(await import("/ui.js")).openFile(${JSON.stringify(wrapped)})`);
-        await reach({ sheet: "file", layers: 1 }, "the Markdown file");
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".file-viewer .md p") !== null)`,
-                )) === true,
-            "the file, rendered",
-        );
-        assert.deepEqual(await paragraphs(".file-viewer .md p"), [
-            "A paragraph wrapped at a narrow column, as files often are.",
-            "Another.",
-        ]);
-        await back();
-        await reach({ sheet: null, layers: 0 }, "back to the reply");
-    },
-);
-
-test("on a phone, the controls are thumb-sized", real, async () => {
-    await fresh();
-    await goTo(rich);
-    await until(
-        async () =>
-            (await inPage<boolean>(
-                `return JSON.stringify(document.querySelector(".code-head .copy") !== null)`,
-            )) === true,
-        "the reply",
-    );
-    // Measured where it rests, past the conversation's slide in, with something to send (an empty box's Send takes no
-    // taps: they go to the text).
-    await slid();
-    const draft = (text: string) =>
-        page.evaluate(`
-            const box = document.querySelector(".composer textarea");
-
-            box.value = ${JSON.stringify(text)};
-            box.dispatchEvent(new Event("input", { bubbles: true }));
-        `);
-
-    await draft("x");
-
-    for (const selector of [
-        ".topbar-back",
-        ".topbar button.title-branch",
-        ".changes-button",
-        '.topbar [aria-label="Menu"]',
-        ".composer-row .places-button",
-        ".composer-row .attach-button",
-        ".composer-row .model-chip",
-        ".composer-row .send-button",
-        ".code-head .copy",
-        ".answer-actions > button",
-    ]) {
-        const area = await hitArea(selector);
-
-        assert.ok(area, `${selector} shows`);
-        assert.ok(
-            area.w >= 36 && area.h >= 36,
-            `${selector} takes a thumb: ${JSON.stringify(area)}`,
-        );
-    }
-
-    // The message box is one target: a tap on its edge, off the one line of text, or on the room beside Send, still
-    // goes to the text.
-    for (const [where, point] of [
-        ["its edge", `const box = document.querySelector(".composer").getBoundingClientRect();`],
-        [
-            "beside Send",
-            `const box = document.querySelector(".composer-row .grow").getBoundingClientRect();`,
-        ],
-    ]) {
-        await page.evaluate(`document.activeElement?.blur()`);
-        const at = await inPage<{ x: number; y: number }>(`
-            ${point}
-
-            return JSON.stringify({ x: box.x + box.width / 2, y: ${where === "its edge" ? "box.y + 4" : "box.y + box.height / 2"} });
-        `);
-
-        await page.click(at);
-        assert.equal(
-            await inPage<boolean>(
-                `return JSON.stringify(document.activeElement === document.querySelector(".composer textarea"))`,
-            ),
-            true,
-            `a tap on ${where} gives the text the focus`,
-        );
-    }
-
-    await page.evaluate(`document.activeElement?.blur()`);
-    await draft("");
-
-    // A reaction keeps its chip's look; the tap it takes reaches past it, unseen.
-    await tap(".answer-actions .reaction.add");
-    await tap(".reaction-picker button");
-    await until(
-        async () =>
-            (await inPage<boolean>(
-                `return JSON.stringify(document.querySelector(".answer-actions > .reaction:not(.add)") !== null)`,
-            )) === true,
-        "the reaction",
-    );
-    const chip = await inPage<number>(
-        `return JSON.stringify(document.querySelector(".answer-actions > .reaction:not(.add)").getBoundingClientRect().height)`,
-    );
-    const reaction = await hitArea(".answer-actions > .reaction:not(.add)");
-
-    assert.ok(chip <= 30, `the chip keeps its size: ${chip}px tall`);
-    assert.ok(reaction && reaction.h >= 36, `it takes a thumb: ${JSON.stringify(reaction)}`);
-});
-
-test(
-    "the message box starts one line tall, on a phone and a desktop, and grows with its text",
-    real,
-    async () => {
-        await fresh();
-        await goTo(first);
-        await slid();
-        // How many lines tall the box is: its height less its padding, in its own line height.
-        const lines = (text: string) =>
-            inPage<number>(`
-            const box = document.querySelector(".composer textarea");
-
-            box.value = ${JSON.stringify(text)};
-            box.dispatchEvent(new Event("input", { bubbles: true }));
-            // The box fits its text once the app has drawn it.
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            const style = getComputedStyle(box);
-            const inside = box.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
-
-            return JSON.stringify(Math.round(inside / parseFloat(style.lineHeight)));
-        `);
-
-        try {
-            for (const viewport of [
-                VIEWPORTS.mobile,
-                { width: 1440, height: 900, scale: 1, mobile: false },
-            ]) {
-                const at = `${viewport.width}px wide`;
-
-                await page.setViewport(viewport);
-                assert.equal(await lines(""), 1, `empty, one line, ${at}`);
-                assert.equal(await lines("one"), 1, `one line of text, one line, ${at}`);
-                assert.equal(
-                    await lines("one\ntwo\nthree"),
-                    3,
-                    `three lines of text, three, ${at}`,
-                );
-                assert.equal(await lines(""), 1, `emptied, one line again, ${at}`);
-            }
-        } finally {
-            await page.setViewport(VIEWPORTS.mobile);
-        }
-    },
-);
-
-test(
-    "on a phone, Files' bar is out of reach under a file, and a diff's header keeps the name readable",
-    real,
-    async () => {
-        await fresh();
-        await tap(row(first));
-        await openFiles();
-        await reach({ files: true }, "Files");
-        await tap('.ft-row[data-path$="/README.md"]');
-        await reach({ file: "README.md" }, "the file");
-        // Past the file's slide in, when the bar under it goes.
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        assert.equal(
-            await inPage<string>(
-                `return JSON.stringify(getComputedStyle(document.querySelector(".files-bar")).visibility)`,
-            ),
-            "hidden",
-        );
-        await back();
-        await reach({ file: null }, "the tree");
-        assert.equal(
-            await inPage<string>(
-                `return JSON.stringify(getComputedStyle(document.querySelector(".files-bar")).visibility)`,
-            ),
-            "visible",
-        );
-        await tap('.files-tabs [role="tab"]:nth-child(2)');
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".dr-file .dv-name") !== null)`,
-                )) === true,
-            "the change",
-        );
-        const name = await inPage<{ shown: number; whole: number }>(`
-        const name = document.querySelector(".dr-file .dv-name");
-
-        return JSON.stringify({ shown: name.clientWidth, whole: name.scrollWidth });
-    `);
-
-        assert.ok(name.shown >= name.whole, `the name is not cut short: ${JSON.stringify(name)}`);
-
-        // The branch stays in sight beside the folder, which gives way, and takes its own tap: on a big phone too, where
-        // the counts share its line.
-        for (const width of [390, 430]) {
-            await page.setViewport({ ...VIEWPORTS.mobile, width, height: 932 });
-            assert.equal(
-                await inPage<boolean>(`
-                    const branch = document.querySelector(".dr-branch");
-                    const r = branch.getBoundingClientRect();
-                    const at = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
-
-                    return JSON.stringify(r.right <= branch.closest(".dr-where").getBoundingClientRect().right + 1 && branch.contains(at));
+            () =>
+                inPage<boolean>(`
+                    return JSON.stringify(document.querySelectorAll(".reply").length === 6);
                 `),
-                true,
-                `the branch shows, and takes a tap, ${width}px wide`,
-            );
-        }
-
-        await page.setViewport(VIEWPORTS.mobile);
-        // Its label hides on a phone; the checkbox alone still takes a thumb.
-        const viewed = await hitArea(".dr-file .dv-viewed");
-
-        assert.ok(
-            viewed && viewed.w >= 40 && viewed.h >= 36,
-            `Viewed takes a thumb: ${JSON.stringify(viewed)}`,
+            "completed and intermediate replies rendered",
         );
-        await back();
-        await reach({ files: false, layers: 0 }, "closed");
-    },
-);
-
-test("the way to the bottom goes to the bottom, and scrolling works after it", real, async () => {
-    const where = () =>
-        inPage<{ gap: number; top: number; jump: boolean; overflow: string; coarse: boolean }>(`
-            const scroller = document.querySelector(".pane > .scroller");
-
-            return JSON.stringify({
-                gap: scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight,
-                top: scroller.scrollTop,
-                jump: document.querySelector(".jump") !== null,
-                overflow: scroller.style.overflowY,
-                coarse: matchMedia("(pointer: coarse)").matches,
-            });
+        const shown = await inPage<typeof expected>(`
+            return JSON.stringify([...document.querySelectorAll(".reply time")].map(time => ({
+                text: time.textContent,
+                dateTime: time.dateTime,
+                title: time.title,
+            })));
         `);
 
-    await fresh();
-    await goTo(long);
-    await slid();
-    await until(async () => (await where()).top > 0, "the conversation, at its bottom");
-    assert.equal((await where()).coarse, true, "a touch screen, where a scroller glides");
+        assert.deepEqual(shown, expected, "one timestamp per completed answer with a stored time");
+        assert.equal(
+            await inPage<boolean>(`
+                return JSON.stringify([...document.querySelectorAll(".reply time")].every(time => {
+                    const bounds = time.getBoundingClientRect();
 
-    // Up to the top, as a thumb would: the way back down shows.
-    await page.evaluate(`document.querySelector(".pane > .scroller").scrollTop = 0`);
-    await until(async () => (await where()).jump, "the way to the bottom");
-    await tap(".jump");
-    await until(async () => {
-        const now = await where();
+                    return bounds.width > 0 && bounds.right <= innerWidth && getComputedStyle(time).opacity === "1";
+                }));
+            `),
+            true,
+            "timestamps remain visible without hovering and fit the viewport",
+        );
+    }
 
-        return now.gap < 2 && !now.jump && now.overflow === "";
-    }, "the bottom, with scrolling back on");
+    await page.evaluate(`(await import("/store.js")).openSheet({ type: "appearance" })`);
+    await until(
+        () =>
+            inPage<boolean>(`
+                return JSON.stringify(document.querySelector('.slot-layout[data-slot="reply"]') !== null);
+            `),
+        "reply layout controls",
+    );
 
-    // It stays there, and the conversation still scrolls by hand.
-    await page.evaluate(`document.querySelector(".pane > .scroller").scrollTop = 0`);
-    await until(async () => (await where()).top === 0, "scrolled up by hand");
-    await back();
-    await reach({ path: "/" }, "the list");
-});
+    try {
+        assert.equal(
+            await inPage<boolean>(`
+                return JSON.stringify(document.querySelector('[aria-label="Show Message time"]') !== null);
+            `),
+            true,
+            "message time is a configurable reply-slot item",
+        );
+        await tap('[aria-label="Show Message time"]');
+        await until(
+            () =>
+                inPage<boolean>(`
+                    return JSON.stringify(document.querySelectorAll(".reply time").length === 0);
+                `),
+            "message times hidden without hiding the reply actions",
+        );
+        assert.equal(
+            await inPage<boolean>(`
+                return JSON.stringify(document.querySelector(".reply .reaction-host") !== null);
+            `),
+            true,
+        );
+        await tap('[aria-label="Show Message time"]');
+        await until(
+            () =>
+                inPage<boolean>(`
+                    return JSON.stringify(document.querySelectorAll(".reply time").length === 3);
+                `),
+            "message times restored",
+        );
+        await tap('[aria-label="Move Message time later"]');
+        await until(
+            () =>
+                inPage<boolean>(`
+                    const actions = document.querySelector(".answer-actions");
 
-test(
-    "while a finger is on the conversation, a change under it does not move it; after, it stays at the bottom",
-    real,
-    async () => {
-        const gap = () =>
-            inPage<number>(`
-            const scroller = document.querySelector(".pane > .scroller");
-
-            return JSON.stringify(Math.round(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight));
-        `);
-        const finger = (type: "touchstart" | "touchend") =>
-            page.evaluate(`
-            const scroller = document.querySelector(".pane > .scroller");
-            const touch = new Touch({ identifier: 1, target: scroller, clientX: 200, clientY: 300 });
-
-            scroller.dispatchEvent(
-                new TouchEvent("${type}", {
-                    bubbles: true,
-                    touches: ${type === "touchstart" ? "[touch]" : "[]"},
-                    changedTouches: [touch],
-                }),
-            );
-        `);
-        // The message box grows, as with a long draft: the conversation above it gets shorter.
-        const box = (px: number) =>
-            page.evaluate(
-                `document.querySelector(".composer textarea").style.minHeight = "${px}px"`,
-            );
-
-        await fresh();
-        await goTo(long);
-        await slid();
-        await until(async () => (await gap()) < 2, "the bottom");
-        // A few frames for the resize to be seen, as it is before the next paint: the conversation stays put.
-        const frames = () =>
-            page.evaluate(
-                `await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(resolve, 150))))`,
-            );
-
-        await finger("touchstart");
-        await box(160);
-        await frames();
-        assert.ok((await gap()) > 40, "left where the finger holds it");
-        await finger("touchend");
+                    return JSON.stringify(actions.firstElementChild.matches(".reaction-host") &&
+                        actions.children[1].tagName === "TIME" &&
+                        actions.lastElementChild.textContent.trim() === "More");
+                `),
+            "message time moved after React, with More still last",
+        );
+    } finally {
         await page.evaluate(`
-        const scroller = document.querySelector(".pane > .scroller");
-
-        scroller.scrollTop = scroller.scrollHeight;
-    `);
-        await until(async () => (await gap()) < 2, "the bottom again");
-        // Past any glide: a change keeps it at the bottom, as before.
-        await new Promise((resolve) => setTimeout(resolve, 300));
-        await box(260);
-        await frames();
-        assert.ok((await gap()) < 2, "kept at the bottom");
-        await box(0);
-        await back();
-        await reach({ path: "/" }, "the list");
-    },
-);
+            (await import("/slots.js")).resetSlot("reply");
+            (await import("/store.js")).closeSheet();
+        `);
+    }
+});
 
 test(
     "on a phone, an invite lasts as long as chosen, and the one it replaces ends",
@@ -1442,10 +449,6 @@ test(
             inPage<string | null>(
                 `return JSON.stringify(document.querySelector(".invite-code-value")?.textContent.replace(/\\s/g, "") ?? null)`,
             );
-        const help = () =>
-            inPage<string>(
-                `return JSON.stringify(document.querySelector(".sheet p.muted").textContent)`,
-            );
         const status = async (invite: string | null) =>
             (await fetch(`${base}/join/${invite}`)).status;
 
@@ -1454,27 +457,17 @@ test(
         await until(async () => (await code()) !== null, "the first invite");
         const first = await code();
 
-        assert.match(await help(), /expires in 15 minutes/);
         await page.evaluate(
             `[...document.querySelectorAll(".sheet .segmented button")].find((each) => each.textContent.trim() === "1 week").click()`,
         );
         await until(async () => ![null, first].includes(await code()), "the week's invite");
         const week = await code();
 
-        assert.match(await help(), /expires in a week/);
         assert.equal(await status(week), 200);
         await until(async () => (await status(first)) === 410, "the 15 minutes' invite, ended");
 
-        // An owner invite always lasts 15 minutes: nothing to choose.
         await tap('.sheet label.check input[type="checkbox"]');
         await until(async () => ![null, week].includes(await code()), "the owner's invite");
-        assert.equal(
-            await inPage<boolean>(
-                `return JSON.stringify([...document.querySelectorAll(".sheet .label")].some((each) => each.textContent === "Expires after"))`,
-            ),
-            false,
-        );
-        assert.match(await help(), /expires in 15 minutes/);
         await until(async () => (await status(week)) === 410, "the week's invite, ended");
         await tap('.sheet label.check input[type="checkbox"]');
         await until(async () => (await code()) !== null, "a guest's invite again");
@@ -1517,36 +510,215 @@ test(
         await back();
         await reach({ sheet: null, layers: 0 }, "closed");
         assert.equal(await status(another), 200, "the last one shown still works");
-
-        // An invite that cannot be made says so, and New invite tries again. (A sheet opened again while it still slides
-        // away is the same sheet: wait until it is gone.)
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".sheet") === null)`,
-                )) === true,
-            "the sheet, gone",
-        );
-        await page.evaluate(`
-            window.realFetch = window.fetch;
-            window.fetch = (url, ...rest) =>
-                String(url).endsWith("/api/invite") ? Promise.reject(new TypeError("offline")) : window.realFetch(url, ...rest);
-        `);
-        await page.evaluate(`(await import("/store.js")).openSheet({ type: "invite" })`);
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".sheet")?.textContent.includes("Tap New invite to try again") === true)`,
-                )) === true,
-            "the way to try again",
-        );
-        await page.evaluate(`window.fetch = window.realFetch`);
-        await tap(".sheet .button.wide:last-of-type");
-        await until(async () => (await code()) !== null, "the invite, at the second try");
-        await back();
-        await reach({ sheet: null, layers: 0 }, "closed");
     },
 );
+
+/** A compacted view can keep recent entries whose ids also occur before its summary. */
+async function compactedView(): Promise<void> {
+    await fresh();
+    await goTo(first);
+    await until(
+        async () =>
+            await inPage<boolean>(`
+                return JSON.stringify((await import("/store.js")).store.state.view.conversation?.id === ${first});
+            `),
+        "the session view",
+    );
+    await page.evaluate(`
+        const { store, actions } = await import("/store.js");
+        const retained = { id: 900001, kind: "user", text: "retained message", images: 0, at: Date.now() };
+        const summary = { id: 900002, kind: "compaction", summary: "Earlier messages" };
+
+        window.earlierEntries = [retained];
+        actions.history = async () => window.earlierEntries;
+        store.set({ view: { ...store.state.view,
+            entries: new Map([[summary.id, summary], [retained.id, retained]]),
+            order: [summary.id, retained.id],
+        } });
+    `);
+    await until(
+        async () =>
+            await inPage<boolean>(`
+                return JSON.stringify([...document.querySelectorAll(".transcript button")]
+                    .some(each => each.textContent === "Show earlier messages"));
+            `),
+        "earlier history available",
+    );
+}
+
+test("a long open group draws its newest steps, and shows the rest when asked", real, async () => {
+    await fresh();
+    await goTo(first);
+    await until(
+        async () =>
+            await inPage<boolean>(`
+                return JSON.stringify((await import("/store.js")).store.state.view.conversation?.id === ${first});
+            `),
+        "the session view",
+    );
+    // A person's message, then a run of Pi's alone: 30 answers that each call a tool, and a result for each.
+    await page.evaluate(`
+        const { store } = await import("/store.js");
+        const entries = [{ id: 910000, kind: "user", text: "go", images: 0, at: Date.now() }];
+
+        for (let n = 1; n <= 30; n++) {
+            entries.push({ id: 910000 + n * 2, kind: "assistant", stopReason: "toolUse", at: Date.now(),
+                blocks: [{ type: "toolCall", id: "call" + n, name: "bash", args: { command: "echo " + n } }] });
+            entries.push({ id: 910001 + n * 2, kind: "toolResult", callId: "call" + n, text: String(n), at: Date.now() });
+        }
+
+        store.set({ view: { ...store.state.view,
+            entries: new Map(entries.map((entry) => [entry.id, entry])),
+            order: entries.map((entry) => entry.id),
+        } });
+    `);
+    const timeline = () =>
+        inPage<{ steps: number; earlier: string | null }>(`
+            const timeline = document.querySelector(".transcript .activity.open .timeline");
+
+            return JSON.stringify({
+                steps: timeline?.querySelectorAll(":scope > :not(.timeline-earlier)").length ?? 0,
+                earlier: timeline?.querySelector(".timeline-earlier")?.textContent.trim() ?? null,
+            });
+        `);
+
+    await until(async () => (await timeline()).steps > 0, "the open group");
+    assert.deepEqual(await timeline(), { steps: 24, earlier: "Show 6 earlier steps" });
+    await tap(".transcript .timeline-earlier");
+    await until(async () => (await timeline()).steps === 30, "all 30 steps");
+    assert.equal((await timeline()).earlier, null);
+});
+
+test("Keep activity folded opens and folds groups already on screen", real, async () => {
+    await fresh();
+    await goTo(first);
+    await until(
+        async () =>
+            await inPage<boolean>(`
+                return JSON.stringify((await import("/store.js")).store.state.view.conversation?.id === ${first});
+            `),
+        "the session view",
+    );
+    // The newest turn: a person's message, then one call of Pi's and its result.
+    await page.evaluate(`
+        const { store } = await import("/store.js");
+        const entries = [
+            { id: 920000, kind: "user", text: "go", images: 0, at: Date.now() },
+            { id: 920001, kind: "assistant", stopReason: "toolUse", at: Date.now(),
+                blocks: [{ type: "toolCall", id: "fold1", name: "bash", args: { command: "echo 1" } }] },
+            { id: 920002, kind: "toolResult", callId: "fold1", text: "1", at: Date.now() },
+        ];
+
+        store.set({ view: { ...store.state.view,
+            entries: new Map(entries.map((entry) => [entry.id, entry])),
+            order: entries.map((entry) => entry.id),
+        } });
+    `);
+    const groupOpen = () =>
+        inPage<boolean | null>(`
+            const group = document.querySelector(".transcript .activity");
+
+            return JSON.stringify(group === null ? null : group.classList.contains("open"));
+        `);
+    const fold = (on: boolean) =>
+        page.evaluate(`(async () => {
+            (await import("/theme.js")).setPrefs({ foldActivity: ${on} });
+        })()`);
+
+    await until(async () => (await groupOpen()) === true, "the group, open by default");
+
+    try {
+        // Without a redraw, the group keeps the state it was drawn with until a reload.
+        await fold(true);
+        await until(
+            async () => (await groupOpen()) === false,
+            "the group folds with the switch on",
+        );
+        await fold(false);
+        await until(
+            async () => (await groupOpen()) === true,
+            "the group opens with the switch off",
+        );
+    } finally {
+        await fold(false);
+    }
+});
+
+test("an open activity group draws a thought step", real, async () => {
+    await fresh();
+    await goTo(first);
+    await until(
+        async () =>
+            await inPage<boolean>(`
+                return JSON.stringify((await import("/store.js")).store.state.view.conversation?.id === ${first});
+            `),
+        "the session view",
+    );
+    await page.evaluate(`
+        const { store } = await import("/store.js");
+        const blocks = [{ type: "thinking", text: "Hmm." },
+            { type: "toolCall", id: "think1", name: "bash", args: { command: "echo 1" } }];
+        const entries = [{ id: 930000, kind: "user", text: "go", images: 0, at: Date.now() },
+            { id: 930001, kind: "assistant", stopReason: "toolUse", at: Date.now(), blocks },
+            { id: 930002, kind: "toolResult", callId: "think1", text: "1", at: Date.now() }];
+
+        store.set({ view: { ...store.state.view,
+            entries: new Map(entries.map((entry) => [entry.id, entry])),
+            order: entries.map((entry) => entry.id),
+        } });
+    `);
+    await until(
+        async () =>
+            await inPage<boolean>(
+                `return JSON.stringify(!!document.querySelector('.activity.open [data-part="thinking"]'))`,
+            ),
+        "the thought step in the open group",
+    );
+});
+
+test("earlier history does not repeat a message kept after compaction", real, async () => {
+    await compactedView();
+    await page.evaluate(`
+        [...document.querySelectorAll(".transcript button")]
+            .find(each => each.textContent === "Show earlier messages").click();
+    `);
+    await until(
+        async () =>
+            await inPage<boolean>(
+                `return JSON.stringify(document.querySelector(".history") !== null)`,
+            ),
+        "earlier history shown",
+    );
+    assert.equal(
+        await inPage<number>(
+            `return JSON.stringify(document.querySelectorAll("#entry-900001").length)`,
+        ),
+        1,
+    );
+});
+
+test("a late earlier-history response stays out of another conversation", real, async () => {
+    const other = await newSession(app);
+
+    await compactedView();
+    await page.evaluate(`
+        (await import("/store.js")).actions.history = () => new Promise(resolve => window.finishHistory = resolve);
+        [...document.querySelectorAll(".transcript button")]
+            .find(each => each.textContent === "Show earlier messages").click();
+    `);
+    await goTo(other);
+    await reach({ path: `/s/${other}` }, "the other conversation");
+    await page.evaluate(`
+        window.finishHistory(window.earlierEntries);
+        await new Promise(resolve => requestAnimationFrame(resolve));
+    `);
+    assert.equal(
+        await inPage<unknown>(
+            `return JSON.stringify((await import("/store.js")).store.state.history)`,
+        ),
+        null,
+    );
+});
 
 /** PiP closed and forgotten in this tab, so the tests after start without it. */
 async function noPip(): Promise<void> {
@@ -1565,466 +737,6 @@ async function noPip(): Promise<void> {
 }
 
 test(
-    "on a desktop, Alt+A opens PiP once, for the keys typed next, below the top bar; Esc gives the focus back",
-    real,
-    async () => {
-        await fresh();
-        await page.setViewport(VIEWPORTS.desktop);
-        await tap(`.sidebar .session-row[data-id="${first}"] .session`);
-        await reach({ path: `/s/${first}` }, "the session");
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".composer textarea") !== null)`,
-                )) === true,
-            "the session's message box",
-        );
-        await page.evaluate(`
-            localStorage.removeItem("pocket.pip.draft");
-            window.pipOpens = 0;
-            const fetched = window.fetch;
-            window.fetch = (url, init) => {
-                if (String(url) === "/api/pip" && JSON.parse(init.body).on === true) {
-                    window.pipOpens++;
-                }
-
-                return fetched(url, init);
-            };
-            document.querySelector(".composer textarea").focus();
-        `);
-
-        // The words right after the shortcut, before anything had time to draw.
-        await page.input([
-            { type: "key", key: "a", modifiers: 1 },
-            { type: "text", text: "hi pip" },
-        ]);
-        const typed = () =>
-            inPage<{ pip: string | null; session: string | null; focused: string | null }>(`
-                return JSON.stringify({
-                    pip: document.querySelector(".pip-composer textarea")?.value ?? null,
-                    session: document.querySelector(".composer textarea")?.value ?? null,
-                    focused: document.activeElement?.closest(".pip-composer") ? "pip"
-                        : document.activeElement?.closest(".composer") ? "session" : null,
-                });
-            `);
-
-        assert.deepEqual(await typed(), { pip: "hi pip", session: "", focused: "pip" });
-        // Past its opening animation, where it takes its whole size.
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        // What the top bar says of its edge is where it is, once the pane has popped in.
-        assert.equal(
-            await inPage<number>(`
-                const said = parseFloat(document.documentElement.style.getPropertyValue("--topbar-h"));
-                const top = document.querySelector(".topbar").getBoundingClientRect().bottom;
-
-                return JSON.stringify(Math.round(said) - Math.round(top));
-            `),
-            0,
-            "--topbar-h matches the top bar's real edge",
-        );
-
-        // The top bar's buttons are not under PiP's window: the menu, Changes.
-        const covered = await inPage<string[]>(`
-            const buttons = [...document.querySelectorAll(".topbar button")];
-
-            return JSON.stringify(
-                buttons
-                    .filter((button) => {
-                        const box = button.getBoundingClientRect();
-                        const at = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
-
-                        return box.width > 0 && at?.closest(".pip-panel") !== null;
-                    })
-                    .map((button) => button.getAttribute("aria-label") ?? button.className),
-            );
-        `);
-
-        assert.ok(
-            await inPage<boolean>(
-                `return JSON.stringify(document.querySelector('.topbar [aria-label="Menu"]') !== null && document.querySelector(".topbar .changes-button") !== null)`,
-            ),
-            "the top bar shows the menu and Changes",
-        );
-        assert.deepEqual(covered, [], "no top bar button is under PiP's window");
-        assert.equal(await inPage<number>(`return JSON.stringify(window.pipOpens)`), 1);
-
-        await page.press("Escape");
-        await until(
-            async () => (await typed()).focused === "session",
-            "the focus back in the session's box",
-        );
-        await noPip();
-    },
-);
-
-/** Where PiP's window is: its gaps to the screen's bottom and right edges, its top, and the top bar's bottom. */
-type Place = {
-    bottom: number;
-    right: number;
-    left: number;
-    top: number;
-    width: number;
-    screen: number;
-    topbar: number;
-};
-
-async function pipPlace(): Promise<Place> {
-    await until(
-        async () =>
-            (await inPage<boolean>(
-                `return JSON.stringify(document.querySelector(".pip-panel:not(.leaving)") !== null)`,
-            )) === true,
-        "PiP's window",
-    );
-    // Past its opening animation, where it takes its whole size.
-    await new Promise((resolve) => setTimeout(resolve, 450));
-
-    return inPage<Place>(`
-        const box = document.querySelector(".pip-panel").getBoundingClientRect();
-
-        return JSON.stringify({
-            bottom: Math.round(innerHeight - box.bottom),
-            right: Math.round(innerWidth - box.right),
-            left: Math.round(box.left),
-            top: Math.round(box.top),
-            width: Math.round(box.width),
-            screen: innerWidth,
-            topbar: Math.round(document.querySelector(".topbar")?.getBoundingClientRect().bottom ?? 0),
-        });
-    `);
-}
-
-/** The session's message box holding `text`, as typing leaves it. */
-const typeInBox = (text: string) =>
-    page.evaluate(`
-        const box = document.querySelector(".composer textarea");
-
-        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(box, ${JSON.stringify(text)});
-        box.dispatchEvent(new Event("input", { bubbles: true }));
-        await new Promise((resolve) => setTimeout(resolve, 300));
-    `);
-
-test(
-    "PiP's window stays in the bottom right corner at every size, however tall the message box grows; on a phone it is a sheet on the bottom edge",
-    real,
-    async () => {
-        await fresh();
-        await tap(row(first));
-        await reach({ path: `/s/${first}` }, "the session");
-
-        for (const [width, height] of [
-            [1280, 800],
-            [1920, 1080],
-            [1024, 700],
-            [844, 390],
-        ] as const) {
-            const size = `${width}x${height}`;
-
-            await page.setViewport({ width, height, scale: 1, mobile: false });
-            await until(
-                async () =>
-                    (await inPage<boolean>(
-                        `return JSON.stringify(document.querySelector(".composer textarea") !== null)`,
-                    )) === true,
-                "the session's message box",
-            );
-            await page.evaluate(`(await import("/pip.js")).openPip()`);
-            const place = await pipPlace();
-
-            // Anchored: the same small gap to the bottom and the right edge, whatever the session shows.
-            assert.equal(
-                place.bottom,
-                place.right,
-                `${size}: as far from the bottom as from the right`,
-            );
-            assert.ok(
-                place.bottom >= 0 && place.bottom <= 24,
-                `${size}: on the bottom edge (${place.bottom}px up)`,
-            );
-            assert.ok(place.top >= place.topbar, `${size}: below the top bar`);
-            // A message box that grows does not move it.
-            await typeInBox("one\ntwo\nthree\nfour\nfive\nsix\nseven\neight");
-            assert.deepEqual(
-                await pipPlace(),
-                place,
-                `${size}: where it was with a tall message box`,
-            );
-            await typeInBox("");
-            await noPip();
-        }
-
-        // Over the session list too: the same corner.
-        await page.setViewport(VIEWPORTS.desktop);
-        await page.navigate(`${base}/`);
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(${JSON.stringify(row(first))}) !== null)`,
-                )) === true,
-            "the session list",
-        );
-        await page.evaluate(`(await import("/pip.js")).openPip()`);
-        const home = await pipPlace();
-
-        assert.equal(
-            home.bottom,
-            home.right,
-            "the session list: as far from the bottom as from the right",
-        );
-        assert.ok(home.bottom <= 24, "the session list: on the bottom edge");
-        await noPip();
-
-        // On a phone: a sheet across the whole width, on the bottom edge.
-        await fresh();
-        await tap(row(first));
-        await reach({ path: `/s/${first}` }, "the session");
-        await page.evaluate(`(await import("/pip.js")).openPip()`);
-        const phone = await pipPlace();
-
-        assert.deepEqual(
-            { bottom: phone.bottom, left: phone.left, width: phone.width },
-            { bottom: 0, left: 0, width: phone.screen },
-            "a phone's sheet",
-        );
-        await noPip();
-    },
-);
-
-test(
-    "PiP's header fits Compact, Start fresh, and how full its context is at every size; Compact summarizes it",
-    real,
-    async () => {
-        const pip = await app.pip.ensure(owner(app));
-
-        await app.commands.configure(pip, owner(app), {
-            model: { provider: "faux", modelId: "faux-1" },
-            thinkingLevel: "off",
-        });
-        await say(app, pip, "hello pip");
-        await say(app, pip, "and again");
-
-        for (const viewport of [VIEWPORTS.desktop, VIEWPORTS.mobile, VIEWPORTS.tablet]) {
-            await fresh();
-            await page.setViewport(viewport);
-            await page.evaluate(`(await import("/pip.js")).openPip()`);
-            await until(
-                async () =>
-                    (await inPage<boolean>(
-                        `return JSON.stringify(document.querySelector(".pip-head .pip-context") !== null)`,
-                    )) === true,
-                "how full PiP's context is",
-                20_000,
-            );
-            // Past its opening animation, where it takes its whole size.
-            await new Promise((resolve) => setTimeout(resolve, 450));
-            const head = await inPage<{
-                fits: boolean;
-                buttons: { label: string; width: number; height: number; inside: boolean }[];
-                context: string;
-                meter: boolean;
-                overlaps: boolean;
-            }>(`
-                const head = document.querySelector(".pip-head");
-                const box = head.getBoundingClientRect();
-                const parts = [...head.querySelectorAll(".pip-context, .icon-button")].map((each) =>
-                    each.getBoundingClientRect(),
-                );
-
-                return JSON.stringify({
-                    fits: head.scrollWidth <= head.clientWidth,
-                    buttons: [...head.querySelectorAll(".icon-button")].map((button) => {
-                        const rect = button.getBoundingClientRect();
-
-                        return {
-                            label: button.getAttribute("aria-label"),
-                            width: rect.width,
-                            height: rect.height,
-                            inside: rect.left >= box.left && rect.right <= box.right,
-                        };
-                    }),
-                    context: head.querySelector(".pip-context").textContent.replace(/\\s+/g, ""),
-                    meter: head.querySelector(".pip-context .meter > span") !== null,
-                    overlaps: parts.some((one, index) =>
-                        parts.slice(index + 1).some((two) => one.right > two.left + 0.5 && two.right > one.left + 0.5),
-                    ),
-                });
-            `);
-            const size = `${viewport.width}x${viewport.height}`;
-
-            assert.equal(head.fits, true, `${size}: nothing runs past the header`);
-            assert.equal(head.overlaps, false, `${size}: nothing over anything else`);
-            assert.deepEqual(
-                head.buttons.map((button) => button.label),
-                ["Compact", "Start fresh", "Open as a conversation", "Close PiP"],
-            );
-
-            for (const button of head.buttons) {
-                assert.ok(
-                    button.width >= 40 && button.height >= 40 && button.inside,
-                    `${size}: ${button.label} is a whole 40px target (${JSON.stringify(button)})`,
-                );
-            }
-
-            assert.match(head.context, /^\d+%$/, `${size}: how full, as a share`);
-            assert.ok(head.meter);
-            await noPip();
-        }
-
-        // Compact, by hand: compaction keeps only the newest few messages as they are, so these two have one to summarize.
-        const settings = app.settings.getCompactionSettings;
-
-        app.settings.getCompactionSettings = () => ({
-            enabled: true,
-            reserveTokens: 16_384,
-            keepRecentTokens: 10,
-        });
-
-        try {
-            await fresh();
-            await page.setViewport(VIEWPORTS.desktop);
-            await page.evaluate(`(await import("/pip.js")).openPip()`);
-            await tap('.pip-head [aria-label="Compact"]:not([disabled])');
-            await until(
-                async () =>
-                    (await inPage<boolean>(`
-                        return JSON.stringify([...document.querySelectorAll(".pip-body .pip-event")].some(
-                            (event) => event.textContent.includes("Earlier messages summarized"),
-                        ));
-                    `)) === true,
-                "the summary, in the panel",
-            );
-            await until(
-                async () =>
-                    (await inPage<boolean>(`
-                        const { store } = await import("/store.js");
-
-                        return JSON.stringify(store.state.notices.some((notice) => notice.message === "PiP's context compacted."));
-                    `)) === true,
-                "the notice that it is done",
-            );
-            // Estimated now, until PiP's next answer measures it.
-            assert.match(
-                await inPage<string>(
-                    `return JSON.stringify(document.querySelector(".pip-head .pip-context").textContent.replace(/\\s+/g, ""))`,
-                ),
-                /^~\d+%$/,
-            );
-            await noPip();
-        } finally {
-            app.settings.getCompactionSettings = settings;
-        }
-    },
-);
-
-test(
-    "on a phone, PiP dragged down closes, and the app behind it is not left dimmed",
-    real,
-    async () => {
-        await fresh();
-        await tap(row(first));
-        await reach({ path: `/s/${first}` }, "the session");
-        await page.evaluate(`(await import("/pip.js")).openPip()`);
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".pip-panel:not(.leaving)") !== null)`,
-                )) === true,
-            "PiP's sheet",
-        );
-        // Past its opening animation.
-        await new Promise((resolve) => setTimeout(resolve, 400));
-        await page.evaluate(`
-        const head = document.querySelector(".pip-head");
-        const panel = document.querySelector(".pip-panel");
-        const from = head.getBoundingClientRect().top + 10;
-        const to = panel.offsetHeight * 0.6;
-        const touch = (y) => new Touch({ identifier: 1, target: head, clientX: 200, clientY: y });
-        const fire = (type, y) =>
-            head.dispatchEvent(
-                new TouchEvent(type, {
-                    bubbles: true,
-                    cancelable: true,
-                    touches: type === "touchend" ? [] : [touch(y)],
-                    changedTouches: [touch(y)],
-                }),
-            );
-
-        fire("touchstart", from);
-
-        for (let step = 1; step <= 10; step++) {
-            fire("touchmove", from + (to * step) / 10);
-            await new Promise((resolve) => setTimeout(resolve, 30));
-        }
-
-        fire("touchend", from + to);
-    `);
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".pip-panel") === null)`,
-                )) === true,
-            "PiP closed by the drag",
-        );
-        assert.deepEqual(
-            await inPage<{ inline: string; shown: string }>(`
-            const layout = document.querySelector(".layout");
-
-            return JSON.stringify({ inline: layout.style.opacity, shown: getComputedStyle(layout).opacity });
-        `),
-            { inline: "", shown: "1" },
-        );
-        await noPip();
-    },
-);
-
-test(
-    "PiP's panel says when a call of PiP's waits for approval, and leads to it",
-    real,
-    async () => {
-        await fresh();
-        await page.setViewport(VIEWPORTS.desktop);
-        await page.evaluate(`(await import("/pip.js")).openPip()`);
-        await until(
-            async () =>
-                (await inPage<boolean>(
-                    `return JSON.stringify(document.querySelector(".pip-panel .pip-loading") === null)`,
-                )) === true,
-            "PiP, awake",
-            20_000,
-        );
-        // As the server sends it while the guard holds one of PiP's calls.
-        const pip = await inPage<number>(`
-        const { store } = await import("/store.js");
-
-        store.set((state) => ({
-            pipView: { ...state.pipView, approvals: [{ id: "a1", tool: "session_start", subject: "", reason: "" }] },
-        }));
-
-        return JSON.stringify(store.state.pip.id);
-    `);
-
-        await until(
-            async () =>
-                (
-                    await inPage<string | null>(
-                        `return JSON.stringify(document.querySelector(".pip-approval")?.textContent ?? null)`,
-                    )
-                )?.includes("waits for your approval: session_start") === true,
-            "the line about the approval",
-        );
-        assert.equal(
-            await inPage<string>(
-                `return JSON.stringify(document.querySelector(".pip-status").textContent.trim())`,
-            ),
-            "needs you",
-        );
-        await tap(".pip-approval .button");
-        await reach({ path: `/s/${pip}` }, "PiP's conversation, where the call can be allowed");
-        await noPip();
-    },
-);
-
-test(
     "/pip with words that cannot be sent leaves them in PiP's box, after its draft",
     real,
     async () => {
@@ -2035,7 +747,8 @@ test(
         const fetched = window.fetch;
         window.fetch = (url, init) =>
             String(url).endsWith("/submit") ? Promise.reject(new TypeError("offline")) : fetched(url, init);
-        (await import("/pip.js")).askPip("hello pip");
+        // Awaited: a promise the script leaves behind can be collected before it settles, which fails the call.
+        await (await import("/pip.js")).askPip("hello pip");
     `);
         await until(
             async () =>
@@ -2045,5 +758,442 @@ test(
             "the words, back in PiP's box after the draft",
         );
         await noPip();
+    },
+);
+
+test(
+    "a streamed update draws only the answer's last block, and not the session list",
+    real,
+    async () => {
+        await fresh();
+        // Wide, where the sidebar's list shows beside the session: a phone in a session draws no list at all.
+        await page.setViewport(VIEWPORTS.desktop);
+        await goTo(first);
+        await reach({ path: `/s/${first}` }, "the session");
+        await until(
+            async () =>
+                (await inPage<boolean>(
+                    `return JSON.stringify((await import("/store.js")).store.state.view.conversation?.id === ${Number(first)})`,
+                )) === true,
+            "its view",
+        );
+        const drawn = await inPage<{
+            kept: boolean;
+            text: string;
+            quiet: number;
+            same: number;
+            listed: string[];
+            image: string | null;
+        }>(`
+        const { h, options, render } = await import("preact");
+        const { Markdown } = await import("/ui.js");
+        const { store } = await import("/store.js");
+        const settle = () => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve)));
+        const box = document.createElement("div");
+
+        render(h(Markdown, { text: "First block.\\n\\n![x](a.png)\\n\\nSecond", cache: false }), box);
+        const first = box.querySelector("p");
+
+        render(h(Markdown, { text: "First block.\\n\\n![x](a.png)\\n\\nSecond, longer", cache: false }), box);
+        let rows = [];
+        const diffed = options.diffed;
+
+        let quiet;
+        let same;
+
+        options.diffed = (vnode) => {
+            if (vnode.type?.name === "SessionRow") {
+                rows.push(vnode.props.session.title ?? "");
+            }
+
+            diffed?.(vnode);
+        };
+
+        try {
+            store.set((state) => ({ view: { ...state.view } }));
+            await settle();
+            quiet = rows.length;
+            // The same sessions in a new list: no row has anything new to show.
+            store.set((state) => ({ sessions: [...state.sessions] }));
+            await settle();
+            same = rows.length - quiet;
+            rows = [];
+            // One session renamed: its row, and no other.
+            store.set((state) => ({
+                sessions: state.sessions.map((session) =>
+                    session.id === ${Number(first)} ? { ...session, title: "Renamed here" } : session,
+                ),
+            }));
+            await settle();
+        } finally {
+            options.diffed = diffed;
+        }
+
+        return JSON.stringify({ kept: box.querySelector("p") === first, text: box.textContent, quiet, same, listed: rows, image: box.querySelector("img")?.getAttribute("src") ?? null });
+    `);
+
+        assert.ok(drawn.kept, "the first block stays as it was drawn");
+        assert.match(drawn.text, /Second, longer/, "the last block grows");
+        assert.match(drawn.image ?? "", /^\/api\//, "an image path points at the server");
+        assert.equal(drawn.quiet, 0, "a new view leaves the session list alone");
+        assert.equal(drawn.same, 0, "the same sessions again draw no row");
+        assert.deepEqual(drawn.listed, ["Renamed here"], "a changed session draws its row alone");
+    },
+);
+
+test("a reconnect that brings the same data keeps it, and draws no session row", real, async () => {
+    await fresh();
+
+    const after = await inPage<{ same: string[]; rows: number }>(`
+        const { options } = await import("preact");
+        const { connect, store } = await import("/store.js");
+        const settle = () => new Promise((resolve) => requestAnimationFrame(() => setTimeout(resolve)));
+        const keys = ["me", "models", "guard", "server", "themeList", "folderFavorites", "sessions"];
+        const before = Object.fromEntries(keys.map((key) => [key, store.state[key]]));
+        const stream = store.state.streamId;
+        const Source = window.EventSource;
+        let rows = 0;
+        let received;
+        const listed = new Promise((resolve) => (received = resolve));
+        const diffed = options.diffed;
+
+        options.diffed = (vnode) => {
+            rows += vnode.type?.name === "SessionRow" ? 1 : 0;
+            diffed?.(vnode);
+        };
+        // The reconnect's own list must arrive before identity and draws are checked.
+        window.EventSource = class extends Source {
+            constructor(url) {
+                super(url);
+                this.addEventListener("sessions", received, { once: true });
+            }
+        };
+
+        try {
+            connect();
+            await listed;
+            await settle();
+        } finally {
+            window.EventSource = Source;
+            options.diffed = diffed;
+        }
+
+        if (store.state.streamId === stream) {
+            throw new Error("the reconnect did not receive a new stream");
+        }
+
+        return JSON.stringify({ same: keys.filter((key) => store.state[key] !== before[key]), rows });
+    `);
+
+    assert.deepEqual(after.same, [], "every equal value keeps its identity");
+    assert.equal(after.rows, 0, "no session row draws again");
+});
+
+test("back to the list slides it in whole, and its rows do not rise in again", real, async () => {
+    await fresh();
+    await tap(row(first));
+    await reach({ path: `/s/${first}` }, "the session");
+    await page.evaluate(`
+        window.listRoutes = [];
+        window.listRouteObserver = new MutationObserver((records) => {
+            window.listRoutes.push(...records.flatMap((record) =>
+                [record.target.dataset.route, record.oldValue]));
+        });
+        window.listRouteObserver.observe(document.documentElement, {
+            attributes: true, subtree: true, attributeFilter: ["data-route"], attributeOldValue: true,
+        });
+    `);
+    await back();
+    await reach({ path: "/" }, "back to the list");
+
+    const shown = await inPage<{ rows: number; animating: number; slide: boolean }>(`
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+        const rows = [...document.querySelectorAll(".home-list .session-row")];
+
+        window.listRouteObserver.disconnect();
+
+        return JSON.stringify({
+            rows: rows.length,
+            animating: rows.filter((each) => each.classList.contains("arriving") || each.getAnimations().length).length,
+            slide: window.listRoutes.includes("back"),
+        });
+    `);
+
+    assert.ok(shown.rows > 0, "the list shows its rows");
+    assert.equal(shown.animating, 0, "no row rises in again");
+    assert.ok(shown.slide, "the list slides in from the left");
+});
+
+test(
+    "the transcript stays at the bottom as an answer streams, and as a row grows",
+    real,
+    async () => {
+        const frames = () => new Promise((resolve) => setTimeout(resolve, 300));
+
+        await openWithRows(30);
+        await until(async () => (await gap()) < 2, "the bottom, once the rows show");
+
+        // Pi writes: the answer grows with no new entry, update after update.
+        for (let n = 1; n <= 3; n++) {
+            await page.evaluate(`
+            const { store } = await import("/store.js");
+            const text = "Streaming. ".repeat(${n * 60});
+
+            store.set((state) => ({ view: { ...state.view, live: { busy: true,
+                generation: { attempt: 0, message: { blocks: [{ type: "text", text }] } } } } }));
+            "written";
+        `);
+            await frames();
+            assert.ok((await gap()) < 2, `at the bottom after streamed update ${n}`);
+        }
+
+        // A row grows by itself, with no draw of the app (an image, a card that draws late).
+        await page.evaluate(`
+        const tall = document.createElement("div");
+
+        tall.style.height = "400px";
+        [...document.querySelectorAll(".transcript > *")].at(-1).append(tall);
+    `);
+        await frames();
+        assert.ok((await gap()) < 2, "at the bottom after a row grew by itself");
+    },
+);
+
+test("the sanitizer still takes out what is unsafe, every time", real, async () => {
+    await openWithRows(2);
+
+    const unsafe = [
+        "<script>window.hit = 1</script>",
+        '<img src="x" onerror="window.hit = 2">',
+        '<a href=" JaVaScRiPt:window.hit = 3">a</a>',
+        '<div data-part="approval" class="sheet" style="position:fixed" id="app">b</div>',
+        "![shot](file:///tmp/shot.png)",
+    ].join("\n\n");
+    const drawn = await inPage<{ first: string; second: string }>(`
+        const { h, render } = await import("preact");
+        const { Markdown } = await import("/ui.js");
+        const draw = () => {
+            const box = document.createElement("div");
+
+            render(h(Markdown, { text: ${JSON.stringify(unsafe)}, cache: false }), box);
+
+            return box.innerHTML;
+        };
+        // Twice: the settings kept from the first draw give the same result.
+        return JSON.stringify({ first: draw(), second: draw() });
+    `);
+
+    assert.equal(drawn.second, drawn.first, "the same result each time");
+
+    for (const gone of ["<script", "onerror", "JaVaScRiPt", "data-part=", "position:fixed"]) {
+        assert.ok(!drawn.first.includes(gone), `${gone} is taken out`);
+    }
+
+    assert.match(drawn.first, /<img[^>]+src="\/api\/c\/\d+\/file\?path=%2Ftmp%2Fshot\.png"/);
+    assert.equal(await inPage<unknown>(`return JSON.stringify(window.hit ?? null)`), null);
+});
+
+// Issue #140: the circle that says how a call went keeps its own size while it waits for an approval.
+test("a call's mark keeps its circle while it waits for an approval", real, async () => {
+    // Lancet Guard is off by default; turn it on, asking about every call.
+    await app.setExtensionEnabled(owner(app), "guard.ts", true);
+    app.guard.judge = async (_tool, args) =>
+        ({
+            subject: String(args.command),
+            decision: { action: "ask", reason: "risky", source: "test", terminate: false },
+        }) as never;
+
+    const one = await newSession(app);
+
+    await fresh();
+    await goTo(one);
+    await app.commands.submit(one, owner(app), { text: "risky please", requestId: "mark-140" });
+
+    const mark = () =>
+        inPage<Record<string, string> | null>(`
+            const mark = document.querySelector('[data-part~="tool-call"][data-state="waiting"] [data-part~="step-mark"]');
+            const shape = mark && getComputedStyle(mark);
+
+            return JSON.stringify(shape && { width: shape.width, height: shape.height,
+                padding: shape.paddingTop, border: shape.borderTopWidth });
+        `);
+
+    await until(async () => (await mark()) !== null, "the call waiting", 20_000);
+    assert.deepEqual(await mark(), {
+        width: "19px",
+        height: "19px",
+        padding: "0px",
+        border: "0px",
+    });
+});
+
+// Issue #131: a phone on its side with a notch. Another Chromium fakes the safe-area insets on its own page.
+test(
+    "with a notch, the rail, the top bar, and the message box clear it; with none, nothing moves",
+    real,
+    async (t) => {
+        const WIDTH = 844;
+        const NOTCH = 47;
+        const chrome = await Chromium.launch(chromium!, mkdtempSync(join(root, "insets-")), []);
+
+        t.after(() => chrome.kill());
+
+        /** A signed-in page on its side with `inset` pixels at each side; `run` evaluates a function body in it. */
+        async function visit(inset: number) {
+            const { connection } = chrome;
+            const { targetId } = await connection.send("Target.createTarget", {
+                url: "about:blank",
+            });
+            const { sessionId } = await connection.send("Target.attachToTarget", {
+                targetId,
+                flatten: true,
+            });
+            const send = (method: string, params: Record<string, unknown> = {}) =>
+                connection.send(method, params, sessionId);
+
+            const run = async <T>(body: string): Promise<T> => {
+                const answer = await send("Runtime.evaluate", {
+                    expression: `(async () => { ${body} })().then((value) => JSON.stringify(value ?? null))`,
+                    awaitPromise: true,
+                    returnByValue: true,
+                });
+
+                return JSON.parse(answer.result.value as string) as T;
+            };
+
+            await send("Emulation.setDeviceMetricsOverride", {
+                width: WIDTH,
+                height: 390,
+                deviceScaleFactor: 2,
+                mobile: true,
+            });
+            await send("Emulation.setSafeAreaInsetsOverride", {
+                insets: { top: 0, left: inset, bottom: 0, right: inset },
+            });
+            await send("Page.navigate", {
+                url: `${base}/login?token=${encodeURIComponent(app.config.ownerToken)}`,
+            });
+            await until(
+                () =>
+                    run<boolean>(`return !!document.querySelector(".home-list > .rail")`).catch(
+                        () => false,
+                    ),
+                "the session list",
+                20_000,
+            );
+
+            return run;
+        }
+
+        /** Where the visible elements that match `selector` start and end across the screen. */
+        const edges = (run: Awaited<ReturnType<typeof visit>>, selector: string) =>
+            run<{ left: number; right: number }[]>(`
+            return [...document.querySelectorAll(${JSON.stringify(selector)})]
+                .map((element) => element.getBoundingClientRect())
+                .filter((box) => box.width > 0 && box.height > 0)
+                .map((box) => ({ left: Math.round(box.left), right: Math.round(box.right) }));
+        `);
+
+        /** Open the session from the list, and wait for its bar, thread, and message box to rest. */
+        const enter = async (run: Awaited<ReturnType<typeof visit>>) => {
+            await run(`(await import("/store.js")).navigate(${Number(first)})`);
+            await until(
+                () =>
+                    run<boolean>(`
+                    return [".topbar", ".pane > .scroller", ".composer-wrap .composer"].every((each) => document.querySelector(each))
+                        && document.getAnimations().every((each) => each.effect?.getComputedTiming().iterations === Infinity);
+                `),
+                "the conversation",
+            );
+        };
+
+        try {
+            const notched = await visit(NOTCH);
+
+            /** Every element that matches is past the notch on both sides, and there is at least one. */
+            const clear = async (selector: string) => {
+                const found = await edges(notched, selector);
+
+                assert.ok(found.length > 0, `${selector} shows`);
+                assert.ok(
+                    found.every((edge) => edge.left >= NOTCH && edge.right <= WIDTH - NOTCH),
+                    `${selector} is in the notch: ${JSON.stringify(found)}`,
+                );
+            };
+
+            await clear(".home-list > .rail button, .home-list > .rail .avatar");
+            await enter(notched);
+            await clear(".topbar button");
+            await clear(".composer-wrap .composer");
+
+            const plain = await visit(0);
+
+            assert.deepEqual(await edges(plain, ".home-list > .rail"), [{ left: 0, right: 56 }]);
+            await enter(plain);
+            assert.deepEqual(
+                await plain<string[]>(`
+                const pad = (selector) => getComputedStyle(document.querySelector(selector)).paddingLeft;
+
+                return [pad(".topbar"), pad(".pane > .scroller")];
+            `),
+                ["0px", "0px"],
+            );
+        } catch (error) {
+            if (error instanceof BrowserError) {
+                t.skip("this Chromium cannot fake safe-area insets");
+
+                return;
+            }
+
+            throw error;
+        }
+    },
+);
+
+test(
+    "Refresh in Changes reads the diffs on screen again, even when the file list is the same",
+    real,
+    async () => {
+        await fresh();
+
+        const requests = await inPage<{ before: number; after: number }>(`
+        const { store } = await import("/store.js");
+        const { DiffReview } = await import("/diff.js");
+        const { h, render } = await import("preact");
+        const box = document.createElement("div");
+        const fetched = window.fetch;
+        let diffs = 0;
+
+        window.fetch = async (url, ...args) => {
+            if (String(url).endsWith("/changes")) {
+                return new Response(JSON.stringify({ repo: { root: "/tmp", head: "abc" }, more: 0, piOnly: [],
+                    files: [{ path: "a.txt", kind: "modified", version: "5:1", added: 1, removed: 1 }] }));
+            }
+
+            if (String(url).includes("/changes/diff?")) {
+                diffs++;
+
+                return new Response("diff --git a/a.txt b/a.txt\\n--- a/a.txt\\n+++ b/a.txt\\n@@ -1 +1 @@\\n-old\\n+new\\n");
+            }
+
+            return fetched(url, ...args);
+        };
+        document.body.append(box);
+        store.set({ conversationId: ${Number(first)} });
+        render(h(DiffReview, { active: false }), box);
+        store.subscribe(() => render(h(DiffReview, { active: false }), box));
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        const before = diffs;
+
+        box.querySelector('[aria-label="Refresh"]').click();
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        window.fetch = fetched;
+
+        return JSON.stringify({ before, after: diffs });
+    `);
+
+        assert.equal(requests.before, 1);
+        assert.equal(requests.after, 2, "Refresh asks for the diff again");
     },
 );

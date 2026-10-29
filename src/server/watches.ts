@@ -263,11 +263,7 @@ export class Watches {
                         return runtime.commit(() => finished, context);
                     }
 
-                    await runtime.sleep(watch.next, context);
-                    await runtime.commit(
-                        () => ({ status: "running", checkpoint: { phase: "look" } }),
-                        context,
-                    );
+                    return runtime.sleepUntil(watch.next, { phase: "look" }, context);
                 },
                 look: (_task, runtime, context) => this.#look(runtime, context),
                 send: (task, runtime, context) => {
@@ -415,6 +411,13 @@ export class Watches {
             ) as typeof found;
         } catch (error) {
             const said = describe(error);
+
+            if (/no git remotes? found/i.test(said)) {
+                throw new HttpError(
+                    404,
+                    "This folder has no git remote, so it has no pull request to watch. Add its GitHub repository with git remote add origin <address>, then try again.",
+                );
+            }
 
             throw new HttpError(
                 404,

@@ -61,6 +61,8 @@ export const PIP_NAME = "PiP";
  */
 export const PIP_EXTENSIONS = [
     "coding-tools",
+    // Core's own: its hook takes the values extensions hide (`host.hide`) out of PiP's tool results too.
+    "pocket-core",
     PIP_EXTENSION,
     "pocket-artifacts",
     "pocket-schedules",
@@ -69,8 +71,11 @@ export const PIP_EXTENSIONS = [
     "pocket-memory",
     "pocket-today",
 ];
-/** Pi Durable's coding tools PiP goes without: it reads files, and changes nothing itself. */
-export const PIP_WITHOUT = ["bash", "write", "edit"];
+/**
+ * The tools PiP goes without: Pi Durable's coding tools (it reads files, and changes nothing itself), and the artifact
+ * card, which its small panel does not draw (`artifact` still opens in the viewer).
+ */
+export const PIP_WITHOUT = ["bash", "write", "edit", "artifact_inline"];
 /** How reports from followed sessions start, so PiP knows what they are. */
 export const REPORT_HEAD = "[report] ";
 /** Sessions PiP may start in an hour, so a confused loop cannot fill the list. */
@@ -357,6 +362,27 @@ export class Pip {
         );
 
         return conversation.id;
+    }
+
+    /**
+     * Give every PiP what this version runs it with, before work resumes: a run or a report that comes before anyone opens
+     * the panel then runs with it too (its hook that hides values, say).
+     */
+    async tuneAll(log: (line: string) => void): Promise<void> {
+        for (const [id, meta] of Object.entries(this.#app.sessionCatalogue())) {
+            if (meta.pip === undefined) {
+                continue;
+            }
+
+            // One that fails is logged, and the others still get theirs.
+            try {
+                await this.#tune(Number(id) as unknown as ConversationId);
+            } catch (error) {
+                log(
+                    `PiP ${id} could not be brought up to date: ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
+        }
     }
 
     /** Give PiP the extensions and tools this version runs it with, when it has others (made by an older one). */
@@ -727,7 +753,7 @@ export class Pip {
         const available = app.models.getAvailableSnapshot();
         const known = app.models.getModels();
         const written = indexed(text);
-        const named = modelsNamed(written, available, true, known);
+        const named = modelsNamed(written, available, true, known, false);
 
         if (named.length === 0) {
             return;
@@ -747,7 +773,7 @@ export class Pip {
 
         if (chosen.length > 0) {
             throw new Error(
-                `This names ${chosen.map((model) => `${model.provider}/${model.id}`).join(", ")}, which your person did not name. Which model to use is theirs to say: take it out (sessions and their subagents use their own model), or ask them first.`,
+                `This names ${chosen.map((model) => `${model.provider}/${model.id}`).join(", ")}, which your person did not name. Which model to use is theirs to say: take it out (a session uses its default model, and its subagents and linked sessions the owner's allowed ones), or ask them first.`,
             );
         }
     }
@@ -974,11 +1000,15 @@ export class Pip {
         this.#count(user, "start", STARTS_PER_HOUR);
         const folder =
             request.repo === undefined ? request.folder : await this.checkout(pipId, request.repo);
-        const { id } = await app.commands.createSession(user, {
-            ...(folder === undefined ? {} : { cwd: folder }),
-            ...(request.title === undefined ? {} : { title: request.title }),
-            worktree: request.worktree === true,
-        });
+        const { id } = await app.commands.createSession(
+            user,
+            {
+                ...(folder === undefined ? {} : { cwd: folder }),
+                ...(request.title === undefined ? {} : { title: request.title }),
+                worktree: request.worktree === true,
+            },
+            { projectDefaults: model === undefined },
+        );
 
         if (model !== undefined) {
             await app.commands.configure(id, user, { model });
@@ -1646,14 +1676,14 @@ export class Pip {
 
         // PiP turned off keeps its follows: a report waits until it is on again, as its schedules, watches, and hooks
         // do, so no run starts in its conversation without its rules and tools.
-        for (;;) {
-            const person = this.#app.config.userById(input.userId);
+        const person = this.#app.config.userById(input.userId);
 
-            if (person === undefined || this.available(person)) {
-                break;
-            }
-
-            await runtime.sleep(runtime.now() + this.holdMs, context);
+        if (person !== undefined && !this.available(person)) {
+            return runtime.sleepUntil(
+                runtime.now() + this.holdMs,
+                { phase: "report", text },
+                context,
+            );
         }
 
         const pip = await this.#app.harness.conversation(pipId, context);

@@ -1,6 +1,7 @@
 // Running now: everything Pi is doing, across sessions.
 import { useEffect, useState } from "preact/hooks";
-import { api, attempt, canSteer, closeSheet, navigate, notify } from "../store.js";
+import { folderColor } from "../avatar.js";
+import { api, attempt, canSteer, closeSheet, navigate, notify, store } from "../store.js";
 import { html, Loader, Sheet, Spinner } from "../ui.js";
 
 /** How often the Running now sheet asks again while it is open. */
@@ -33,12 +34,27 @@ export function RunningSheet() {
         navigate(id);
     };
 
+    const stopCommand = (task) => {
+        const path = {
+            "pocket.shell": "shell",
+            "pocket.background": "background",
+            "pocket.extension-command": "extension-commands",
+        }[task.kind];
+
+        return attempt(() => api(`c/${task.conversationId}/${path}/${task.id}/stop`, {}));
+    };
+
     return html`<${Sheet} title="Running now" onClose=${closeSheet}>
         ${sessions === null && html`<${Loader} label="Looking" />`}
         ${sessions?.length === 0 && html`<p class="muted">Nothing is running.</p>`}
         ${sessions?.map(
             (session) => html`<div class="running" key=${session.id}>
                 <div class="running-head">
+                    <span
+                        class="folder-mark"
+                        style=${`--folder:${folderColor(store.state.sessions.find((entry) => entry.id === session.id)?.cwd)}`}
+                        aria-hidden="true"
+                    ></span>
                     <button class="link grow" onClick=${() => go(session.id)}>
                         ${session.title}
                     </button>
@@ -70,6 +86,7 @@ export function RunningSheet() {
                             ${task.subagent && html`<span class="mono">${task.subagent}</span>: `}
                             ${task.label}
                         </span>
+                        <span class="muted small mono">${task.status}</span>
                         ${
                             steer &&
                             task.scheduleId &&
@@ -93,15 +110,18 @@ export function RunningSheet() {
                         }
                         ${
                             steer &&
-                            task.kind === "pocket.shell" &&
+                            [
+                                "pocket.shell",
+                                "pocket.background",
+                                "pocket.extension-command",
+                            ].includes(task.kind) &&
                             html`<button
                                 class="link small"
-                                onClick=${() => attempt(() => api(`c/${task.conversationId}/shell/${task.id}/stop`, {}))}
+                                onClick=${() => stopCommand(task)}
                             >
                                 Stop
                             </button>`
                         }
-                        <span class="muted small mono">${task.status}</span>
                     </div>`,
                 )}
             </div>`,

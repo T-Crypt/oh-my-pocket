@@ -20,12 +20,20 @@ export type PushKeys = { p256dh: string; auth: string };
 export type PushSubscriptionJson = { endpoint: string; keys: PushKeys };
 /** `publicKey`: base64url uncompressed P-256 point (65 bytes); `privateKey`: base64url 32-byte scalar. */
 export type VapidKeys = { publicKey: string; privateKey: string };
-export type PushPrefs = { done: boolean; approval: boolean; chat: boolean; mention: boolean };
+export type PushPrefs = {
+    done: boolean;
+    approval: boolean;
+    chat: boolean;
+    mention: boolean;
+    /** A run began to wait a long while for a provider's limit to clear (`limit-gate.ts`). */
+    limit: boolean;
+};
 export const DEFAULT_PREFS: PushPrefs = Object.freeze({
     done: true,
     approval: true,
     chat: true,
     mention: true,
+    limit: true,
 });
 export type StoredSubscription = PushSubscriptionJson & {
     userId: string;

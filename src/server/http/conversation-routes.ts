@@ -1,12 +1,16 @@
 /** `/api/c/:id`: one conversation's routes, for people the API has checked may see it. */
 import { randomUUID } from "node:crypto";
-import { createWriteStream, rmSync } from "node:fs";
+import { constants, createWriteStream, rmSync } from "node:fs";
+import { type FileHandle, open } from "node:fs/promises";
 import { basename, extname, join, resolve, sep } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { ConversationId } from "@earendil-works/pi-durable";
+import { readState, writeState } from "../artifact-state.ts";
 import type { Attachment, SubmitRequest } from "../commands.ts";
 import { HttpError } from "../errors.ts";
 import { contextDiff } from "../context-meter.ts";
+import type { CommandRequest } from "../extension-commands.ts";
+import { reveal } from "../reveal.ts";
 import { serveImage, TYPES } from "./assets.ts";
 import { type ApiRequest, json, readJson, send } from "./io.ts";
 
@@ -57,6 +61,22 @@ export async function conversationRoutes(
         });
 
         return json(response, 200, await app.commands.submit(id, user, { ...body, attachments }));
+    }
+
+    if (third === "extension-commands" && fourth === undefined && method === "POST") {
+        const body = await readJson<CommandRequest>(request);
+        const gone = new AbortController();
+
+        // The browser stopped waiting: so does this request. The run goes on, and a retry finds it.
+        response.on("close", () => gone.abort());
+
+        return json(response, 200, await app.extensionCommands.run(id, user, body, gone.signal));
+    }
+
+    if (third === "extension-commands" && parts[4] === "stop" && method === "POST") {
+        await app.extensionCommands.stop(id, user, Number(fourth));
+
+        return json(response, 200, { ok: true });
     }
 
     if (third === "chat" && method === "POST") {
@@ -128,6 +148,11 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    // A run waiting for its provider's limit tries now, rather than at its time.
+    if (third === "limit" && fourth === "retry" && method === "POST") {
+        return json(response, 200, { ok: await app.commands.retryLimit(id, user) });
+    }
+
     // A failed subagent dealt with: `at` says which failure the person saw.
     if (third === "dismiss" && method === "POST") {
         const body = await readJson<{ at?: unknown }>(request);
@@ -141,6 +166,14 @@ export async function conversationRoutes(
         return json(response, 200, {
             result: await app.commands.withdraw(id, user, Number(body.submissionId)),
         });
+    }
+
+    if (third === "move" && method === "POST") {
+        const body = await readJson<{ submissionId?: number; mode?: string }>(request);
+
+        await app.commands.moveQueued(id, user, Number(body.submissionId), String(body.mode));
+
+        return json(response, 200, { ok: true });
     }
 
     if (third === "configure" && method === "POST") {
@@ -222,13 +255,21 @@ export async function conversationRoutes(
         return json(response, 200, await app.commands.watchPr(id, user, body.pr));
     }
 
-    // Memory: the lessons that apply here; one added by hand; one changed, forgotten, or approved.
+    // Memory normally applies here. The owner's pending queue reviews all projects, but never adds or edits: `Memory`
+    // checks who may use it, and what it may do with a lesson.
+    const pendingMemory = third === "memory" && url.searchParams.get("pending") === "all";
+
     if (third === "memory" && fourth === undefined) {
         if (method === "GET") {
-            return json(response, 200, await app.memory.view(id, user));
+            return json(response, 200, await app.memory.view(id, user, pendingMemory));
         }
 
         if (method === "POST") {
+            // Saving takes no queue: it would save a lesson as usual.
+            if (pendingMemory) {
+                throw new HttpError(400, "The pending queue only approves or discards lessons.");
+            }
+
             return json(
                 response,
                 200,
@@ -253,15 +294,26 @@ export async function conversationRoutes(
             return json(
                 response,
                 200,
-                await app.memory.edit(id, user, fourth, change, {
-                    text: typeof seen.text === "string" ? seen.text : undefined,
-                    forget: seen.forget === true,
-                }),
+                await app.memory.edit(
+                    id,
+                    user,
+                    fourth,
+                    change,
+                    {
+                        text: typeof seen.text === "string" ? seen.text : undefined,
+                        forget: seen.forget === true,
+                    },
+                    pendingMemory,
+                ),
             );
         }
 
         if (change !== undefined) {
-            return json(response, 200, await app.memory.edit(id, user, fourth, change));
+            return json(
+                response,
+                200,
+                await app.memory.edit(id, user, fourth, change, undefined, pendingMemory),
+            );
         }
     }
 
@@ -349,6 +401,25 @@ export async function conversationRoutes(
         });
     }
 
+    // Show a path in the file manager of the machine the server runs on: the owner's, at that machine (`reveal.ts`).
+    if (third === "reveal" && method === "POST") {
+        app.requireSee(user, id);
+
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner opens the server's file manager");
+        }
+
+        const body = await readJson<{ path?: unknown }>(request);
+
+        if (typeof body.path !== "string" || body.path.trim() === "") {
+            throw new HttpError(400, "path is required");
+        }
+
+        await reveal(app.workspace.conversationPath(id, body.path));
+
+        return json(response, 200, { ok: true });
+    }
+
     if (third === "file" && method === "GET") {
         const requested = url.searchParams.get("path") ?? "";
 
@@ -359,7 +430,7 @@ export async function conversationRoutes(
         return serveImage(request, response, app.workspace.conversationFile(user, id, requested));
     }
 
-    if (third === "context" && method === "GET" && fourth === undefined) {
+    if (third === "context-meter" && method === "GET" && fourth === undefined) {
         const meter = await app.contextMeter(id);
         const baseline = await app.contextBaseline(id);
 
@@ -374,14 +445,58 @@ export async function conversationRoutes(
 
     // The owner's reference point for where the context goes: take it before a change, diff the next meter against
     // it, and clear it when the change is done with.
-    if (third === "context" && fourth === "baseline" && method === "POST") {
+    if (third === "context-meter" && fourth === "baseline" && method === "POST") {
         return json(response, 200, await app.takeContextBaseline(id));
     }
 
-    if (third === "context" && fourth === "baseline" && method === "DELETE") {
+    if (third === "context-meter" && fourth === "baseline" && method === "DELETE") {
         await app.clearContextBaseline(id);
 
         return json(response, 200, { ok: true });
+    }
+
+    // A file of the session's folder as a download (a design's export): whom the file viewer lets read it, as it is.
+    if (third === "download" && method === "GET") {
+        const requested = url.searchParams.get("path") ?? "";
+
+        if (requested.trim() === "") {
+            throw new HttpError(400, "path is required");
+        }
+
+        const file = app.workspace.readableFile(user, id, requested);
+        let handle: FileHandle;
+
+        try {
+            handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+        } catch {
+            throw new HttpError(404, "File not found");
+        }
+
+        try {
+            const stats = await handle.stat();
+
+            if (!stats.isFile()) {
+                throw new HttpError(404, "File not found");
+            }
+
+            // An ASCII fallback, then the whole name (RFC 6266): no quote or line break gets into the header.
+            const name = basename(file);
+            const ascii = name.replace(/[^\x20-\x7e]|["\\]/g, "_");
+
+            response.writeHead(200, {
+                "content-type": "application/octet-stream",
+                "content-length": stats.size,
+                "content-disposition": `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`,
+                "cache-control": "private, no-store",
+                "x-content-type-options": "nosniff",
+            });
+
+            await pipeline(handle.createReadStream({ autoClose: false }), response);
+        } finally {
+            await handle.close();
+        }
+
+        return;
     }
 
     if (third === "entry" && fourth !== undefined && method === "GET") {
@@ -413,6 +528,44 @@ export async function conversationRoutes(
             await app.workspace.changeDiff(id, user, url.searchParams.get("path") ?? ""),
             "text/plain; charset=utf-8",
         );
+    }
+
+    // What an artifact's page saved for this person (`artifact-state.ts`): anyone who sees the session keeps their own.
+    if (third === "artifact-state" && fourth !== undefined && parts.length === 4) {
+        if (method === "GET") {
+            return json(
+                response,
+                200,
+                await readState(app, id, user, fourth, url.searchParams.get("schema")),
+            );
+        }
+
+        if (method === "POST") {
+            return json(
+                response,
+                200,
+                await writeState(app, id, user, fourth, await readJson(request)),
+            );
+        }
+    }
+
+    // An artifact published to anyone with its address: the shares of this session, and ending one.
+    if (third === "shares" && fourth === undefined && method === "GET") {
+        // The address others reach this server by, as webhooks give it: a tunnel's, when one is up.
+        return json(response, 200, {
+            shares: await app.shares.list(id, user),
+            base: app.access?.url ?? null,
+        });
+    }
+
+    if (third === "shares" && fourth === undefined && method === "POST") {
+        return json(response, 200, await app.shares.create(id, user, await readJson(request)));
+    }
+
+    if (third === "shares" && fourth !== undefined && method === "POST") {
+        await app.shares.revoke(user, id, fourth);
+
+        return json(response, 200, { ok: true });
     }
 
     // The folder's files for `@` mentions. A browser that has the newest list says so with `since` and gets only
@@ -495,6 +648,26 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    // Running now's Stop for a command Pi runs in the background: anyone who may steer the session.
+    if (
+        third === "background" &&
+        fourth !== undefined &&
+        parts[4] === "stop" &&
+        method === "POST"
+    ) {
+        app.requireSee(user, id);
+        app.requireSteer(user);
+        const item = await app.background.byTask(id, fourth);
+
+        if (item === undefined) {
+            throw new HttpError(404, "No such background task here.");
+        }
+
+        await app.background.stop(id, item.id);
+
+        return json(response, 200, { ok: true });
+    }
+
     if (third === "history" && method === "GET") {
         return json(
             response,
@@ -504,6 +677,69 @@ export async function conversationRoutes(
                 Number(url.searchParams.get("before") ?? Number.MAX_SAFE_INTEGER),
             ),
         );
+    }
+
+    // Earlier entries of the active context, for a tab that got only the newest with its view (protocol 4).
+    if (third === "context" && method === "GET") {
+        const number = (name: string) => {
+            const value = url.searchParams.get(name);
+
+            return value === null ? undefined : Number(value);
+        };
+
+        const before = number("before");
+        const rows = number("rows");
+        const from = number("from");
+
+        if (
+            before === undefined ||
+            ![before, rows ?? 1, from ?? 1].every(
+                (value) => Number.isSafeInteger(value) && value > 0,
+            )
+        ) {
+            throw new HttpError(
+                400,
+                "before (an entry id), and rows or from, if given, must be positive whole numbers",
+            );
+        }
+
+        const room = await app.room(id);
+
+        try {
+            return json(response, 200, room.entriesBefore(before, { rows, from }));
+        } finally {
+            app.releaseRoom(room);
+        }
+    }
+
+    // The people's messages, a page at a time, for extensions' outlines (`pocket.messages`).
+    if (third === "messages" && method === "GET") {
+        const before = url.searchParams.get("before");
+        const limit = Number(url.searchParams.get("limit") ?? 50);
+
+        if (
+            (before !== null && !(Number.isSafeInteger(Number(before)) && Number(before) > 0)) ||
+            !(Number.isSafeInteger(limit) && limit > 0 && limit <= 200)
+        ) {
+            throw new HttpError(
+                400,
+                "before is an entry id, and limit a whole number from 1 to 200, if given",
+            );
+        }
+
+        const room = await app.room(id);
+
+        try {
+            const page = room.userMessages(before === null ? undefined : Number(before), limit);
+
+            if (page === null) {
+                throw new HttpError(409, "That page is gone: the session's context changed.");
+            }
+
+            return json(response, 200, page);
+        } finally {
+            app.releaseRoom(room);
+        }
     }
 
     if (third === "upload" && method === "POST") {
