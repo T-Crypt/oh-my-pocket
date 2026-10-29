@@ -4,7 +4,7 @@
  * there, with each file's diff on request.
  */
 import { realpathSync } from "node:fs";
-import { lstat, rm } from "node:fs/promises";
+import { lstat, open, readlink, rm } from "node:fs/promises";
 import { devNull } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { type GitOptions, git as runGit } from "./git.ts";
@@ -46,8 +46,6 @@ const MAX_FILES = 500;
 const MAX_DIFF = 300_000;
 /** Untracked files are counted again on every look, so a larger one keeps its count unknown. */
 const MAX_COUNTED_BYTES = 2_000_000;
-/** How many untracked files are counted at once. */
-const COUNTS_AT_ONCE = 8;
 const GIT_TIMEOUT_MS = 15_000;
 
 /** Git for Changes: quick, with room for a long diff. */
@@ -296,6 +294,171 @@ async function versionOf(file: string): Promise<string | undefined> {
     }
 }
 
+/** Counts of new files already read, by repository and path, kept while the file's size and time stay the same. */
+const newCounts = new Map<
+    string,
+    { version: string; counts: { added: number; removed: number } | null }
+>();
+/** How many new files' counts are kept: the oldest go first. */
+const NEW_COUNTS_KEPT = 5000;
+/** Git reads this much of a file to tell text from binary: a NUL byte in it makes the file binary. */
+const BINARY_PROBE = 8000;
+
+/**
+ * Lines added by each new file, as `git diff --no-index --numstat /dev/null <file>` counts them, without starting git
+ * per file: every line, a last one without its newline included; none for an empty file; no counts for a binary file
+ * (a NUL byte in its first 8000 bytes, or the `binary` attribute, or `-diff`); a symlink is the one line of its target.
+ * Files larger than `MAX_COUNTED_BYTES`, and anything that is not a file or a symlink, keep their counts unknown. A
+ * file is read again only when its size or time changes; attributes are asked of git once per look, for the files
+ * read in it.
+ */
+async function newFileCounts(
+    root: string,
+    paths: readonly string[],
+): Promise<Map<string, { added: number; removed: number }>> {
+    const result = new Map<string, { added: number; removed: number }>();
+    const toRead: { path: string; key: string; version: string; size: number; link: boolean }[] =
+        [];
+
+    await Promise.all(
+        paths.map(async (path) => {
+            try {
+                const info = await lstat(join(root, path));
+                const link = info.isSymbolicLink();
+
+                if ((!info.isFile() && !link) || info.size > MAX_COUNTED_BYTES) {
+                    return;
+                }
+
+                const key = `${root}\0${path}`;
+                const version = `${info.size}:${info.mtimeMs}:${info.ino}`;
+                const known = newCounts.get(key);
+
+                if (known?.version === version) {
+                    if (known.counts !== null) {
+                        result.set(path, known.counts);
+                    }
+
+                    return;
+                }
+
+                toRead.push({ path, key, version, size: info.size, link });
+            } catch {
+                // Gone or unreadable since status: its count stays unknown.
+            }
+        }),
+    );
+
+    if (toRead.length === 0) {
+        return result;
+    }
+
+    const binaryByAttribute = await binaryAttributes(
+        root,
+        toRead.map(({ path }) => path),
+    );
+
+    await Promise.all(
+        toRead.map(async ({ path, key, version, link }) => {
+            let counts: { added: number; removed: number } | null;
+
+            try {
+                if (link) {
+                    counts =
+                        (await readlink(join(root, path))) === ""
+                            ? { added: 0, removed: 0 }
+                            : { added: 1, removed: 0 };
+                } else if (binaryByAttribute.get(path) === true) {
+                    counts = null;
+                } else {
+                    counts = await countLines(
+                        join(root, path),
+                        binaryByAttribute.get(path) === false,
+                    );
+                }
+            } catch {
+                return;
+            }
+
+            newCounts.delete(key);
+            newCounts.set(key, { version, counts });
+
+            if (newCounts.size > NEW_COUNTS_KEPT) {
+                newCounts.delete(newCounts.keys().next().value!);
+            }
+
+            if (counts !== null) {
+                result.set(path, counts);
+            }
+        }),
+    );
+
+    return result;
+}
+
+/** A file's lines, or null when it is binary (a NUL in its first 8000 bytes, unless `text` says it is text). */
+async function countLines(
+    file: string,
+    text: boolean,
+): Promise<{ added: number; removed: number } | null> {
+    const handle = await open(file, "r");
+
+    try {
+        const content = await handle.readFile();
+
+        if (!text && content.subarray(0, BINARY_PROBE).includes(0)) {
+            return null;
+        }
+
+        let lines = 0;
+
+        for (let at = content.indexOf(10); at !== -1; at = content.indexOf(10, at + 1)) {
+            lines++;
+        }
+
+        if (content.length > 0 && content[content.length - 1] !== 10) {
+            lines++;
+        }
+
+        return { added: lines, removed: 0 };
+    } finally {
+        await handle.close();
+    }
+}
+
+/**
+ * What a repository's attributes say about diffing each path: true when it is binary to diff (`binary`, or `-diff`),
+ * false when `diff` is set (text, whatever its bytes), absent when they leave it to the content. One git command for
+ * all of them; when it fails, the content decides.
+ */
+async function binaryAttributes(
+    root: string,
+    paths: readonly string[],
+): Promise<Map<string, boolean>> {
+    const said = new Map<string, boolean>();
+
+    try {
+        const out = await git(root, ["check-attr", "-z", "--stdin", "binary", "diff"], {
+            input: paths.join("\0") + "\0",
+        });
+        const fields = out.split("\0");
+
+        for (let at = 0; at + 2 < fields.length; at += 3) {
+            const [path, name, value] = [fields[at]!, fields[at + 1], fields[at + 2]];
+
+            if ((name === "binary" && value === "set") || (name === "diff" && value === "unset")) {
+                said.set(path, true);
+            } else if (name === "diff" && value === "set" && said.get(path) !== true) {
+                said.set(path, false);
+            }
+        }
+    } catch {
+        // No answer: the content decides.
+    }
+
+    return said;
+}
+
 /** Where a folder is in its repository, as git writes paths: `app/` for the folder app, empty at the top. */
 async function prefixOf(cwd: string): Promise<string> {
     return (await git(cwd, ["rev-parse", "--show-prefix"])).trim();
@@ -344,42 +507,16 @@ export async function changesIn(
             ? new Map()
             : parseNumstat(await git(root, ["diff", "HEAD", "--numstat", "-z", ...DIFF_FLAGS]));
 
-    // HEAD diffs omit untracked files. Count only the visible, permitted files; Git keeps binary, attributes,
-    // symlinks and final-newline handling the same as each file's diff. No index or files are changed.
-    const count = async (path: string) => {
-        try {
-            if ((await lstat(join(root, path))).size > MAX_COUNTED_BYTES) {
-                return;
-            }
+    // HEAD diffs omit untracked files: they are counted here, in this process (`newFileCounts`), not with a git
+    // command per file. A refresh while Pi works used to start one git process for every untracked file, each a
+    // fork of this whole server on its main thread.
+    const uncounted = status
+        .filter(({ code }) => code === "??" || head === undefined)
+        .map(({ path }) => path);
 
-            const added = parseNumstat(
-                await git(
-                    root,
-                    ["diff", "--no-index", "--numstat", "-z", ...DIFF_FLAGS, "--", devNull, path],
-                    {
-                        allowExit: [1],
-                    },
-                ),
-            ).get(path);
-
-            if (added !== undefined) {
-                counts.set(path, added);
-            }
-        } catch {
-            // A file can disappear or become unreadable after status. Keep the list, with its count unknown.
-        }
-    };
-
-    const uncounted = status.filter(({ code }) => code === "??" || head === undefined);
-    let next = 0;
-
-    await Promise.all(
-        Array.from({ length: COUNTS_AT_ONCE }, async () => {
-            while (next < uncounted.length) {
-                await count(uncounted[next++]!.path);
-            }
-        }),
-    );
+    for (const [path, added] of await newFileCounts(root, uncounted)) {
+        counts.set(path, added);
+    }
 
     const versions = await Promise.all(status.map(({ path }) => versionOf(join(root, path))));
     const files = status.map(({ code, path }, index): ChangedFile => {
