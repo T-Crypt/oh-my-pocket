@@ -3608,6 +3608,13 @@ pre.diff .del {
     color: var(--accent);
 }
 
+/* Browser use: a plan-style switch with the globe before its word. */
+.composer-row .browser-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+
 /* Which models this session's subagents may run on: accent while some besides the session's own. */
 .composer-row .subagents-chip {
     flex: none;
@@ -13338,6 +13345,13 @@ textarea.notes {
     /* While Pi works, Steer and Queue take the plan chip's place (`/plan` still turns plan mode on or off). */
     /* The chip keeps its word (auto, own, local); its colour says whether roles leave this session's model. */
     .composer-row .subagents-chip .detail {
+        display: none;
+    }
+    /* The browser switch keeps its globe on a phone; its word gives the row back. */
+    .composer-row .browser-chip {
+        padding-inline: 8px;
+    }
+    .composer-row .browser-chip .word {
         display: none;
     }
     .composer.busy .plan-chip,

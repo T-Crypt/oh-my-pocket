@@ -1637,8 +1637,8 @@ defineItem("composer", {
             onMouseDown=${(event) => event.preventDefault()}
             onClick=${() => attempt(() => actions.setBrowserUse(!view.browserUse))}
         >
-            <${Icon} name="globe" size=${12} />
-            Browser
+            <${Icon} name="globe" size=${13} />
+            <span class="word">Browser</span>
         </button>`,
 });
 defineItem("composer", {
