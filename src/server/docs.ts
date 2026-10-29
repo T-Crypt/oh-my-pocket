@@ -357,6 +357,20 @@ export const SubagentPolicyDoc = defineDoc<SubagentPolicy>({
     initial: () => ({ mode: "auto" }),
 });
 
+/**
+ * Whether Pi may use the browser in this session (`extensions/browser.ts`): off until a person turns it on, and the
+ * sites a person allowed here when Pi asked. Only a person changes `on`; a fork keeps both, as it keeps the model.
+ */
+export const BrowserUseDoc = defineDoc<{ on: boolean; by?: string; at?: number; sites: string[] }>({
+    kind: "pocket.browser-use",
+    version: 1,
+    ...rebased,
+    scope: "conversation",
+    history: "latest",
+    fork: "current",
+    initial: () => ({ on: false, sites: [] }),
+});
+
 /** The router this session runs as (`routers.ts`), by id; none for a plain session. Its people choose it. */
 export const RouterDoc = defineDoc<{ router?: string; by?: string; at?: number }>({
     kind: "pocket.router",

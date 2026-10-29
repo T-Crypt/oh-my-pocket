@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { Avatar } from "./avatar.js";
 import { boxKey, keyBox } from "./box-keys.js";
+import { browserAvailable } from "./browser.js";
 import { chatUnread, TypingLine } from "./chat.js";
 import {
     loadTemplates,
@@ -1615,6 +1616,29 @@ defineItem("composer", {
                 view.subagentPolicy.label.includes(" · ") &&
                 html`<span class="detail">${` · ${view.subagentPolicy.label.split(" · ")[1]}`}</span>`
             }
+        </button>`,
+});
+defineItem("composer", {
+    id: "core:browser-use",
+    label: "Browser use",
+    order: 450,
+    render: ({ view }) =>
+        browserAvailable() &&
+        view.conversation?.kind !== "subagent" &&
+        html`<button
+            class=${`plan-chip browser-chip ${view.browserUse ? "on" : ""}`}
+            data-part="composer-button browser-chip"
+            aria-pressed=${view.browserUse === true}
+            title=${
+                view.browserUse
+                    ? "Pi may use the browser in this session (it asks before new sites, sign-ins, forms, and scripts). Tap to stop it."
+                    : "Let Pi use the browser in this session. Off, the browser costs Pi no context."
+            }
+            onMouseDown=${(event) => event.preventDefault()}
+            onClick=${() => attempt(() => actions.setBrowserUse(!view.browserUse))}
+        >
+            <${Icon} name="globe" size=${12} />
+            Browser
         </button>`,
 });
 defineItem("composer", {

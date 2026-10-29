@@ -38,6 +38,7 @@ import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
 import {
     AuthorsDoc,
+    BrowserUseDoc,
     ChatDoc,
     NotesDoc,
     PinsDoc,
@@ -1851,6 +1852,94 @@ export class Commands {
                 on ? "turned on plan mode" : "turned off plan mode",
             );
         }
+    }
+
+    /**
+     * Let Pi use the browser in this session, or stop it. The browser tool is offered to the model only while this is
+     * on (it is deferred: `extensions/browser.ts`), so a session that does not browse carries none of its schema or
+     * guide. People use the Browser panel either way.
+     */
+    async setBrowserUse(id: ConversationId, user: User, on: unknown): Promise<void> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        await app.requireDriver(id, user);
+
+        if (typeof on !== "boolean") {
+            throw new HttpError(400, "on must be true or false");
+        }
+
+        if (on && !app.browserOn()) {
+            throw new HttpError(409, "The browser is turned off in Extensions.");
+        }
+
+        const changed = await app.harness.commit(async (tx) => {
+            const use = await tx.doc(BrowserUseDoc, id);
+
+            if (use.on === on) {
+                return false;
+            }
+
+            use.on = on;
+            use.by = user.id;
+            use.at = Date.now();
+
+            return true;
+        }, context);
+
+        await this.#offerBrowser(id, on);
+
+        if (changed) {
+            await app.collab.activity(
+                id,
+                user,
+                on ? "let Pi use the browser" : "stopped Pi from using the browser",
+            );
+        }
+    }
+
+    /**
+     * Add the browser tool to the tools this conversation offers its model, or take it out, keeping the rest of the
+     * conversation's tool filter as it is (`AgentState.modelTools` holds names; a change takes registrations).
+     */
+    async #offerBrowser(id: ConversationId, on: boolean): Promise<void> {
+        const app = this.#app;
+        const browser = app.toolNamed("browser");
+
+        if (browser === undefined) {
+            return;
+        }
+
+        const current = (await app.agentState(id))?.modelTools;
+        const tools = (names: readonly string[]) =>
+            names.flatMap((name) => {
+                const tool = name === "browser" ? browser : app.toolNamed(name);
+
+                return tool === undefined ? [] : [tool];
+            });
+        const toggled = (names: readonly string[]) =>
+            on
+                ? [...names.filter((name) => name !== "browser"), "browser"]
+                : names.filter((name) => name !== "browser");
+
+        let change: AgentChange["modelTools"];
+
+        if (Array.isArray(current)) {
+            change = tools(toggled(current));
+        } else {
+            const add = toggled(current?.add ?? []);
+            const remove = (current?.remove ?? []).filter((name) => name !== "browser");
+
+            change =
+                add.length === 0 && remove.length === 0
+                    ? null
+                    : {
+                          ...(add.length === 0 ? {} : { add: tools(add) }),
+                          ...(remove.length === 0 ? {} : { remove: tools(remove) }),
+                      };
+        }
+
+        await (await app.conversation(id)).configure({ modelTools: change }, context);
     }
 
     /** Approve Pi's plan: plan mode goes off, and Pi is told to carry the plan out. */

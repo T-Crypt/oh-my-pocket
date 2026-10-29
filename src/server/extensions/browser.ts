@@ -2,16 +2,30 @@
  * Browser: Pi opens, reads, clicks through, and screenshots web pages in a real Chromium on this machine, the same page
  * the people in the conversation watch and use in the Browser panel. Turning it off turns off the panel too.
  *
+ * Pi uses it only in a session where a person turned browser use on (the Browser switch by the message box): the tool
+ * is deferred, so elsewhere the model is offered neither it nor its guide. There it asks first, as the owner's settings
+ * say, before a new site, the local network, a sign-in, a form, a purchase or a deletion, and a script; it never types
+ * into a password or payment field.
+ *
  * A call is not replayed after a restart (clicking twice is not harmless), and the page itself does not survive one:
  * its address comes back when it opens again, but not what was typed or clicked on it.
  */
 import { awaitWithContext } from "@earendil-works/chord/context";
 import { type ImageContent, type TextContent, Type } from "@earendil-works/pi-ai";
 import { AgentDoc, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
+import { BrowserUseDoc } from "../docs.ts";
 import type { BrowserPage, LogEntry, Target } from "../browser/page.ts";
 import { displayUrl, normalizeUrl } from "../browser/urls.ts";
+import {
+    FOCUS_SCRIPT,
+    POLICY_SETTINGS,
+    policyFrom,
+    riskyWord,
+    siteOf,
+    siteVerdict,
+} from "../browser/policy.ts";
 import { presetOf, viewportFrom } from "../browser/viewport.ts";
-import type { PocketHost } from "../host.ts";
+import type { ExtensionWeb, PocketHost } from "../host.ts";
 
 const ACTIONS = [
     "navigate",
@@ -77,9 +91,16 @@ function formatLog(entry: LogEntry): string {
     return `[${entry.level}] ${entry.text}${entry.source === undefined ? "" : ` (${entry.source})`}`;
 }
 
-export default function createBrowser(host: PocketHost) {
+const OFF =
+    "Browser use is off in this session: only a person turns it on, with the Browser switch by the message box. Say what you would look up or check, and ask them.";
+
+export default function createBrowser(host: PocketHost, web: ExtensionWeb) {
+    web.settings(POLICY_SETTINGS);
+
     const browser = defineTool({
         name: "browser",
+        // Offered to the model only in a session where a person turned browser use on (`commands.setBrowserUse`).
+        deferred: true,
         description:
             "Use a real web browser (Chromium on this machine) that the people in this conversation watch live. Open pages (local dev servers, files, sites), read them as a snapshot with element refs, click, type, take screenshots you can see, read console errors, and run JavaScript in the page.",
         parameters: Type.Object({
@@ -181,6 +202,77 @@ export default function createBrowser(host: PocketHost) {
         execute: async (args, api, context) => {
             const signal = context.abortSignal;
             const action = args.action as Action;
+            const use = await api.snapshot(BrowserUseDoc, api.conversationId, context);
+
+            // Tools can call a deferred tool too (codemode): the session's switch holds for them as well.
+            if (use?.on !== true) {
+                throw new Error(OFF);
+            }
+
+            const policy = policyFrom((name) => web.setting(name));
+            const sitesHere = [...use.sites];
+            let asked = 0;
+
+            /** A card on this call: Allow goes on, anything else stops the call. */
+            const askFirst = async (title: string, text?: string) => {
+                const answer = await host.ask(
+                    {
+                        conversationId: api.conversationId,
+                        id: `${api.taskId}:${api.callId}:${asked++}`,
+                        taskId: api.taskId,
+                        callId: api.callId,
+                        title,
+                        ...(text === undefined ? {} : { text }),
+                        submit: "Allow",
+                    },
+                    context,
+                );
+
+                if (!answer.answered) {
+                    throw new Error(
+                        `Not allowed: ${title} Do not try to do it another way. Say what you wanted to do and why, and let the person decide.`,
+                    );
+                }
+            };
+
+            /** Pi works on this page only when its site is allowed: by the settings, earlier here, or now. */
+            const allowSite = async (url: string) => {
+                const verdict = siteVerdict(url, policy, sitesHere);
+
+                if (verdict.go) {
+                    return;
+                }
+
+                if ("refuse" in verdict) {
+                    throw new Error(`${verdict.refuse} Do not try to reach it another way.`);
+                }
+
+                await askFirst(
+                    `Let Pi use ${verdict.ask} in the browser?`,
+                    "Allowed once, it stays allowed for the rest of this session.",
+                );
+                sitesHere.push(verdict.ask);
+                await api.commit(async (tx) => {
+                    const doc = await tx.doc(BrowserUseDoc, api.conversationId);
+
+                    if (!doc.sites.includes(verdict.ask)) {
+                        doc.sites.push(verdict.ask);
+                    }
+                }, context);
+            };
+
+            /** Ask before an action that signs in, submits, sends, buys, or deletes, when the settings say so. */
+            const allowAction = async (what: string, why: string | undefined) => {
+                if (policy.actions === "allow" || why === undefined) {
+                    return;
+                }
+
+                await askFirst(
+                    `Let Pi ${what} on ${siteOf(page.url)?.site ?? "this page"}?`,
+                    `It looks like it may ${why}.`,
+                );
+            };
+
             const agent = await api.snapshot(AgentDoc, api.conversationId, context);
             const cwd = agent?.cwd ?? process.cwd();
             // A page opened again comes back at its last address, unless Pi is about to open another.
@@ -188,6 +280,12 @@ export default function createBrowser(host: PocketHost) {
                 host.browsers.open(Number(api.conversationId), { restore: action !== "navigate" }),
                 context,
             );
+
+            // A click can lead to another site: the next action there is checked like an opening.
+            if (action !== "navigate" && page.url !== "" && page.url !== "about:blank") {
+                await allowSite(page.url);
+            }
+
             const before = page.logSeq;
             const target: Target = {
                 ...(args.ref === undefined ? {} : { ref: args.ref.replace(/^\[|\]$/g, "") }),
@@ -218,6 +316,8 @@ export default function createBrowser(host: PocketHost) {
                             `"${args.url}" is not an address the browser opens: give an http(s) URL, host:port, or a file path.`,
                         );
                     }
+
+                    await allowSite(url);
 
                     const result = await run(
                         page.navigate(url, {
@@ -282,6 +382,19 @@ export default function createBrowser(host: PocketHost) {
 
                 case "click": {
                     need(pointed, "a ref, selector, label, or x and y");
+
+                    if (policy.actions === "ask") {
+                        const found =
+                            target.x !== undefined && target.y !== undefined
+                                ? await run(page.describeAt(target.x, target.y))
+                                : await run(page.locate(target));
+                        const label = found.label;
+                        const word =
+                            riskyWord(label) ?? (found.kind === "submit" ? "submit" : undefined);
+
+                        await allowAction(`click ${label}`, word && `${word.toLowerCase()}`);
+                    }
+
                     const clicked = await run(
                         page.click(target, signal === undefined ? {} : { signal }),
                     );
@@ -308,6 +421,32 @@ export default function createBrowser(host: PocketHost) {
 
                 case "type": {
                     need(args.text !== undefined, "text");
+
+                    {
+                        const found = pointed ? await run(page.locate(target)) : undefined;
+                        const focus = JSON.parse(await run(page.evaluate(FOCUS_SCRIPT))) as {
+                            secret?: boolean;
+                            password?: boolean;
+                            submit?: string;
+                        };
+
+                        // People type passwords and card numbers themselves, in the Browser panel.
+                        if (found?.password === true || (!pointed && focus.secret === true)) {
+                            throw new Error(
+                                "That is a password or payment field: Pi does not type into those. Ask the person to type it in the Browser panel, then carry on.",
+                            );
+                        }
+
+                        if (args.submit === true) {
+                            await allowAction(
+                                "press Enter and send the form",
+                                focus.password === true
+                                    ? "sign in"
+                                    : riskyWord(focus.submit ?? "")?.toLowerCase(),
+                            );
+                        }
+                    }
+
                     const into = await run(
                         page.type(pointed ? target : undefined, args.text!, {
                             ...(args.append === undefined ? {} : { append: args.append }),
@@ -326,6 +465,24 @@ export default function createBrowser(host: PocketHost) {
 
                 case "press":
                     need(args.key !== undefined && args.key !== "", "a key");
+
+                    if (/(^|\+)Enter$/i.test(args.key!)) {
+                        const focus = JSON.parse(await run(page.evaluate(FOCUS_SCRIPT))) as {
+                            form?: boolean;
+                            password?: boolean;
+                            submit?: string;
+                        };
+
+                        await allowAction(
+                            "press Enter and send the form",
+                            focus.form !== true
+                                ? undefined
+                                : focus.password === true
+                                  ? "sign in"
+                                  : riskyWord(focus.submit ?? "")?.toLowerCase(),
+                        );
+                    }
+
                     await run(page.press(args.key!, signal === undefined ? {} : { signal }));
                     lines.push(`Pressed ${args.key}.`);
                     break;
@@ -369,6 +526,17 @@ export default function createBrowser(host: PocketHost) {
 
                 case "evaluate":
                     need(args.script !== undefined && args.script.trim() !== "", "a script");
+
+                    if (policy.scripts === "never") {
+                        throw new Error(
+                            "Running scripts in pages is turned off in the browser's settings. Use snapshot, click, and type instead.",
+                        );
+                    }
+
+                    await askFirst(
+                        `Let Pi run a script on ${siteOf(page.url)?.site ?? "this page"}?`,
+                        clip(args.script!, 600),
+                    );
                     lines.push(
                         clip(
                             await run(

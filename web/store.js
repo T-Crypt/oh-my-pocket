@@ -83,6 +83,7 @@ const emptyView = () => ({
     turns: { on: false, asks: [] },
     decisions: {},
     plan: { on: false },
+    browserUse: false,
     subagentPolicy: null,
     router: null,
     schedules: [],
@@ -728,6 +729,7 @@ function mergeView(current, data) {
         turns: data.turns ?? base.turns,
         decisions: data.decisions ?? base.decisions,
         plan: data.plan ?? base.plan,
+        browserUse: data.browserUse ?? base.browserUse,
         subagentPolicy: data.subagentPolicy ?? base.subagentPolicy,
         // No router is null, which the server sends too: only a missing field keeps the last value.
         router: data.router === undefined ? base.router : data.router,
@@ -1400,6 +1402,8 @@ export const actions = {
     /** Send a message to Pi again in a fork that ends just before it: `{ text }` edits it, `{ model }` picks another model. */
     resend: (entryId, change = {}) => api(`c/${current()}/resend`, { entryId, ...change }),
     setPlan: (on) => api(`c/${current()}/plan`, { on }),
+    /** Let Pi use the browser in this session, or stop it (`commands.setBrowserUse`). */
+    setBrowserUse: (on) => api(`c/${current()}/browser-use`, { on }),
     /** `{ mode }`, or `{ mode: "custom", models }`: which models this session's subagents may run on. */
     setSubagents: (request) => api(`c/${current()}/subagents`, request),
     /** Run this session as a router by id, or as a plain session again (null). */

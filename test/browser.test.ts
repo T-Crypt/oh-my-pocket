@@ -388,6 +388,9 @@ test(
             await app.commands.configure(id, owner(app), {
                 model: { provider: "faux", modelId: "faux-vision" },
             });
+            // A person lets Pi use the browser here; the test page is on this machine, which the owner allows.
+            await app.commands.setBrowserUse(id, owner(app), true);
+            app.setExtensionSettings(owner(app), "browser", { local: "allow" });
             const tab = fakeTab(id, owner(app));
 
             await app.attach(tab.client);

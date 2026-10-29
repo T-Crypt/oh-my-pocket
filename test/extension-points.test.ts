@@ -591,6 +591,10 @@ test(
 
 test("a hook can keep Pi's own browser tool from typing into a password field", real, async () => {
     const id = await newSession(app);
+
+    // Pi uses the browser only where a person turned it on; the page is on this machine, which the owner allows.
+    await app.commands.setBrowserUse(id, owner(app), true);
+    app.setExtensionSettings(owner(app), "browser", { local: "allow" });
     const { createHandler } = await import("../src/server/http.ts");
     const server = createServer(
         createHandler({ app, listen: { host: "127.0.0.1", port: 0 }, restart: () => {} }),

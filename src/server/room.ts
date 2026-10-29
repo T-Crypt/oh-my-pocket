@@ -32,6 +32,7 @@ import {
     NotesDoc,
     type Pin,
     PinsDoc,
+    BrowserUseDoc,
     PlanDoc,
     RouterDoc,
     SubagentPolicyDoc,
@@ -83,6 +84,7 @@ export const ROOM_DOCS = new Set(
         TurnsDoc,
         DecisionsDoc,
         PlanDoc,
+        BrowserUseDoc,
         SubagentPolicyDoc,
         RouterDoc,
         ScheduleDoc,
@@ -343,6 +345,8 @@ export class Room {
     turns: Turns = { on: false, asks: [] };
     decisions: Record<string, Decision> = {};
     plan: { on: boolean; by?: string; at?: number } = { on: false };
+    /** Whether Pi may use the browser here (`BrowserUseDoc`); the sites allowed stay on the server. */
+    browserUse = false;
     subagentPolicy: SubagentPolicy | undefined;
     router: string | undefined;
     schedules: Record<string, Schedule> = {};
@@ -397,6 +401,7 @@ export class Room {
             ...((await harness.snapshot(DecisionsDoc, this.id, context))?.calls ?? {}),
         };
         this.plan = { ...((await harness.snapshot(PlanDoc, this.id, context)) ?? { on: false }) };
+        this.browserUse = (await harness.snapshot(BrowserUseDoc, this.id, context))?.on === true;
         this.subagentPolicy = await harness.snapshot(SubagentPolicyDoc, this.id, context);
         this.router = (await harness.snapshot(RouterDoc, this.id, context))?.router;
         this.schedules = {
@@ -469,6 +474,8 @@ export class Room {
             this.decisions = { ...((value?.calls as Record<string, Decision>) ?? {}) };
         } else if (kind === PlanDoc.definition.kind) {
             this.plan = { on: false, ...((value as Room["plan"] | null) ?? {}) };
+        } else if (kind === BrowserUseDoc.definition.kind) {
+            this.browserUse = value?.on === true;
         } else if (kind === RouterDoc.definition.kind) {
             this.router = (value?.router as string | undefined) ?? undefined;
         } else if (kind === SubagentPolicyDoc.definition.kind) {
@@ -650,6 +657,7 @@ export class Room {
             turns: this.turns,
             decisions: this.decisions,
             plan: this.plan,
+            browserUse: this.browserUse,
             // Which models its subagents may run on besides its own: the message box's chip.
             subagentPolicy: this.#app.subagentsView(this.subagentPolicy, agentState.model),
             // The router it runs as, for the message box's model chip: its id and label, or null.

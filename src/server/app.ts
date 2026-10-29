@@ -38,6 +38,7 @@ import {
     ProviderDoc,
     type Registry,
     type Storage,
+    type ToolRegistration,
     UsageDoc,
     type UsageState,
 } from "@earendil-works/pi-durable";
@@ -2514,6 +2515,15 @@ export class PocketApp {
     }
 
     /** What a conversation runs with: its model, thinking level, folder, and instructions. */
+    /** An installed tool by name, as the registry holds it now; undefined when no extension that is on has it. */
+    toolNamed(name: string): ToolRegistration | undefined {
+        return this.#registry
+            ?.snapshot()
+            .installed()
+            .flatMap((extension) => extension.tools ?? [])
+            .find((tool) => tool.name === name);
+    }
+
     async agentState(id: ConversationId): Promise<AgentState | undefined> {
         return (
             this.#agents.get(id) ??

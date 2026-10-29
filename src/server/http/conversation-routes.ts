@@ -198,6 +198,12 @@ export async function conversationRoutes(
         return json(response, 200, { ok: true });
     }
 
+    if (third === "browser-use" && method === "POST") {
+        await app.commands.setBrowserUse(id, user, (await readJson<{ on?: unknown }>(request)).on);
+
+        return json(response, 200, { ok: true });
+    }
+
     if (third === "plan" && method === "POST") {
         const body = await readJson<{ on?: unknown; approve?: unknown }>(request);
 
