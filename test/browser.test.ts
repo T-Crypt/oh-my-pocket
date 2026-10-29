@@ -28,7 +28,7 @@ import { Browsers } from "../src/server/browser.ts";
 import { findBrowser, profileFolder, snapOf } from "../src/server/browser/discovery.ts";
 import { parseKeys } from "../src/server/browser/keys.ts";
 import { SHOT_MAX } from "../src/server/browser/page.ts";
-import { normalizeUrl } from "../src/server/browser/urls.ts";
+import { bareUrl, normalizeUrl, sameSite } from "../src/server/browser/urls.ts";
 import { presetOf, viewportFrom } from "../src/server/browser/viewport.ts";
 import { blockedInPlanMode } from "../src/server/extensions/plan.ts";
 
@@ -96,6 +96,20 @@ test("addresses as people type them become URLs the browser may open", () => {
     ]) {
         assert.equal(normalizeUrl(refused, { trusted: true, windows: false }), undefined, refused);
     }
+});
+
+test("a failed load is the page's own or another site's", () => {
+    assert.equal(sameSite("https://cdn.example.com/a.js", "https://example.com/"), true);
+    assert.equal(sameSite("https://example.com/x", "https://www.example.com/"), true);
+    assert.equal(
+        sameSite("https://browser-intake-datadoghq.com/api", "https://hackerone.com/"),
+        false,
+    );
+    assert.equal(sameSite("https://errors.hackerone.net/api", "https://hackerone.com/"), false);
+    assert.equal(sameSite("http://127.0.0.1:5173/app.js", "http://127.0.0.1:5173/"), true);
+    assert.equal(sameSite("http://localhost:1/beacon", "http://127.0.0.1:5173/"), false);
+    assert.equal(sameSite("not a url", "https://example.com/"), true);
+    assert.equal(bareUrl("https://x.com/api/v2/rum?dd-request-id=1#a"), "https://x.com/api/v2/rum");
 });
 
 test("on Windows, paths as Windows writes them open as files", () => {
@@ -286,6 +300,12 @@ before(async () => {
     site = createServer((request, response) => {
         // A request that never ends, as some pages have (a stream, a stuck image).
         if (request.url === "/never") {
+            return;
+        }
+
+        if (request.url === "/missing.js") {
+            response.writeHead(404).end();
+
             return;
         }
 
@@ -828,6 +848,44 @@ test("the browser tool says so when this machine has no browser", async () => {
 });
 
 // ─── 12-c1: screenshot size contract at the unzoomed baseline ───
+
+test(
+    "failed loads are told apart: the page's own count as errors, other sites' fold into one",
+    real,
+    async () => {
+        const browsers = new Browsers({ dataDir: mkdtempSync(join(root, "netlog-")) });
+
+        try {
+            const page = await browsers.open(1);
+
+            await page.navigate(`${base}/two`);
+            await until(() => page.title === "Two", "the title");
+            // A tracker that nothing answers, three times over, then the page's own missing file.
+            await page.evaluate(`
+            for (let i = 0; i < 3; i++) {
+                await fetch("http://localhost:1/beacon?id=" + i).catch(() => {});
+            }
+            await fetch("/missing.js").catch(() => {});
+            return "done";
+        `);
+            await until(
+                () => page.logs().some((entry) => entry.level === "net" && entry.other !== true),
+                "the page's own failed load",
+            );
+
+            const net = page.logs().filter((entry) => entry.level === "net");
+            const tracker = net.find((entry) => entry.other === true);
+
+            assert.equal(tracker?.source, "http://localhost:1/beacon");
+            assert.equal(tracker?.count, 3, JSON.stringify(net));
+            assert.equal(net.length, 2, JSON.stringify(net));
+            // Only the page's own failure reaches the badge.
+            assert.equal(browsers.state(1).errors, 1);
+        } finally {
+            await browsers.closeAll({ final: true });
+        }
+    },
+);
 
 test("screenshot width/height matches the JPEG size at baseline (12-c1)", real, async () => {
     const saved = new Map<number, { url?: string }>();

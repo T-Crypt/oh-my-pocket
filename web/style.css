@@ -8133,6 +8133,22 @@ textarea.notes {
     color: var(--faint);
 }
 
+.console-line.net {
+    color: var(--muted);
+}
+
+.console-count {
+    flex: none;
+    align-self: flex-start;
+    min-width: 1.4em;
+    padding: 0 0.35em;
+    border-radius: 999px;
+    background: var(--line);
+    color: var(--muted);
+    font-size: 0.7rem;
+    text-align: center;
+}
+
 .console-nav {
     margin-top: 0.3rem;
     padding: 0.15rem 0;

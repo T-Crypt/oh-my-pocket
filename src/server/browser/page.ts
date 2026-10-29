@@ -11,6 +11,7 @@ import {
     SELECT_OPTION_SCRIPT,
     SNAPSHOT_SCRIPT,
 } from "./page-scripts.ts";
+import { bareUrl, sameSite } from "./urls.ts";
 import { clamp, presetOf, type Viewport, type ViewportPreset } from "./viewport.ts";
 
 export type BrowserState = {
@@ -33,7 +34,19 @@ export type BrowserState = {
     problem?: string;
 };
 
-export type LogEntry = { seq: number; at: number; level: string; text: string; source?: string };
+/**
+ * A console line. `net` lines are loads that failed (and CORS refusals); `other` marks those to another site than the
+ * page's, such as trackers a DNS blocker refused. `count` is how many times the same line came in a row.
+ */
+export type LogEntry = {
+    seq: number;
+    at: number;
+    level: string;
+    text: string;
+    source?: string;
+    count?: number;
+    other?: true;
+};
 
 export type Frame = { seq: number; data: Buffer; width: number; height: number };
 
@@ -408,6 +421,24 @@ export class BrowserPage {
                     return;
                 }
 
+                const text = String(entry.text ?? "");
+                const cors =
+                    /^Access to .* at '([^']+)' from origin .* blocked by CORS policy/.exec(text);
+
+                // A load that failed is the network's word, not the page's error: most are trackers a blocker refused.
+                if (entry.source === "network" || cors !== null) {
+                    const url = cors?.[1] ?? String(entry.url ?? "");
+
+                    this.#log(
+                        "net",
+                        text.replace(/^Failed to load resource: /, ""),
+                        url === "" ? undefined : bareUrl(url),
+                        url !== "" && !sameSite(url, this.#url),
+                    );
+
+                    return;
+                }
+
                 const level =
                     entry.level === "warning"
                         ? "warn"
@@ -415,11 +446,7 @@ export class BrowserPage {
                           ? "debug"
                           : String(entry.level ?? "info");
 
-                this.#log(
-                    level,
-                    String(entry.text ?? ""),
-                    entry.url ? String(entry.url) : undefined,
-                );
+                this.#log(level, text, entry.url ? String(entry.url) : undefined);
 
                 return;
             }
@@ -511,23 +538,44 @@ export class BrowserPage {
         void this.#connection.send("Target.closeTarget", { targetId }).catch(() => {});
     }
 
-    #log(level: string, text: string, source?: string): void {
+    #log(level: string, text: string, source?: string, other = false): void {
+        const clipped = text.length > 2000 ? `${text.slice(0, 1999)}…` : text;
+        const last = this.#logs.at(-1);
+        // A page's own failed load is an error for the badge; another site's is not.
+        const counts = level === "error" || (level === "net" && !other);
+
+        if (counts) {
+            this.#errors++;
+        }
+
+        // The same line again (a beacon retried, a log in a loop) counts up on the last one instead of filling the console.
+        if (
+            last !== undefined &&
+            last.level === level &&
+            last.text === clipped &&
+            last.source === (source === "" ? undefined : source)
+        ) {
+            last.count = (last.count ?? 1) + 1;
+            last.at = Date.now();
+            last.seq = ++this.#logSeq;
+            this.#changed();
+
+            return;
+        }
+
         const entry: LogEntry = {
             seq: ++this.#logSeq,
             at: Date.now(),
             level,
-            text: text.length > 2000 ? `${text.slice(0, 1999)}…` : text,
+            text: clipped,
             ...(source === undefined || source === "" ? {} : { source }),
+            ...(other ? { other: true as const } : {}),
         };
 
         this.#logs.push(entry);
 
         if (this.#logs.length > MAX_LOGS) {
             this.#logs.splice(0, this.#logs.length - MAX_LOGS);
-        }
-
-        if (level === "error") {
-            this.#errors++;
         }
 
         this.#changed();
