@@ -114,6 +114,44 @@ test("a timeout stops the command on the host too", async () => {
     });
 });
 
+test("a stopped command leaves none of its descendants running on the host", async () => {
+    await withEnv(async (env) => {
+        const marker = join(env.cwd, "survived");
+        const controller = new AbortController();
+        // The marker is written by a subshell: killing the command's own shell would leave it going.
+        const running = env.exec(
+            `(sleep 3; touch ${shellQuote(marker)}) & wait`,
+            undefined,
+            withAbortSignal(controller.signal, BACKGROUND_CONTEXT),
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        controller.abort();
+
+        const result = await running;
+
+        assert.equal(result.ok, false);
+        assert.equal(!result.ok && result.error.code, "aborted");
+        await new Promise((resolve) => setTimeout(resolve, 3500));
+        assert.equal(existsSync(marker), false, "a descendant went on after it was stopped");
+    });
+});
+
+test("a timeout stops a command's descendants on the host too", async () => {
+    await withEnv(async (env) => {
+        const marker = join(env.cwd, "survived");
+        const result = await env.exec(
+            `(sleep 3; touch ${shellQuote(marker)}) & wait`,
+            { timeout: 0.5 },
+            context,
+        );
+
+        assert.equal(!result.ok && result.error.code, "timeout");
+        await new Promise((resolve) => setTimeout(resolve, 3500));
+        assert.equal(existsSync(marker), false);
+    });
+});
+
 test("output past the spill thresholds is kept whole in a local file", async () => {
     await withEnv(async (env) => {
         const result = getOrThrow(

@@ -168,6 +168,8 @@ export class SshExecutionEnv implements ExecutionEnv {
             const child = spawn(program!, [...args, launcher(PRELUDE + script)], {
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
+                // Its own process group, as the remote session's tree has one over ssh.
+                detached: true,
             });
             const out: Buffer[] = [];
             let stderr = "";
@@ -254,18 +256,21 @@ export class SshExecutionEnv implements ExecutionEnv {
             .map(([key, value]) => `export ${key}=${shellQuote(value)}\n`)
             .join("");
         const run = typeof command === "string" ? `${this.#shell} ${shellQuote(text)}` : text;
-        // The command in its own process group (`set -m`), stdin from nowhere; a watcher on the channel's stdin
-        // kills that group when the channel closes, and is stopped itself when the command ends.
+        // stdin from nowhere; a watcher on the channel's stdin kills the command when the channel closes, and is
+        // stopped itself when the command ends. No `set -m`: a shell without a tty (dash over ssh) turns job control
+        // off, the command then sits in the script's own group, and the watcher kills that group too.
         const script = [
             `cd -- ${shellQuote(cwd)} || exit 1`,
             exports,
             present,
             "exec 3<&0",
-            "set -m",
             `${run} </dev/null &`,
             "pid=$!",
-            "set +m",
-            '{ cat <&3 >/dev/null 2>&1; kill -KILL -"$pid" 2>/dev/null; } >/dev/null 2>&1 &',
+            // When the channel closes: the command's own group, if the shell gave it one; then the script's group,
+            // where the command sits in shells without job control; the pid itself when `ps` is nowhere. The group
+            // kill takes this watcher and the script with it, so it must come before the pid kill that lets the
+            // script's wait return and stop the watcher.
+            '{ cat <&3 >/dev/null 2>&1; kill -KILL -"$pid" 2>/dev/null; g=$(ps -o pgid= -p $$ 2>/dev/null | tr -d "[:space:]\n"); [ -n "$g" ] && kill -KILL -"$g" 2>/dev/null; kill -KILL "$pid" 2>/dev/null; } >/dev/null 2>&1 &',
             "w=$!",
             "exec 3<&-",
             'wait "$pid"; s=$?',
@@ -284,6 +289,9 @@ export class SshExecutionEnv implements ExecutionEnv {
             const child = spawn(program!, [...args, launcher(script)], {
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
+                // Its own process group and session, as the command's tree has one in the remote session; the
+                // watcher's group kill then reaches every descendant, and the test's `sh -c` stands in safely.
+                detached: true,
             });
             const decoders = { stdout: new StreamDecoder(), stderr: new StreamDecoder() };
             let settled = false;
