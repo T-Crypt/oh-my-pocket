@@ -264,6 +264,7 @@ test("each look finds Pi's edits since the last one, in a fork too", async () =>
         ];
     };
 
+    await say(app, id, "read it");
     await say(app, id, "edit it");
     assert.deepEqual(await byPi(id), ["keep.txt"]);
     await say(app, id, "write notes");
@@ -273,6 +274,8 @@ test("each look finds Pi's edits since the last one, in a fork too", async () =>
     const { id: fork } = await app.commands.fork(id, owner(app), { entryId: last.id });
 
     assert.deepEqual(await byPi(fork), ["keep.txt", "notes/todo.md"]);
+    // An earlier test may have left this file; read-first would refuse to overwrite it unread.
+    rmSync(join(folder, "..", "outside.txt"), { force: true });
     await say(app, fork, "write outside");
     assert.deepEqual(await byPi(fork), ["keep.txt", "notes/todo.md", "../outside.txt"]);
 });

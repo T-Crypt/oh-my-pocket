@@ -453,6 +453,13 @@ function actionItems() {
             icon: "key",
             run: () => openSheet({ type: "providers" }),
         },
+        me?.role === "owner" && {
+            label: "Hosts",
+            detail: "SSH hosts Pi can work on",
+            keywords: "ssh remote machine server",
+            icon: "terminal",
+            run: () => openSheet({ type: "hosts" }),
+        },
         modelRefreshAvailable() && {
             label: "Refresh models",
             detail: store.state.modelRefresh.loading

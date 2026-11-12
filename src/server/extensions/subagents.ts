@@ -1288,12 +1288,14 @@ export default function createSubagents(host: PocketHost) {
                             ...(thinking === undefined ? {} : { thinkingLevel: thinking }),
                             ...(tools === undefined ? {} : { tools }),
                         });
-                    }
 
-                    const plan = await tx.doc(PlanDoc, api.conversationId);
+                        // Only a fresh child: a fork has its parent's plan mode already (PlanDoc forks as current),
+                        // and a fork transaction may not touch the parent's current-policy documents.
+                        const plan = await tx.doc(PlanDoc, api.conversationId);
 
-                    if (plan.on) {
-                        Object.assign(await tx.doc(PlanDoc, child.id), plan);
+                        if (plan.on) {
+                            Object.assign(await tx.doc(PlanDoc, child.id), plan);
+                        }
                     }
 
                     state.agents[name] = { conversationId: child.id, reported: [] };
