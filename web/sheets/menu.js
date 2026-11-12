@@ -51,6 +51,12 @@ function extensionsHint() {
         .join(" · ");
 }
 
+/** The menu's word on the owner's SSH hosts: their names, or none. */
+const hostsLabel = (hosts) =>
+    (hosts ?? []).length === 0
+        ? "other machines over SSH"
+        : hosts.map((each) => each.name).join(", ");
+
 /**
  * The session's places as big tiles at the top of the menu: Files, Changes, the browser, artifacts, the chat, find,
  * the branch, and peek tiles. The top bar keeps only the buttons with something to say; these are always here, a
@@ -570,6 +576,7 @@ export function MenuSheet({ places = true }) {
             ${item("Spend", () => openSheet({ type: "spend" }), me?.role === "owner" ? "by person and session, limits" : "yours")}
             ${triggersOn() && me?.role !== "viewer" && item("Webhooks and watches", () => openSheet({ type: "hooks" }), "GitHub, other services")}
             ${me?.role === "owner" && item("Providers", () => openSheet({ type: "providers" }))}
+            ${me?.role === "owner" && item("Hosts", () => openSheet({ type: "hosts" }), hostsLabel(server?.hosts))}
             ${modelRefreshAvailable() && item("Refresh models", refreshModels, store.state.modelRefresh.loading ? "refreshing…" : "models.json and providers")}
             ${extensionMenuItems().map((each) => item(each.label, each.run, each.hint))}
             ${item("Extensions", () => openSheet({ type: "extensions" }), extensionsHint())}

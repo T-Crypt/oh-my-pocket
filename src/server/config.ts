@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { HostEntry } from "./hosts.ts";
 
 /** The repository root: `web/` and `src/` live here, and `node_modules/` too, except in an npx or local install. */
 export const APP_ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -116,6 +117,8 @@ interface PocketConfig {
      * setting with no value here has its default. Since 0.22.0; an older Pi Pocket ignores it.
      */
     extensionSettings?: Record<string, Record<string, string | number | boolean>>;
+    /** Other machines Pi may work on over SSH (`hosts.ts`), as the owner set them up. Absent: none. */
+    hosts?: HostEntry[];
 }
 
 /** The hours a run waits for a model's limit to clear, until the owner says otherwise. */
@@ -325,6 +328,23 @@ export class ConfigStore {
             delete this.#config.limitWaitHours;
         } else {
             this.#config.limitWaitHours = Math.min(Math.max(hours, 0), 24);
+        }
+
+        this.save();
+    }
+
+    /** The SSH hosts, as stored: `hosts.ts` checked them when the owner saved them. */
+    get hosts(): readonly HostEntry[] {
+        const hosts = this.#config.hosts;
+
+        return Array.isArray(hosts) ? hosts : [];
+    }
+
+    set hosts(hosts: readonly HostEntry[]) {
+        if (hosts.length === 0) {
+            delete this.#config.hosts;
+        } else {
+            this.#config.hosts = hosts.map((each) => ({ ...each }));
         }
 
         this.save();

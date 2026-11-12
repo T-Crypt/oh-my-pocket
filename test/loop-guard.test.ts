@@ -182,6 +182,8 @@ test("a check run after each fix is not a loop: an edit clears the repeats of sh
 
     writeFileSync(file, "broken\n");
     steps = [
+        // Read first: write refuses a file the session has not read (read-first).
+        tool("read", { path: file }),
         check,
         tool("write", { path: file, content: "still broken\n" }),
         check,
@@ -192,7 +194,7 @@ test("a check run after each fix is not a loop: an edit clears the repeats of sh
     stepIndex = 0;
     await say(app, id, "make the check pass");
 
-    const results = await resultsOf(id);
+    const results = (await resultsOf(id)).slice(1);
 
     assert.equal(results.length, 5);
     assert.equal(results[2]!.isError, true);

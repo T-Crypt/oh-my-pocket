@@ -79,7 +79,8 @@ export default function createReadEconomy(host: PocketHost) {
                         return result;
                     }
 
-                    const env = host.envFor(api.conversationId);
+                    // The call's own environment: a read on a host over SSH maps the file there.
+                    const env = api.env ?? host.envFor(api.conversationId);
                     const located = await env.absolutePath(input.path, context);
 
                     if (!located.ok) {

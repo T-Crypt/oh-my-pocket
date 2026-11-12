@@ -10,6 +10,7 @@ import { type ConversationId, UsageDoc } from "@earendil-works/pi-durable";
 import type { Attachment } from "../src/server/commands.ts";
 import type { User } from "../src/server/config.ts";
 import type { LimitTuning } from "../src/server/limit-gate.ts";
+import { SENT_STAMP } from "../src/server/sent-at.ts";
 import type { Client } from "../src/server/room.ts";
 import { PocketApp } from "../src/server/app.ts";
 
@@ -19,7 +20,7 @@ export const context = BACKGROUND_CONTEXT;
 
 export type App = Awaited<ReturnType<typeof PocketApp.open>>;
 
-/** The text of the newest message a model request carries, and who sent it. */
+/** The text of the newest message a model request carries, and who sent it, without the time it was sent. */
 export function lastText(context: { messages: readonly { role: string; content: unknown }[] }): {
     role: string;
     text: string;
@@ -32,7 +33,10 @@ export function lastText(context: { messages: readonly { role: string; content: 
 
     return {
         role: last.role,
-        text: content.flatMap((part) => (part.type === "text" ? [part.text ?? ""] : [])).join(""),
+        text: content
+            .flatMap((part) => (part.type === "text" ? [part.text ?? ""] : []))
+            .join("")
+            .replace(SENT_STAMP, ""),
     };
 }
 

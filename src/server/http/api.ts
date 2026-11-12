@@ -587,6 +587,19 @@ export function createApi(options: HttpOptions, auth: Auth) {
             return json(response, 200, { path: app.workspace.makeFolder(user, body.path) });
         }
 
+        // The owner's SSH hosts: the whole list saved at once, and a test of one (checked in `app.ts`).
+        if (first === "hosts" && second === undefined && method === "POST") {
+            const body = await readJson<{ hosts?: unknown }>(request);
+
+            return json(response, 200, { hosts: await app.setHosts(user, body.hosts) });
+        }
+
+        if (first === "hosts" && second === "test" && method === "POST") {
+            const body = await readJson<{ name?: unknown }>(request);
+
+            return json(response, 200, await app.testHost(user, body.name));
+        }
+
         if (first === "settings" && method === "POST") {
             const body = await readJson<{
                 approvalRule?: unknown;

@@ -166,6 +166,7 @@ import { Spend } from "./spend.ts";
 import { Transcripts } from "./transcripts.ts";
 import { Watches } from "./watches.ts";
 import { Workspace } from "./workspace.ts";
+import { checkHosts, type HostEntry, Hosts, type HostTest } from "./hosts.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -192,6 +193,7 @@ const SUBAGENTS_FILE = "subagents.ts";
 const LIMIT_WAIT_CHOICES = [0, 1, 6, 12, 24];
 /** The most models the owner may allow subagents. */
 const MAX_SUBAGENT_MODELS = 50;
+const HOSTS_FILE = "hosts.ts";
 
 /**
  * The most conversations a tab gets live peeks for at once: the sessions on its screen, and the subagents working
@@ -316,6 +318,8 @@ export class PocketApp {
     pushStore: PushStore | undefined;
     readonly approvals = new Approvals((id) => this.attribution.requesterOf(id));
     readonly guard = new LancetGuard();
+    /** Other machines Pi may work on over SSH, as the owner set them up (`hosts.ts`). */
+    readonly hosts: Hosts;
     readonly dataDir: string;
     readonly defaultCwd: string;
     readonly supervised: boolean;
@@ -469,6 +473,12 @@ export class PocketApp {
                 : {}),
         });
         this.config = new ConfigStore(options.dataDir);
+        // `PI_POCKET_SSH` names another ssh program: for tests, or an ssh that is not on the PATH.
+        this.hosts = new Hosts(
+            options.dataDir,
+            () => this.config.hosts,
+            process.env.PI_POCKET_SSH || "ssh",
+        );
         this.#lockFile = join(options.dataDir, "harness.lock");
         this.#log = options.log ?? ((line) => console.log(line));
         this.cacheKeeper = new CacheKeeper({
@@ -867,6 +877,7 @@ export class PocketApp {
             updates: this.updates,
             text: Object.freeze({ quoted, defang }),
             thinkingLevels: THINKING_LEVELS,
+            hosts: this.hosts,
         };
 
         this.#registry = registry;
@@ -2334,6 +2345,10 @@ export class PocketApp {
                 ...(user.role === "owner"
                     ? { subagentModels: [...this.config.subagentModels] }
                     : {}),
+                // Other machines Pi may work on over SSH: the owner's to see and change.
+                ...(user.role === "owner"
+                    ? { hosts: this.config.hosts.map((each) => ({ ...each })) }
+                    : {}),
                 // This person may have a PiP, the assistant over every screen (`pip.ts`).
                 pip: this.pip.available(user),
                 // Tokens of context above which PiP compacts itself once idle; 0: only as sessions do.
@@ -3241,6 +3256,45 @@ export class PocketApp {
     }
 
     /** The owner changes who may allow risky calls. */
+    /** The owner's SSH hosts, all of them at once: what the Hosts sheet saves. Returns them as kept. */
+    async setHosts(user: User, value: unknown): Promise<readonly HostEntry[]> {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        const chosen = checkHosts(value);
+
+        if (JSON.stringify(chosen) !== JSON.stringify(this.config.hosts)) {
+            this.config.hosts = chosen;
+
+            // The tools take `host` only while some host is usable: rebuilt now, for the next request of every session.
+            if (this.loader.enabled(HOSTS_FILE)) {
+                try {
+                    await this.loader.reload(HOSTS_FILE);
+                } catch (error) {
+                    this.notice("error", `SSH hosts failed to reload: ${describe(error)}`);
+                }
+            }
+
+            await this.#refreshClients((each) => each.role === "owner");
+        }
+
+        return this.config.hosts;
+    }
+
+    /** Connect to one of the owner's hosts and run a no-op there: the Hosts sheet's Test button. */
+    async testHost(user: User, name: unknown): Promise<HostTest> {
+        if (user.role !== "owner") {
+            throw new HttpError(403, "Only the owner can do that");
+        }
+
+        if (typeof name !== "string") {
+            throw new HttpError(400, "Name the host to test.");
+        }
+
+        return this.hosts.test(name);
+    }
+
     async setApprovalRule(user: User, rule: unknown): Promise<void> {
         if (user.role !== "owner") {
             throw new HttpError(403, "Only the owner can do that");
@@ -3850,6 +3904,8 @@ export class PocketApp {
                 for (const env of this.#envs.values()) {
                     await env.cleanup(context);
                 }
+
+                await this.hosts.close().catch(() => {});
             } finally {
                 // After the harness: a browser call cut off by the stop resumes as interrupted, not as failed.
                 await this.browsers.closeAll({ final: true }).catch(() => {});

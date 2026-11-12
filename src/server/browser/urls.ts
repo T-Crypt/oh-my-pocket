@@ -138,3 +138,46 @@ export function displayUrl(url: string): string {
 
     return url.replace(/^https?:\/\//, "").replace(/^([^/?#]+)\/$/, "$1");
 }
+
+/**
+ * Whether `url` belongs to the same site as the page at `pageUrl`: the same host, or the same last two labels of its
+ * name (`cdn.example.com` and `example.com`). Local names and IP addresses match only themselves. A rough site, not
+ * the public suffix list: enough to tell a page's own failed loads from its trackers'.
+ */
+export function sameSite(url: string, pageUrl: string): boolean {
+    let host: string;
+    let pageHost: string;
+
+    try {
+        host = new URL(url).hostname.toLowerCase();
+        pageHost = new URL(pageUrl).hostname.toLowerCase();
+    } catch {
+        return true;
+    }
+
+    if (host === pageHost || pageHost === "") {
+        return true;
+    }
+
+    if (localHost(host) || localHost(pageHost) || /^[\d.]+$/.test(host)) {
+        return false;
+    }
+
+    const site = (name: string) => name.split(".").slice(-2).join(".");
+
+    return site(host) === site(pageHost);
+}
+
+/** A resource's address without its query or fragment, which for beacons and trackers is mostly a request id. */
+export function bareUrl(url: string): string {
+    return url.replace(/[?#].*$/, "");
+}
+
+/** The host name of an address, or the address itself when it has none. */
+export function hostOf(url: string): string {
+    try {
+        return new URL(url).hostname || url;
+    } catch {
+        return url;
+    }
+}

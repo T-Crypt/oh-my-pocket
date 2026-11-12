@@ -526,6 +526,8 @@ function TypeBar({ send, onClose, input, shown }) {
 /** The page's console: logs, errors, failed loads, and dialogs, with a line where each page began. */
 function ConsolePane({ conversationId, logs, steer, onClose }) {
     const [entries, setEntries] = useState(null);
+    // Other sites' failed loads (trackers a DNS blocker refused, mostly) stay folded away unless asked for.
+    const [showOther, setShowOther] = useState(false);
     const list = useRef(null);
     const pending = useRef(null);
     const mounted = useRef(true);
@@ -562,13 +564,29 @@ function ConsolePane({ conversationId, logs, steer, onClose }) {
         }
     }, [entries]);
     const source = (text) => text?.replace(/^https?:\/\/[^/]+/, "");
+    const other = (entry) => entry.level === "net" && entry.other;
+    const hidden = (entries ?? [])
+        .filter(other)
+        .reduce((sum, entry) => sum + (entry.count ?? 1), 0);
+    const shown = (entries ?? []).filter((entry) => showOther || !other(entry));
 
     return html`<section class="browser-console" aria-label="Console">
         <header>
             <strong>Console</strong>
             <span class="muted small">
-                ${entries ? `${entries.filter((entry) => entry.level !== "nav").length} lines` : ""}
+                ${entries ? `${shown.filter((entry) => entry.level !== "nav").length} lines` : ""}
             </span>
+            ${
+                hidden > 0 &&
+                html`<button
+                    class="link small"
+                    title="Failed loads to other sites than the page's: analytics and trackers, usually blocked on purpose"
+                    onClick=${() => setShowOther(!showOther)}
+                >
+                    ${showOther ? "Hide" : "Show"} ${hidden} other-site failed
+                    ${hidden === 1 ? " load" : " loads"}
+                </button>`
+            }
             <span class="spacer"></span>
             ${
                 steer &&
@@ -584,16 +602,20 @@ function ConsolePane({ conversationId, logs, steer, onClose }) {
             ${
                 entries === null
                     ? html`<div class="muted small">Loading…</div>`
-                    : entries.length === 0
+                    : shown.length === 0
                       ? html`<div class="muted small">
-                          Nothing yet. Logs, errors, and failed loads show here.
+                          ${hidden > 0 ? "Nothing from the page itself." : "Nothing yet. Logs, errors, and failed loads show here."}
                       </div>`
-                      : entries.map((entry) =>
+                      : shown.map((entry) =>
                             entry.level === "nav"
                                 ? html`<div key=${entry.seq} class="console-nav">
                                     ${displayUrl(entry.text) || entry.text}
                                 </div>`
                                 : html`<div key=${entry.seq} class=${`console-line ${entry.level}`}>
+                                    ${
+                                        entry.count > 1 &&
+                                        html`<span class="console-count">${entry.count}</span>`
+                                    }
                                     <span class="console-text">${entry.text}</span>
                                     ${
                                         entry.source &&

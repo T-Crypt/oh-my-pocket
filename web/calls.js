@@ -31,6 +31,21 @@ export const describersRevision = () => ownRevision;
  * call an extension described.
  */
 export function describeCall(call) {
+    const described = describeOne(call);
+    const host = call.args?.host;
+
+    // A call on another machine says which: `>_ @gpu nvidia-smi`.
+    return typeof host === "string" &&
+        host !== "" &&
+        ["bash", "read", "write", "edit"].includes(call.name)
+        ? {
+              ...described,
+              label: described.label === "" ? `@${host}` : `${described.label} @${host}`,
+          }
+        : described;
+}
+
+function describeOne(call) {
     const args = call.args ?? {};
 
     switch (call.name) {

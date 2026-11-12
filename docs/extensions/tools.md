@@ -58,7 +58,7 @@ const lookup = Object.assign(defineTool({ … }), { annotations: { readOnlyHint:
 
 ## Files, documents, and the session
 
-- `api.env` gives the files and the shell of the session's folder. `(await api.agent(context)).cwd` is the folder.
+- `api.env` gives the files and the shell of the call: the session's folder, or an SSH host's when the call named one. Use it, not `node:fs` or `host.envFor`, for anything about the file a call names, so the tool works on a host too. `(await api.agent(context)).cwd` is the folder.
 - `api.snapshot(Doc, api.conversationId, context)` reads a document, for example one of Pi Pocket's in `src/server/docs.ts`.
 
 ## Call a model

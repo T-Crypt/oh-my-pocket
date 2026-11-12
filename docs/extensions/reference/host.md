@@ -686,6 +686,7 @@ The host has more members, for Pi Pocket's built-in modules only. They are not i
 - `memory`: the lessons that Pi keeps across sessions, for the memory tool.
 - `watches`: the pull request watches of sessions, for the `watch_pr` tool.
 - `repoWatches`: the task of repository watches, for the triggers module.
+- `hosts`: SSH hosts (`hosts.ts`): `usable()`, `get(name)`, and `envFor(name)`, where a call with `host` runs. A server from before the hosts module has none: check that it is there first.
 - `pip`: what the tools of PiP, the owner's assistant, do.
 - `pipCompaction`: PiP's own summaries when its context is compacted.
 - `gallery`: the extension gallery, for its own routes.

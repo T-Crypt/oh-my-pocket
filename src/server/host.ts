@@ -11,6 +11,7 @@ import type {
     Tx,
 } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
+import type { Hosts } from "./hosts.ts";
 import type { Browsers } from "./browser.ts";
 import type { Gallery } from "./gallery.ts";
 import type { Role, User } from "./config.ts";
@@ -526,6 +527,11 @@ export interface PocketHost {
     >;
     /** Updates of Pi Pocket itself (`updates.ts`): its extension's routes are the owner's way to them. */
     readonly updates: Pick<Updates, "status" | "check" | "apply" | "subscribe">;
+    /**
+     * Other machines Pi may work on over SSH (`hosts.ts`): the ones it is offered, one by name, and the environment a
+     * call with `host` runs in. Optional: a module reloaded into a server older than it works without it.
+     */
+    readonly hosts?: Pick<Hosts, "usable" | "get" | "envFor">;
 }
 
 /**

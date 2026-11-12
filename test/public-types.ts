@@ -80,7 +80,8 @@ type Internal =
     | "loopGuard"
     | "pruner"
     | "readOnlyCalls"
-    | "reloadModule";
+    | "reloadModule"
+    | "hosts";
 
 type PublicHost = Pick<PocketHost, keyof Host>;
 
