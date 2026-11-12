@@ -3,6 +3,7 @@ import { awaitWithContext } from "@earendil-works/chord/context";
 import type { Skill } from "@earendil-works/pi-coding-agent";
 import type { ConversationId, Extension, ModelRef, TaskId } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
+import type { Hosts } from "./hosts.ts";
 import type { Browsers } from "./browser.ts";
 import type { Goals } from "./goals.ts";
 import type { LancetGuard } from "./lancet.ts";
@@ -209,6 +210,11 @@ export interface PocketHost {
      * sets its tools here when it loads; a reload sets them again.
      */
     readonly readOnlyCalls: Map<string, (args: Record<string, unknown>) => boolean>;
+    /**
+     * Other machines Pi may work on over SSH (`hosts.ts`): the ones it is offered, one by name, and the environment a
+     * call with `host` runs in. Optional: a module reloaded into a server older than it works without it.
+     */
+    readonly hosts?: Pick<Hosts, "usable" | "get" | "envFor">;
 }
 
 /** The shape of every module in `src/server/extensions/`: a default export building one or more extensions. */

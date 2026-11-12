@@ -531,6 +531,7 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "bash-timeout.ts",
             "quiet-shell.ts",
             "read-first.ts",
+            "hosts.ts",
             "todo.ts",
             "today.ts",
         ],

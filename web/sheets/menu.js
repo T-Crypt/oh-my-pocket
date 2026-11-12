@@ -29,6 +29,12 @@ import { memoryAvailable, memoryHint, useMemory } from "./memory.js";
 import { defaultLabel, defaultsKept } from "./model.js";
 import { copyText, html, Icon, item, Sheet, shortPath } from "../ui.js";
 
+/** The menu's word on the owner's SSH hosts: their names, or none. */
+const hostsLabel = (hosts) =>
+    (hosts ?? []).length === 0
+        ? "other machines over SSH"
+        : hosts.map((each) => each.name).join(", ");
+
 /**
  * The session's places as big tiles at the top of the menu: Files, Changes, the browser, artifacts, the chat, find,
  * the branch, and peek tiles. The top bar keeps only the buttons with something to say; these are always here, a
@@ -341,6 +347,7 @@ export function MenuSheet() {
             ${item("Spend", () => openSheet({ type: "spend" }), me?.role === "owner" ? "by person and session, limits" : "yours")}
             ${triggersOn() && me?.role !== "viewer" && item("Webhooks and watches", () => openSheet({ type: "hooks" }), "GitHub, other services")}
             ${item("Providers", () => openSheet({ type: "providers" }))}
+            ${me?.role === "owner" && item("Hosts", () => openSheet({ type: "hosts" }), hostsLabel(server?.hosts))}
             ${item("Extensions", () => openSheet({ type: "extensions" }), store.state.guard?.enabled ? "Lancet Guard on" : store.state.guard?.available ? "Lancet Guard off" : "")}
             ${
                 me?.role === "owner" &&

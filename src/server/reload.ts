@@ -47,6 +47,9 @@ const ORDER = [
     "bash-timeout.ts",
     "quiet-shell.ts",
     "read-first.ts",
+    // After every module that wraps bash, read, write or edit: its wrap is the outermost, so theirs see the host's
+    // environment and never the `host` argument.
+    "hosts.ts",
     "todo.ts",
     "today.ts",
 ];
@@ -80,6 +83,7 @@ const TITLES: Record<string, string> = {
     "bash-timeout.ts": "Bash timeout",
     "quiet-shell.ts": "Quiet shell",
     "read-first.ts": "Read first",
+    "hosts.ts": "SSH hosts",
     "todo.ts": "Todo",
     "today.ts": "Today",
 };
