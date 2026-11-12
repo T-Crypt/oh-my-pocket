@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { HostEntry } from "./hosts.ts";
 
 /** The repository root: `web/`, `src/`, and `node_modules/` live here. */
 export const APP_ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -79,6 +80,8 @@ interface PocketConfig {
      * Absent or empty: none, and subagents always run on their session's model.
      */
     subagentModels?: string[];
+    /** Other machines Pi may work on over SSH (`hosts.ts`), as the owner set them up. Absent: none. */
+    hosts?: HostEntry[];
 }
 
 /** Who may allow a risky tool call: anyone who can steer, or (for guests) only someone other than who asked. */
@@ -223,6 +226,23 @@ export class ConfigStore {
             delete this.#config.subagentModels;
         } else {
             this.#config.subagentModels = [...models];
+        }
+
+        this.save();
+    }
+
+    /** The SSH hosts, as stored: `hosts.ts` checked them when the owner saved them. */
+    get hosts(): readonly HostEntry[] {
+        const hosts = this.#config.hosts;
+
+        return Array.isArray(hosts) ? hosts : [];
+    }
+
+    set hosts(hosts: readonly HostEntry[]) {
+        if (hosts.length === 0) {
+            delete this.#config.hosts;
+        } else {
+            this.#config.hosts = hosts.map((each) => ({ ...each }));
         }
 
         this.save();

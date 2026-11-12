@@ -5,7 +5,6 @@
  * subagent forked from this conversation knows what it read. After DSH's fs-observation-policy; like it, what was read
  * is not kept across a restart, so after one the model reads the file again.
  */
-import { statSync } from "node:fs";
 import type { ConversationId, ToolRegistration } from "@earendil-works/pi-durable";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { defineExtension, wrapTool } from "@earendil-works/pi-durable";
@@ -16,22 +15,30 @@ const MAX_CONVERSATIONS = 200;
 /** How many forks up a conversation looks for its parents' reads. */
 const MAX_ANCESTORS = 5;
 
-/** A file as it was: its modification time and size, or undefined when it does not exist. */
-function stampOf(path: string): string | undefined {
-    try {
-        const stat = statSync(path);
+type Api = Parameters<ToolRegistration["execute"]>[1];
+type Ctx = Parameters<ToolRegistration["execute"]>[2];
 
-        return `${stat.mtimeMs}:${stat.size}`;
-    } catch {
-        return undefined;
-    }
+/**
+ * A file as it was, in the call's own environment (this machine, or a host over SSH): its modification time and size,
+ * or undefined when it does not exist there.
+ */
+async function stampOf(api: Api, path: string, context: Ctx): Promise<string | undefined> {
+    const info = await api.env?.fileInfo(path, context);
+
+    return info?.ok === true ? `${info.value.mtimeMs}:${info.value.size}` : undefined;
+}
+
+/** A path as one environment sees it: the same path on another machine is another file. */
+function keyOf(api: Api, path: string): string {
+    return `${api.env?.id ?? ""}\u0000${path}`;
 }
 
 export default function createReadFirst(_host: PocketHost) {
     const seen = new Map<ConversationId, Map<string, string>>();
 
-    const remember = (id: ConversationId, path: string) => {
-        const stamp = stampOf(path);
+    const remember = async (api: Api, path: string, context: Ctx) => {
+        const id = api.conversationId;
+        const stamp = await stampOf(api, path, context);
 
         if (stamp === undefined) {
             return;
@@ -48,10 +55,8 @@ export default function createReadFirst(_host: PocketHost) {
             }
         }
 
-        files.set(path, stamp);
+        files.set(keyOf(api, path), stamp);
     };
-
-    type Api = Parameters<ToolRegistration["execute"]>[1];
 
     /** The absolute path a call names, as the tool resolves it; undefined when it cannot be resolved. */
     const resolve = async (
@@ -74,7 +79,7 @@ export default function createReadFirst(_host: PocketHost) {
         let id: ConversationId | undefined = api.conversationId;
 
         for (let depth = 0; id !== undefined && depth <= MAX_ANCESTORS; depth++) {
-            const stamp = seen.get(id)?.get(path);
+            const stamp = seen.get(id)?.get(keyOf(api, path));
 
             if (stamp !== undefined) {
                 return stamp;
@@ -112,7 +117,7 @@ export default function createReadFirst(_host: PocketHost) {
                               );
 
                               if (result.isError !== true && path !== undefined) {
-                                  remember(api.conversationId, path);
+                                  await remember(api, path, context);
                               }
 
                               return result;
@@ -130,7 +135,7 @@ export default function createReadFirst(_host: PocketHost) {
                             return tool.execute(args, api, context);
                         }
 
-                        const now = stampOf(path);
+                        const now = await stampOf(api, path, context);
 
                         if (now !== undefined) {
                             const before = await lastRead(api, path, context);
@@ -152,7 +157,7 @@ export default function createReadFirst(_host: PocketHost) {
 
                         // What the model wrote is what it knows: it may change the file again without reading it.
                         if (result.isError !== true) {
-                            remember(api.conversationId, path);
+                            await remember(api, path, context);
                         }
 
                         return result;

@@ -82,7 +82,7 @@ You cannot turn a drop-in on yourself: ask the owner to, in Menu → Extensions.
 - Return `{ content: [{ type: "text", text }] }`. Throw an `Error` to give the model an error result with its message.
 - `replay: "safe"` only when running the call twice is harmless (reading, or an action keyed so a repeat finds the first one's result). The default is unsafe: a call cut off by a restart comes back to the model as interrupted instead of running again.
 - `api.conversationId`, `api.taskId`, `api.callId` say which call this is. `${api.taskId}:${api.callId}` is a key that stays the same if the call runs again.
-- `api.env` is the session folder's files and shell; `(await api.agent(context)).cwd` is the folder.
+- `api.env` is the call's files and shell: the session's folder, or an SSH host's when the call named one. Use it, not `node:fs` or `host.envFor`, for anything about the file a call names, so the tool works on a host too. `(await api.agent(context)).cwd` is the session's folder.
 - `api.output(text)` streams running output, which becomes the result when `execute` returns no `content`.
 - `api.memo(name, context)` reads, and `api.memo(name, value, context)` stores, a value kept with this call: a repeat after a restart finds it. Use it for anything that must not happen twice.
 - `api.snapshot(Doc, api.conversationId, context)` reads a document, such as Pi Pocket's in `src/server/docs.ts`.
@@ -131,6 +131,7 @@ What the default export receives. Extensions reach the app only through it; it s
 | `watches`                        | Sessions' PR watches: starting, stopping, and reading one, and the task that looks                                            |
 | `repoWatches`                    | Repository watches' task, which the triggers extension installs                                                               |
 | `readOnlyCalls`                  | Tool name to a check of its arguments: calls that pass only read, so plan mode lets them run                                  |
+| `hosts`                          | SSH hosts (`hosts.ts`): `usable()`, `get(name)`, and `envFor(name)`, where a call with `host` runs. Optional: check first     |
 
 Modules reload into the running server, but the server's own part (the host among it) changes only with a restart. A module that uses a member new to the host must work without it until then: check that it is there (`typeof host.heldBack === "function"`) and do as before when it is not. A module that called a missing member would fail at its first use, in every session.
 
