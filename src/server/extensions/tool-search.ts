@@ -27,7 +27,8 @@ const DESIGN_NOTE = `Before you make or change a design, read ${DESIGN_GUIDE}. C
  * The tools that wait. `section`: the prompt section that waits with them. `note`: what that section would say, for
  * the codemode route, where it never shows; `guide`: the module that provides it (`web.provide({ guide })`) instead.
  */
-// Not `subagent`: a router session spawns its stages at once, and a local model may not search for the tool first.
+// `subagent` waits too, except in a session that runs a router: `commands.setRouter` loads it there, so the router
+// spawns its stages at once.
 const DEFERRED: Record<string, { use: string; section?: string; note?: string; guide?: string }> = {
     browser: {
         use: "open and test web pages in a real browser",
@@ -53,6 +54,11 @@ const DEFERRED: Record<string, { use: string; section?: string; note?: string; g
         note: DESIGN_NOTE,
     },
     ask_someone: { use: "draft a question for someone outside this chat" },
+    subagent: {
+        use: "hand work to background helpers",
+        section: "subagents",
+        guide: "subagents",
+    },
 };
 
 type Guide = { guide?: (model: Agent["model"]) => Promise<string> };

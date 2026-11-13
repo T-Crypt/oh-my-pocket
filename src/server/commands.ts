@@ -2293,6 +2293,17 @@ export class Commands {
             return true;
         }, context);
 
+        // A router spawns its stages at once: its session has the subagent tool, which other sessions load by a
+        // search (`tool-search.ts`).
+        if (chosen !== undefined) {
+            await (
+                await app.conversation(id)
+            ).configure(
+                { modelTools: { remove: [], add: [{ name: "subagent" }] } } as never,
+                context,
+            );
+        }
+
         if (changed) {
             await app.collab.activity(
                 id,

@@ -46,7 +46,7 @@ import {
     SubagentsDoc,
 } from "../docs.ts";
 import { describe } from "../errors.ts";
-import type { PocketHost } from "../host.ts";
+import type { ExtensionWeb, PocketHost } from "../host.ts";
 import { levelAtMost, sameModel, THINKING_LEVELS } from "../models.ts";
 import { requestFor } from "../requests.ts";
 import { skillsToRead, stageDefinition, stageModels, stageOf } from "../routers.ts";
@@ -860,7 +860,11 @@ async function forkPoint(tx: Tx, id: ConversationId, callId: string): Promise<En
 /** Where a level stands among the thinking levels, lowest first. */
 const rank = (level: ModelThinkingLevel) => THINKING_LEVELS.indexOf(level);
 
-export default function createSubagents(host: PocketHost) {
+export default function createSubagents(host: PocketHost, web?: ExtensionWeb) {
+    // The guide, for tool search to show where the section never does: when Pi calls subagent through codemode. The
+    // models it lists are the owner's; a session's own choice (`/subagents`) still decides what a spawn may use.
+    web?.provide({ guide: () => guide(host, host.subagentModels()) });
+
     const Courier = courierFor(host);
     const Reporter = reporterFor(Courier, host);
     const base = {

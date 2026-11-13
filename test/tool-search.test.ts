@@ -122,12 +122,15 @@ test("a new conversation is offered tool_search, not the tools that wait, and th
 
     assert.ok(offered.includes("tool_search"));
     assert.ok(offered.includes("artifact"), "tools in common use are offered");
-    assert.ok(
-        offered.includes("subagent"),
-        "subagent is offered at once: routers spawn their stages",
-    );
 
-    for (const name of ["browser", "background", "schedule", "design_preview", "design_system"]) {
+    for (const name of [
+        "browser",
+        "subagent",
+        "background",
+        "schedule",
+        "design_preview",
+        "design_system",
+    ]) {
         assert.ok(!offered.includes(name), `${name} waits`);
         assert.ok(waiting.includes(name), `${name} can be loaded`);
     }
@@ -137,9 +140,9 @@ test("a new conversation is offered tool_search, not the tools that wait, and th
     // "no section" matches none of the patterns below, so a missing section fails each of them.
     assert.match(sections.deferred_tools ?? "no section", /- browser: /);
     assert.match(sections.deferred_tools ?? "no section", /- background: /);
-    assert.doesNotMatch(sections.deferred_tools ?? "no section", /- subagent: /);
+    assert.match(sections.deferred_tools ?? "no section", /- subagent: /);
 
-    for (const key of ["browser", "background_tasks", "design_mode"]) {
+    for (const key of ["browser", "subagents", "background_tasks", "design_mode"]) {
         assert.equal(sections[key], undefined, `${key} is not shown while its tool waits`);
     }
 });
@@ -172,6 +175,36 @@ test("on a model with tool changes in the messages, a query of tool names loads 
     assert.match(sections.deferred_tools ?? "no section", /design_preview/);
     assert.doesNotMatch(sections.deferred_tools ?? "no section", /- browser:/);
     assert.equal(sections.design_mode, undefined);
+});
+
+test("subagent loads with its guide: a section with tool changes in the messages, the search result through codemode", async () => {
+    const native = await nativeSession();
+
+    await say(app, native, "need subagents");
+    await say(app, native, "and now?");
+    assert.ok((await agent(native)).offered.includes("subagent"));
+    assert.match(sections.subagents ?? "no section", /A subagent does not see this conversation/);
+
+    const id = await newSession(app);
+
+    await say(app, id, "need subagents");
+
+    const result = (await app.transcripts.allEntries(id, false)).find(
+        (entry) =>
+            entry.kind === "toolResult" && (entry as { name?: string }).name === "tool_search",
+    ) as { text?: string } | undefined;
+
+    assert.match(result?.text ?? "", /Call it from a codemode script: await tools\.subagent/);
+    assert.match(result?.text ?? "", /A subagent does not see this conversation/);
+    assert.match(result?.text ?? "", /Subagents run on your model/);
+
+    // Through codemode, as the result says: the subagent starts.
+    await say(app, id, "spawn from a script");
+    await until(
+        async () =>
+            (await app.harness.snapshot(SubagentsDoc, id, context))?.agents.scripted !== undefined,
+        "the subagent a script started",
+    );
 });
 
 test("any design tool shows the design guide's section once it is loaded", async () => {
