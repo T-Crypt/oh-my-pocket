@@ -90,14 +90,14 @@ async function openProviders(): Promise<void> {
     );
     await slid();
     await see(
-        `return JSON.stringify(document.querySelector(".provider-block") !== null)`,
+        `return JSON.stringify(document.querySelector(".provider-item") !== null)`,
         "the providers",
     );
 }
 
 /** A provider's block in the sheet, by the name its row shows. */
 const block = (provider: string) =>
-    `[...document.querySelectorAll(".provider-block")].find((each) => each.querySelector(".provider").textContent.includes(${JSON.stringify(provider)}))`;
+    `[...document.querySelectorAll(".provider-item")].find((each) => each.querySelector(".provider").textContent.includes(${JSON.stringify(provider)}))`;
 
 /** Open a provider's models, or close them, with the button on its row. */
 const modelsButton = (provider: string) =>
@@ -253,6 +253,6 @@ test("the owner's switches decide which models the model menu offers", real, asy
 
     // The session's model menu, which was open over the whole flood: only the chosen models now.
     await page.evaluate(`(await import("/store.js")).closeSheet()`);
-    await see(gone(".provider-block"), "the Providers sheet closed");
+    await see(gone(".provider-item"), "the Providers sheet closed");
     assert.deepEqual((await menu()).sort(), ["faux/faux-2", "local/local-1", "local/local-2"]);
 });

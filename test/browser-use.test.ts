@@ -182,7 +182,7 @@ async function offered(id: ConversationId) {
 
     return {
         browser: lastTools.includes("browser"),
-        guide: lastSystem.includes("You have a browser tool"),
+        guide: lastSystem.includes("The browser tool is a real Chromium"),
     };
 }
 
