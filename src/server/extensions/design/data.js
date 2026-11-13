@@ -34,6 +34,51 @@ export function designsOf(appView, listed) {
         .sort((a, b) => timeOf(b) - timeOf(a));
 }
 
+/**
+ * Moves the accepted findings (`accepted`: id to who and when) out of `findings`, and counts only the open ones. An already
+ * split report is split again, so an accept and its undo need no new check.
+ */
+export function splitReport(report, accepted) {
+    if (!report || !Array.isArray(report.findings)) {
+        return report;
+    }
+
+    const all = [...report.findings, ...(report.accepted ?? [])];
+    const at = new Map((report.order ?? []).map((id, index) => [id, index]));
+    const place = (finding) => at.get(finding.id) ?? Number.MAX_SAFE_INTEGER;
+    const sorted = at.size > 0 ? all.toSorted((a, b) => place(a) - place(b)) : all;
+    const isAccepted = (finding) =>
+        finding.id !== undefined && Object.hasOwn(accepted ?? {}, finding.id);
+    const findings = sorted.filter((finding) => !isAccepted(finding));
+    const byRule = {};
+
+    for (const finding of findings) {
+        byRule[finding.rule] = (byRule[finding.rule] ?? 0) + 1;
+    }
+
+    return {
+        ...report,
+        findings,
+        accepted: sorted.filter(isAccepted),
+        summary: {
+            ...report.summary,
+            errors: findings.filter((finding) => finding.level === "error").length,
+            warnings: findings.filter((finding) => finding.level === "warning").length,
+            byRule,
+        },
+    };
+}
+
+const resplit = (checks, artifact, accepted) =>
+    Object.fromEntries(
+        Object.entries(checks).map(([key, entry]) => [
+            key,
+            key.startsWith(`${artifact}@`) && entry.report
+                ? { ...entry, report: splitReport(entry.report, accepted) }
+                : entry,
+        ]),
+    );
+
 /** The designs in the same group as `artifact` (itself included), in the list's order; none when it has no group. */
 export function siblingsOf(designs, artifact) {
     if (!artifact?.group) {
@@ -41,6 +86,16 @@ export function siblingsOf(designs, artifact) {
     }
 
     return designs.filter((each) => each.group === artifact.group);
+}
+
+export function downloadFile(conversation, made) {
+    const link = document.createElement("a");
+
+    link.href = `/api/c/${encodeURIComponent(conversation)}/download?${new URLSearchParams({ path: made.relative })}`;
+    link.download = made.name;
+    document.body.append(link);
+    link.click();
+    link.remove();
 }
 
 export function createData(pocket, store) {
@@ -95,12 +150,50 @@ export function createData(pocket, store) {
                 if (current(conversation)) {
                     store.set((state) => ({
                         notes: { ...state.notes, [artifact]: { ...result, loaded: true } },
+                        checks: resplit(state.checks, artifact, result.accepted),
                     }));
                 }
             } catch (error) {
                 if (current(conversation) && error?.status !== 404) {
                     console.warn("Design: could not read the comments", error);
                 }
+            }
+        },
+
+        async accept(artifact, finding) {
+            const conversation = conversationOf();
+
+            try {
+                await pocket.api(
+                    `c/${conversation}/designs/${encodeURIComponent(artifact)}/accepted`,
+                    { id: finding.id, rule: finding.rule, message: finding.message },
+                );
+                await data.notes(artifact);
+
+                return true;
+            } catch (error) {
+                fail(error);
+
+                return false;
+            }
+        },
+
+        async unaccept(artifact, id) {
+            const conversation = conversationOf();
+
+            try {
+                await pocket.api(
+                    `c/${conversation}/designs/${encodeURIComponent(artifact)}/accepted/${encodeURIComponent(id)}`,
+                    undefined,
+                    { method: "DELETE" },
+                );
+                await data.notes(artifact);
+
+                return true;
+            } catch (error) {
+                fail(error);
+
+                return false;
             }
         },
 
@@ -225,14 +318,8 @@ export function createData(pocket, store) {
                     format,
                     ...(viewport ? { viewport } : {}),
                 });
-                // The core route streams the file from the session's folder as an attachment.
-                const link = document.createElement("a");
 
-                link.href = `/api/c/${encodeURIComponent(conversation)}/download?${new URLSearchParams({ path: made.relative })}`;
-                link.download = made.name;
-                document.body.append(link);
-                link.click();
-                link.remove();
+                downloadFile(conversation, made);
                 pocket.notify("info", `Saved ${made.name}. It is also at ${made.path}`);
 
                 return true;

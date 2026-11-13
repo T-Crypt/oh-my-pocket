@@ -4,7 +4,7 @@
  *
  * Kinds are part of the stored data: rename one and old sessions lose it.
  */
-import type { JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord/json";
 import {
     type CheckpointInfo,
     type ConversationId,
@@ -61,6 +61,44 @@ export const SessionsDoc = defineDoc<{ items: Record<string, SessionMeta> }>({
     initial: () => ({ items: {} }),
 });
 
+/** Interrupt handoffs not yet admitted as messages: retries find the same durable task, even after a restart. */
+export const InterruptsDoc = defineDoc<{ pending: Record<string, number> }>({
+    kind: "pocket.interrupts",
+    version: 1,
+    ...rebased,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    initial: () => ({ pending: {} }),
+});
+
+/** A message that Stop took out of the queue: it waits, and goes to Pi only when someone sends it. */
+export type HeldMessage = {
+    /** The id of the queued message it was. */
+    key: string;
+    /** Pi Durable's `UserInput`, as it was queued. */
+    content: JsonValue;
+    mode: "steer" | "followUp";
+    /** The request id it goes out with: its sender's, so it stays theirs, and a retry never sends it twice. */
+    requestId: string;
+    /** Pi Durable's `InputEntry`, when it had one. */
+    entry?: JsonValue;
+    /** Who wrote it, when a person did. */
+    by?: string;
+    heldAt: number;
+};
+
+/** The messages a Stop kept from the queue, in their order (`Commands.abort`, `Commands.sendHeld`). */
+export const HeldDoc = defineDoc<{ items: HeldMessage[] }>({
+    kind: "pocket.held",
+    version: 1,
+    ...rebased,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    initial: () => ({ items: [] }),
+});
+
 /** Favorite working folders in shortcut order, private to each person and shared by their devices. */
 export const FolderFavoritesDoc = defineDoc<{ users: Record<string, string[]> }>({
     kind: "pocket.folder-favorites",
@@ -86,7 +124,8 @@ export const LinkedSessionPeersDoc = defineDoc<{ peers: Record<string, number> }
 
 /**
  * Messages between the linked sessions of one team since a person last wrote in any of them, kept on the team's top
- * session (`linked-sessions.ts`). Since 0.19.0 no count stops them: before, sessions stopped past 20 until a person wrote.
+ * session. Before 0.19.0 sessions stopped past 20 until a person wrote; since 0.28.0 nothing counts them, and this is
+ * no longer written. Kept so the copies older versions stored keep their definition.
  */
 export const LinkedSessionRelayDoc = defineDoc<{ sent: number }>({
     kind: "pocket.linked-session-relay",
@@ -104,7 +143,20 @@ export const LinkedSessionRelayDoc = defineDoc<{ sent: number }>({
  * 30 days, and the newest 1000, as `shell.ts` keeps its requests. (Not a document family: those cannot be pruned.)
  */
 export const LinkedSessionCallsDoc = defineDoc<{
-    items: Record<string, { conversationId?: number; by?: string; at: number }>;
+    items: Record<
+        string,
+        {
+            conversationId?: number;
+            by?: string;
+            at: number;
+            /**
+             * What a stop or an archive returned, so a repeat gives that and changes nothing again. `stopping`: the stop
+             * has not finished.
+             */
+            result?:
+                { busy: boolean; stopping?: boolean } | { archived: boolean; repeating: number };
+        }
+    >;
 }>({
     kind: "pocket.linked-session-calls",
     version: 1,
@@ -539,6 +591,10 @@ export type Schedule = {
     createdAt: number;
     /** How many times it went out: each time sends with its own request id, so a restart never sends one twice. */
     runs: number;
+    /** How many of a repeat's times sent nothing because its last message still waited in the queue (`schedules.ts`). */
+    skipped?: number;
+    /** When the newest of those was. */
+    skippedAt?: number;
     /** The durable task that sends it. */
     taskId: TaskId;
     /** Set by the same call already, when a tool call is replayed: its `taskId:callId`. */
@@ -580,7 +636,16 @@ export type BackgroundTask = {
     /** The machine's boot it started in: a task of another boot has no process left. */
     boot?: string;
     endedAt?: number;
-    /** Whether Pi gets a message when it ends. */
+    /** When Pi was told that it ended, if it was: a task told once is not told again. */
+    toldAt?: number;
+    /**
+     * Pi is still to be told that it ended. Set when it ends, so a task that ended before 0.28 (told then, with no
+     * `toldAt`) is not told again.
+     */
+    untold?: true;
+    /** The request id of the message that tells it, saved before that message is sent, until it is told. */
+    batch?: string;
+    /** Whether Pi gets a message when it ends: false for one Pi stopped itself, which needs no message. */
     notify: boolean;
     /** Whom Pi worked for when it started the command: its message goes out as their work. */
     requestedBy?: string;
@@ -729,6 +794,20 @@ export const ShellRequestsDoc = defineDoc<{ items: Record<string, number> }>({
     history: "latest",
     fork: "initial",
     initial: () => ({ items: {} }),
+});
+
+/**
+ * Why a session's last run failed, in the same short line the session list shows. A later run clears it when that run
+ * starts, so a process that starts again still knows a run that gave up. A stop is not a failure and writes nothing.
+ */
+export const RunFailureDoc = defineDoc<{ text?: string }>({
+    kind: "pocket.run-failure",
+    version: 1,
+    ...rebased,
+    scope: "conversation",
+    history: "latest",
+    fork: "initial",
+    initial: () => ({}),
 });
 
 /**
@@ -980,6 +1059,10 @@ export type DesignItem = {
     tweaks?: Record<string, { values: Record<string, string | number | boolean>; at: number }>;
     /** Versions that "Go back to this one" made, by version: the version whose content they copy. */
     restores?: Record<string, number>;
+    accepted?: Record<
+        string,
+        { by: string; byName: string; at: number; rule: string; message: string }
+    >;
 };
 
 /**

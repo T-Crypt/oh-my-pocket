@@ -55,6 +55,8 @@ export interface User {
     tunnel?: string;
     /** The most Pi may spend for this person, in dollars; never for the owner. */
     budget?: number;
+    /** When their profile picture was set (`avatars.ts`); absent means they have none. */
+    avatar?: number;
 }
 
 /** An invite not yet used, kept by its code's sha256 (the code itself is only shown to whoever made it). */
@@ -441,7 +443,9 @@ export class ConfigStore {
 
     updateUser(
         id: string,
-        patch: Partial<Pick<User, "name" | "lastSeen" | "role" | "sessions" | "tunnel" | "budget">>,
+        patch: Partial<
+            Pick<User, "name" | "lastSeen" | "role" | "sessions" | "tunnel" | "budget" | "avatar">
+        >,
     ): void {
         const user = this.userById(id);
 
@@ -470,6 +474,10 @@ export class ConfigStore {
 
         if (user.budget === undefined) {
             delete user.budget;
+        }
+
+        if (user.avatar === undefined) {
+            delete user.avatar;
         }
 
         this.save();

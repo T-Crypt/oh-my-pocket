@@ -14,6 +14,28 @@ const comments = await load("comments");
 const data = await load("data");
 const parts = await load("parts");
 
+test("on a phone the zoom that nobody chose is the width of the room, and the page scrolls; a tap goes width, whole page, 100%", () => {
+    const room = { w: 390, h: 300 };
+
+    // A phone's page (390 × 844) at the width of a 390 px room, less the margin: readable; the whole page would be 0.3.
+    assert.equal(devices.scaleOf("width", { w: 390, h: 844 }, room), 0.91);
+    assert.equal(devices.scaleOf("fit", { w: 390, h: 844 }, room), 0.31);
+    assert.equal(devices.scaleOf("width", { w: 200, h: 200 }, { w: 800, h: 600 }), 1);
+    assert.equal(devices.scaleOf("width", { w: 390, h: 844 }, { w: 0, h: 0 }), 1);
+    assert.equal(devices.zoomOf("auto", true), "width");
+    assert.equal(devices.zoomOf("auto", false), "fit");
+    assert.equal(devices.zoomOf("fit", true), "fit");
+    assert.equal(devices.zoomOf(0.5, true), 0.5);
+    assert.equal(devices.zoomWord("width"), "Width ");
+    assert.equal(devices.zoomWord("fit"), "Fit ");
+    assert.equal(devices.zoomWord(1), "");
+    assert.deepEqual(
+        [devices.nextZoom("width", true), devices.nextZoom("fit", true), devices.nextZoom(1, true)],
+        ["fit", 1, "width"],
+    );
+    assert.deepEqual([devices.nextZoom("fit", false), devices.nextZoom(1, false)], [1, "fit"]);
+});
+
 test("a frame's size is its device's, or the person's own kept between 200 and 4000", () => {
     assert.deepEqual(devices.sizeOf("mobile"), { w: 390, h: 844 });
     assert.deepEqual(devices.sizeOf("desktop"), { w: 1280, h: 800 });

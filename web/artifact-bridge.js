@@ -206,7 +206,7 @@ function checkKnob(raw) {
 }
 
 /**
- * What the frame's inspector said, as clean data the app may use, or null when it is not one of the four messages or
+ * What the frame's inspector said, as clean data the app may use, or null when it is not one of the messages or
  * has the wrong shape. A new object is built from the known fields only, whatever else the message had.
  */
 export function checkPageMessage(data) {
@@ -250,6 +250,32 @@ export function checkPageMessage(data) {
 
             return { type: data.type, knobs };
         }
+
+        case "pocket-pin": {
+            const rect = data.rect;
+            const finite = (value) =>
+                typeof value === "number" && Number.isFinite(value) && Math.abs(value) < 1e6;
+
+            if (!isText(data.label, 8)) {
+                return null;
+            }
+
+            if (isRecord(rect)) {
+                return finite(rect.x) && finite(rect.y) && finite(rect.width) && finite(rect.height)
+                    ? {
+                          type: data.type,
+                          label: data.label,
+                          rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                      }
+                    : null;
+            }
+
+            return data.tap === true ? { type: data.type, label: data.label, tap: true } : null;
+        }
+
+        case "pocket-size":
+            // 0: the page was too big to measure.
+            return isCount(data.height, 100_000) ? { type: data.type, height: data.height } : null;
 
         case "pocket-deck":
             return isCount(data.slides, LIMITS.slides) &&
@@ -323,6 +349,7 @@ export function checkAppMessage(raw) {
                     !isRecord(target) ||
                     !isText(target.selector, LIMITS.selector) ||
                     (target.pid !== undefined && !isText(target.pid, LIMITS.pid)) ||
+                    (target.reveal !== undefined && typeof target.reveal !== "boolean") ||
                     !(
                         target.label === undefined ||
                         isText(target.label, 8) ||
@@ -340,6 +367,10 @@ export function checkAppMessage(raw) {
 
                 if (target.label !== undefined) {
                     pin.label = target.label;
+                }
+
+                if (target.reveal === true) {
+                    pin.reveal = true;
                 }
 
                 targets.push(pin);

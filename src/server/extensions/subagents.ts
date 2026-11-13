@@ -13,8 +13,9 @@
  * or provider failed is reported as such, and Pi is told to stop and tell the user, never to try another model.
  */
 import type { AssistantMessage, ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { clampThinkingLevel, Type } from "@earendil-works/pi-ai";
-import type { Context } from "@earendil-works/chord";
+import { clampThinkingLevel, StringEnum } from "@earendil-works/pi-ai";
+import { arr, bool, obj, opt, str } from "@earendil-works/pi-schema";
+import type { Context } from "@earendil-works/chord/context";
 import {
     AgentDoc,
     AssistantEntry,
@@ -54,6 +55,8 @@ import { whyUnanswered } from "../subagent-runs.ts";
 
 // Exclude Agent Teams by name even while it is off; enabling it later must not give nested agents delegation.
 const AgentTeams = defineExtension({ name: "pocket-agent-teams" });
+// Nor does a subagent ask the person (`ask.ts`): it works for another agent, and nobody reads its chat.
+const Ask = defineExtension({ name: "pocket-ask" });
 
 function textOf(message: AssistantMessage | undefined): string {
     return (message?.content ?? [])
@@ -143,7 +146,11 @@ function reporterFor(Courier: CourierTask, host: Pick<PocketHost, "notice">) {
 
                         // A listener is never called inline, so the value it started on is this one's to check.
                         await strand(watch.value);
-                        watch.start(strand);
+                        watch.start(async (call) => {
+                            if (call.kind === "value") {
+                                await strand(call.value);
+                            }
+                        });
                     }
 
                     settled = await submission.wait(context);
@@ -361,8 +368,8 @@ async function leftQueue(
 
     try {
         await new Promise<void>((resolve, reject) => {
-            watch.start(async (value) => {
-                if (!queued(value)) {
+            watch.start(async (call) => {
+                if (call.kind === "value" && !queued(call.value)) {
                     resolve();
                 }
             });
@@ -857,59 +864,49 @@ export default function createSubagents(host: PocketHost) {
     const Courier = courierFor(host);
     const Reporter = reporterFor(Courier, host);
     const base = {
-        action: Type.Union([
-            Type.Literal("spawn"),
-            Type.Literal("send"),
-            Type.Literal("stop"),
-            Type.Literal("status"),
-        ]),
-        name: Type.Optional(
-            Type.String({ description: "Short kebab-case name, for example test-runner." }),
-        ),
-        message: Type.Optional(
-            Type.String({
+        action: StringEnum(["spawn", "send", "stop", "status"] as const),
+        name: opt(str({ description: "Short kebab-case name, for example test-runner." })),
+        message: opt(
+            str({
                 description: "spawn, send: the full brief.",
             }),
         ),
-        followUp: Type.Optional(Type.Boolean()),
-        wait: Type.Optional(
-            Type.Boolean({
+        followUp: opt(bool()),
+        wait: opt(
+            bool({
                 description:
                     "spawn and send: return the subagent's answer as this call's result, instead of a message later.",
             }),
         ),
-        agent: Type.Optional(
-            Type.String({
+        agent: opt(
+            str({
                 description:
                     "spawn only: an agent definition to start as (its role, model, thinking level, and tools). " +
                     "The other spawn options override it. Its model is used only where this session allows it; " +
                     "otherwise it runs on your model.",
             }),
         ),
-        thinking: Type.Optional(
-            Type.Union(
-                THINKING_LEVELS.map((level) => Type.Literal(level)),
-                {
-                    description:
-                        "spawn only: its thinking level, yours or lower (lower for mechanical work). One its model lacks becomes the nearest lower one.",
-                },
-            ),
+        thinking: opt(
+            StringEnum(THINKING_LEVELS, {
+                description:
+                    "spawn only: its thinking level, yours or lower (lower for mechanical work). One its model lacks becomes the nearest lower one.",
+            }),
         ),
-        tools: Type.Optional(
-            Type.Array(Type.String(), {
+        tools: opt(
+            arr(str(), {
                 description: "spawn only: the tool names it may use. Default: yours.",
             }),
         ),
-        fork: Type.Optional(
-            Type.Boolean({
+        fork: opt(
+            bool({
                 description:
                     "spawn only: start it as a copy of this conversation so far, on your model and tools, for a side " +
                     "task that needs what you already know: it reads nothing again, and a local server reuses the " +
                     "prompt it already has. Not with agent, model, thinking, tools, or skills.",
             }),
         ),
-        skills: Type.Optional(
-            Type.Array(Type.String(), {
+        skills: opt(
+            arr(str(), {
                 description:
                     "spawn only: skills to put in its prompt, by name (any installed skill): it reads each in full " +
                     `before it starts, after any its agent definition or stage already names. At most ${MAX_SPAWN_SKILLS}.`,
@@ -917,15 +914,18 @@ export default function createSubagents(host: PocketHost) {
         ),
     };
     // Always offered: which models a subagent may use depends on the session (`/subagents`), and the call checks.
-    const parameters = Type.Object({
-        ...base,
-        model: Type.Optional(
-            Type.String({
-                description:
-                    "spawn only: one of the models the user allows for subagents in this session, listed in your instructions, as provider/modelId. Leave it out to use your own model.",
-            }),
-        ),
-    });
+    const parameters = obj(
+        {
+            ...base,
+            model: opt(
+                str({
+                    description:
+                        "spawn only: one of the models the user allows for subagents in this session, listed in your instructions, as provider/modelId. Leave it out to use your own model.",
+                }),
+            ),
+        },
+        { open: true },
+    );
 
     const subagent = defineTool({
         name: "subagent",
@@ -1193,7 +1193,18 @@ export default function createSubagents(host: PocketHost) {
                             allowed,
                         )
                       : undefined;
-            const parentTools = action === "spawn" && toolNames !== undefined ? parent.tools : [];
+            // Tools that wait for a search (`tool-search.ts`) can be given too: the subagent is offered them. So can
+            // tools that only scripts call (codemode's Only mode): the subagent gets codemode with them.
+            const parentTools =
+                action === "spawn" && toolNames !== undefined
+                    ? [
+                          ...new Map(
+                              [...parent.tools, ...parent.deferred, ...parent.callable].map(
+                                  (tool) => [tool.name, tool],
+                              ),
+                          ).values(),
+                      ]
+                    : [];
             const tools =
                 action !== "spawn" || toolNames === undefined
                     ? undefined
@@ -1208,6 +1219,18 @@ export default function createSubagents(host: PocketHost) {
 
                           return found;
                       });
+            const codemode = parentTools.find((tool) => tool.name === "codemode");
+
+            if (
+                codemode !== undefined &&
+                tools?.some((tool) => tool.callers?.includes("model") === false) === true &&
+                !tools.includes(codemode)
+            ) {
+                tools.push(codemode);
+            }
+
+            // Every tool given that waits for a search, also one this session loaded: the subagent has no search.
+            const waiting = (tools ?? []).filter((tool) => tool.deferred === true);
             // TypeBox infers no type from a union built from a list; the schema itself checks the value.
             const asked = (args.thinking ?? stageThinking ?? definition?.thinking) as
                 ModelThinkingLevel | undefined;
@@ -1277,7 +1300,7 @@ export default function createSubagents(host: PocketHost) {
 
                     if (!fork) {
                         await configure(tx, child.id, {
-                            extensions: { remove: [SubagentTools, AgentTeams] },
+                            extensions: { remove: [SubagentTools, AgentTeams, Ask] },
                             instructions:
                                 `You are the subagent "${name}". You work for another agent, not directly for a person, although a person may open your conversation and talk to you. Answer requests completely but concisely: your final answer is what gets reported back.` +
                                 (definition === undefined || definition.instructions === ""
@@ -1287,6 +1310,9 @@ export default function createSubagents(host: PocketHost) {
                             ...(model === undefined ? {} : { model }),
                             ...(thinking === undefined ? {} : { thinkingLevel: thinking }),
                             ...(tools === undefined ? {} : { tools }),
+                            ...(waiting.length === 0
+                                ? {}
+                                : { modelTools: { remove: [], add: waiting } }),
                         });
 
                         // Only a fresh child: a fork has its parent's plan mode already (PlanDoc forks as current),

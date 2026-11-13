@@ -4,7 +4,7 @@
  * the work's usage is committed. The owner can limit a session or a person. Past a limit, new messages are refused,
  * and a run that crosses it is stopped; the model request that crossed it still counts.
  */
-import { copyJson } from "@earendil-works/chord";
+import { copyJson } from "@earendil-works/chord/json";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { type ConversationId, UsageDoc, type UsageState } from "@earendil-works/pi-durable";
@@ -223,6 +223,11 @@ export class Spend {
         }
 
         this.#stopOverLimit();
+    }
+
+    /** What one conversation spent, its subagents not counted: a subagent's own cost. */
+    conversationSpent(id: ConversationId): number {
+        return this.#costs.get(id) ?? 0;
     }
 
     /** What a session spent: itself and its subagents. */

@@ -17,7 +17,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
     AgentDoc,
@@ -36,6 +36,7 @@ import {
 import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
 import { AuthorsDoc, FollowsDoc, PipAskedDoc, SessionsDoc } from "./docs.ts";
+import { presentationOptions, presentationPip } from "./entry-presentation.ts";
 import { NOTE_ENTRY } from "./entry-format.ts";
 import { describe, HttpError } from "./errors.ts";
 import { clip, defang, quoted } from "./fence.ts";
@@ -72,10 +73,10 @@ export const PIP_EXTENSIONS = [
     "pocket-today",
 ];
 /**
- * The tools PiP goes without: Pi Durable's coding tools (it reads files, and changes nothing itself), and the artifact
- * card, which its small panel does not draw (`artifact` still opens in the viewer).
+ * The tools PiP goes without: Pi Durable's coding tools (it reads files, and changes nothing itself). Its `artifact`
+ * has no `inline` (`withoutInline`): its small panel does not draw cards, and the viewer still opens the artifact.
  */
-export const PIP_WITHOUT = ["bash", "write", "edit", "artifact_inline"];
+export const PIP_WITHOUT = ["bash", "write", "edit"];
 /** How reports from followed sessions start, so PiP knows what they are. */
 export const REPORT_HEAD = "[report] ";
 /** Sessions PiP may start in an hour, so a confused loop cannot fill the list. */
@@ -109,8 +110,7 @@ export const SESSION_OPEN = "<session-output>";
 export const SESSION_CLOSE = "</session-output>";
 /** Follows waiting at once, at most. */
 const MAX_FOLLOWS = 50;
-/** How much of a session's last answer a report and a read carry. */
-const ANSWER_CHARS = 3000;
+const ANSWER_CHARS = 12_000;
 const LINE_CHARS = 600;
 
 type FollowInput = {
@@ -150,6 +150,30 @@ export function fenced(text: string): string {
 /** A tool call's key made into a request id's: short and safe whatever the call ids look like. */
 function requestKey(key: string): string {
     return createHash("sha256").update(key).digest("base64url").slice(0, 40);
+}
+
+// The note is ours, so it goes outside the fence.
+function answerPart(
+    text: string,
+    from: number,
+    session: ConversationId,
+): { text: string; note?: string } {
+    let end = Math.min(text.length, from + ANSWER_CHARS);
+
+    // Never split a surrogate pair.
+    if (end < text.length && /[\uD800-\uDBFF]/.test(text.charAt(end - 1))) {
+        end -= 1;
+    }
+
+    const left = text.length - end;
+
+    return {
+        text: text.slice(from, end),
+        note:
+            left === 0
+                ? undefined
+                : `[… ${left} more characters: read them with session_read, session ${String(session)}, answerFrom ${end}]`,
+    };
 }
 
 function textOf(message: AssistantMessage | undefined): string {
@@ -604,7 +628,11 @@ export class Pip {
                     continue;
                 }
 
-                const shown = projectEntry(entry);
+                const shown = projectEntry(
+                    entry,
+                    false,
+                    presentationOptions(app.webs.presentations(), own, Number(entry.id)),
+                );
 
                 if (shown?.kind === "user" && own[String(shown.id)] === user.id) {
                     messages.push({ id: shown.id, text: shown.text });
@@ -863,8 +891,8 @@ export class Pip {
         };
     }
 
-    /** The newest part of a session, as text for PiP: its state, what waits there, and its last messages. */
-    async read(pipId: ConversationId, sessionId: number, entries = 40): Promise<string> {
+    async read(pipId: ConversationId, sessionId: number, entries = 40, from = 0): Promise<string> {
+        const answerFrom = Number.isFinite(from) ? Math.max(0, Math.floor(from)) : 0;
         const app = this.#app;
         const user = this.#person(pipId);
         const id = this.#session(pipId, user, sessionId);
@@ -876,30 +904,65 @@ export class Pip {
             undefined,
             context,
         );
+        const authors = (await app.harness.snapshot(AuthorsDoc, id, context))?.entries;
+        const presentations = app.webs.presentations();
         const projected = page.items
-            .map((entry) => projectEntry(entry))
+            .map((entry) =>
+                projectEntry(
+                    entry,
+                    false,
+                    presentationOptions(presentations, authors, Number(entry.id)),
+                ),
+            )
             .filter((entry): entry is ClientEntry => entry !== undefined)
             .reverse();
-        const lastAnswer = projected.findLast(
+        const last = projected.findLast(
             (entry) =>
                 entry.kind === "assistant" && entry.blocks.some((block) => block.type === "text"),
-        )?.id;
+        );
+        const lastAnswer = last?.id;
+        const answer =
+            last?.kind === "assistant"
+                ? last.blocks
+                      .flatMap((block) =>
+                          block.type === "text" && block.text.trim() !== "" ? [block.text] : [],
+                      )
+                      .join("\n")
+                      .trim()
+                : "";
+
+        if (answerFrom > answer.length) {
+            throw new Error(`The last answer has only ${answer.length} characters.`);
+        }
+
         const failed = new Set(
             projected.flatMap((entry) =>
                 entry.kind === "toolResult" && entry.isError ? [entry.callId] : [],
             ),
         );
         const lines: string[] = [];
+        const part = answerPart(answer, answerFrom, id);
+        let shown = false;
 
         for (const entry of projected) {
             if (entry.kind === "user") {
-                lines.push(`▸ ${entry.from ?? "Someone"}: ${clip(entry.text, LINE_CHARS)}`);
+                lines.push(
+                    entry.presentation === undefined
+                        ? `▸ ${entry.from ?? "Someone"}: ${clip(entry.text, LINE_CHARS)}`
+                        : clip(
+                              presentationPip(entry.presentation.label, entry.presentation.summary),
+                              LINE_CHARS,
+                          ),
+                );
             } else if (entry.kind === "assistant") {
                 for (const block of entry.blocks) {
                     if (block.type === "text" && block.text.trim() !== "") {
-                        lines.push(
-                            `Pi: ${clip(block.text, entry.id === lastAnswer ? ANSWER_CHARS : LINE_CHARS)}`,
-                        );
+                        if (entry.id !== lastAnswer) {
+                            lines.push(`Pi: ${clip(block.text, LINE_CHARS)}`);
+                        } else if (!shown) {
+                            shown = true;
+                            lines.push(`Pi: ${part.text}`);
+                        }
                     } else if (block.type === "toolCall") {
                         lines.push(
                             `  · ${callLine(block.name, block.args)}${failed.has(block.id) ? " (failed)" : ""}`,
@@ -951,13 +1014,13 @@ export class Pip {
         ];
 
         this.#looked(pipId, id);
+        const body = answerFrom > 0 ? [`Pi: ${part.text}`] : [...pending, ...lines];
         const head = [
             `#${String(sessionId)} ${quoted(meta.title ?? "New session")} · ${state}${meta.archived === true ? " · archived" : ""}`,
             `Folder: ${snippet(homePath(app.cwdOf(id)), 300)}${meta.worktree === undefined ? "" : ` (worktree, branch ${snippet(meta.worktree.branch, 120)})`}`,
             "",
-            pending.length + lines.length === 0
-                ? "(no messages yet)"
-                : fenced([...pending, ...lines].join("\n")),
+            body.length === 0 ? "(no messages yet)" : fenced(body.join("\n")),
+            ...(part.note === undefined ? [] : [part.note]),
         ];
 
         return head.join("\n");
@@ -1084,7 +1147,11 @@ export class Pip {
         folders.add(app.defaultCwd);
 
         for (const folder of [clone, ...[...folders].slice(0, 200)]) {
-            if (existsSync(folder) && sameRepo(await this.#origin(folder), info.repo)) {
+            if (
+                app.workspaceScheme(folder) === undefined &&
+                existsSync(folder) &&
+                sameRepo(await this.#origin(folder), info.repo)
+            ) {
                 return (
                     await git(folder, ["rev-parse", "--show-toplevel"]).catch(() => folder)
                 ).trim();
@@ -1261,8 +1328,12 @@ export class Pip {
         return busy;
     }
 
-    /** Archive a session, or bring it back. */
-    async archive(pipId: ConversationId, sessionId: number, archived: boolean): Promise<void> {
+    /** Archive a session, or bring it back. Gives how many repeating schedules keep running in it. */
+    async archive(
+        pipId: ConversationId,
+        sessionId: number,
+        archived: boolean,
+    ): Promise<{ repeating: number }> {
         const user = this.#person(pipId);
         const id = this.#session(pipId, user, sessionId);
 
@@ -1271,7 +1342,7 @@ export class Pip {
             this.#requireLooked(pipId, sessionId, "archive");
         }
 
-        await this.#app.commands.updateSession(id, this.#through(user), { archived });
+        return this.#app.commands.updateSession(id, this.#through(user), { archived });
     }
 
     /** The calls waiting for approval in the sessions PiP's person can see. */
@@ -1511,6 +1582,14 @@ export class Pip {
     /** A session's last words, for PiP: how its run ended, and Pi's last answer, fenced. */
     async #lastWords(id: ConversationId, title: string, state: string): Promise<string> {
         const name = `${quoted(title, 80)} (/s/${String(id)})`;
+        // A run that failed with no answer of its own (its compaction failed) left the answer before it as the last:
+        // the failure is what came of the run, not that answer.
+        const failure = this.#app.runFailure(id);
+
+        if (failure !== undefined) {
+            return `${name} stopped with an error: ${snippet(failure, 300)}`;
+        }
+
         const page = await (await this.#app.conversation(id)).entries({}, 16, undefined, context);
         const last = page.items
             .map((entry) => projectEntry(entry))
@@ -1532,7 +1611,9 @@ export class Pip {
             .flatMap((block) => (block.type === "text" ? [block.text] : []))
             .join("\n");
 
-        return `${name} ${state}. Pi's last answer:\n${fenced(clip(text, ANSWER_CHARS))}`;
+        const part = answerPart(text.trim(), 0, id);
+
+        return `${name} ${state}. Pi's last answer:\n${fenced(part.text)}${part.note === undefined ? "" : `\n${part.note}`}`;
     }
 
     /**
@@ -1615,7 +1696,11 @@ export class Pip {
                 };
 
                 await strand(watch.value);
-                watch.start(strand);
+                watch.start(async (call) => {
+                    if (call.kind === "value") {
+                        await strand(call.value);
+                    }
+                });
             }
 
             settled = await submission.wait(context);
@@ -1648,7 +1733,9 @@ export class Pip {
             return undefined;
         }, context);
 
-        return `${name} answered your message:\n${fenced(clip(text, ANSWER_CHARS) || "(no text)")}`;
+        const part = answerPart(text.trim(), 0, input.sessionId);
+
+        return `${name} answered your message:\n${fenced(part.text || "(no text)")}${part.note === undefined ? "" : `\n${part.note}`}`;
     }
 
     /** Mark this follow as reported in PiP's list, where it stays a while so a replayed call does not follow again. */

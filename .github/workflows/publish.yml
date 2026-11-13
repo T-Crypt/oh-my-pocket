@@ -10,7 +10,7 @@ on:
     workflow_dispatch:
         inputs:
             tag:
-                description: "Release tag to publish, such as v0.26.1"
+                description: "Release tag to publish, such as v0.26.1 or v0.27.0-beta.1"
                 required: true
 
 permissions:
@@ -34,8 +34,9 @@ jobs:
                   node-version: 24
                   registry-url: https://registry.npmjs.org
 
+            # npm 11.5.1 and later publish with trusted publishing; npm 12 leaves npm-shrinkwrap.json out of the package.
             - name: Use an npm that supports trusted publishing
-              run: npm install -g npm@latest
+              run: npm install -g npm@11
 
             - name: Check the tag matches package.json
               env:
@@ -65,8 +66,26 @@ jobs:
               run: npm run check && npm run lint
 
             # The full suite (with its browser tests) runs before a release is merged, not here.
+            # A pre-release version (0.27.0-beta.1) goes to the beta dist-tag, so latest and its
+            # installs and updates stay on the stable release.
             - name: Publish
               if: steps.exists.outputs.skip != 'true'
               run: |
                   cp package-lock.json npm-shrinkwrap.json
-                  npm publish --ignore-scripts --access public
+                  npm pack --dry-run --json --ignore-scripts | node -e '
+                      let text = "";
+                      process.stdin.on("data", (chunk) => (text += chunk)).on("end", () => {
+                          const packed = Object.values(JSON.parse(text))[0];
+
+                          if (!packed?.files?.some((file) => file.path === "npm-shrinkwrap.json")) {
+                              console.error("The package has no npm-shrinkwrap.json: installs would not get the tested dependency versions.");
+                              process.exit(1);
+                          }
+                      });
+                  '
+                  case "$VERSION" in
+                      *-*) dist_tag=beta ;;
+                      *) dist_tag=latest ;;
+                  esac
+                  echo "Publishing pi-pocket@$VERSION with the dist-tag $dist_tag"
+                  npm publish --ignore-scripts --access public --tag "$dist_tag" --loglevel verbose

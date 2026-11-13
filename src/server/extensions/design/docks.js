@@ -1,5 +1,6 @@
 // The side panel of the workspace: versions, comments, text edits, and tweaks. On a wide panel it sits beside the canvas,
 // on a narrow one under it.
+import { createCheck } from "./check.js";
 import { openOf, pinNumber } from "./comments.js";
 import { nameOf } from "./edits.js";
 import { commentsMessage, editsMessage, tweaksMessage } from "./messages.js";
@@ -33,6 +34,8 @@ export function createDocks(env) {
             </button>
         </header>`;
     }
+
+    const { CheckDock } = createCheck(env, DockHead);
 
     // ─── Versions ────────────────────────────────────────────────────────────
 
@@ -619,11 +622,104 @@ export function createDocks(env) {
         comments: "Comments",
         edits: "Text edits",
         tweaks: "Tweaks",
+        check: "Check",
     };
+
+    /** Sheet height on a phone, in percent of the room under the bars: shut (a bar), middle, high. */
+    const SHEET_SNAPS = [8, 54, 88];
+    const SHEET_WORDS = ["shut", "middle", "high"];
+
+    function SheetHandle({ s }) {
+        const handle = useRef(null);
+        const drag = useRef(null);
+        const index = Math.min(SHEET_SNAPS.length - 1, Math.max(0, s.checkSheet));
+
+        const settle = (to) => {
+            const next = Math.min(SHEET_SNAPS.length - 1, Math.max(0, to));
+            const dock = handle.current?.closest(".dsn-dock");
+
+            if (next === 0) {
+                dock?.style.removeProperty("--sheet");
+            } else {
+                dock?.style.setProperty("--sheet", `${SHEET_SNAPS[next]}%`);
+            }
+
+            store.set({ checkSheet: next });
+        };
+
+        return html`<div
+            ref=${handle}
+            class="dsy-sheet-handle"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Height of the findings. Drag, or press the arrow keys."
+            aria-valuemin="0"
+            aria-valuemax=${SHEET_SNAPS.length - 1}
+            aria-valuenow=${index}
+            aria-valuetext=${SHEET_WORDS[index]}
+            tabindex="0"
+            onPointerDown=${(event) => {
+                const dock = handle.current.closest(".dsn-dock");
+
+                try {
+                    handle.current.setPointerCapture(event.pointerId);
+                } catch {
+                    // A pointer that is gone (or made up): the drag still follows the moves that reach the handle.
+                }
+
+                drag.current = {
+                    dock,
+                    room: dock.parentElement.getBoundingClientRect(),
+                    share: null,
+                };
+            }}
+            onPointerMove=${(event) => {
+                const now = drag.current;
+
+                if (now) {
+                    now.share = Math.min(
+                        0.94,
+                        Math.max(0.08, (now.room.bottom - event.clientY) / now.room.height),
+                    );
+                    now.dock.style.setProperty("--sheet", `${now.share * 100}%`);
+                }
+            }}
+            onPointerUp=${() => {
+                const now = drag.current;
+
+                drag.current = null;
+
+                if (now === null) {
+                    return;
+                }
+
+                if (now.share === null) {
+                    settle((index + 1) % SHEET_SNAPS.length);
+                } else {
+                    const near = SHEET_SNAPS.map((snap) => Math.abs(snap / 100 - now.share));
+
+                    settle(near.indexOf(Math.min(...near)));
+                }
+            }}
+            onKeyDown=${(event) => {
+                if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+                    event.preventDefault();
+                    settle(index + (event.key === "ArrowUp" ? 1 : -1));
+                } else if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    settle((index + 1) % SHEET_SNAPS.length);
+                }
+            }}
+        >
+            <span></span>
+        </div>`;
+    }
 
     /** The dock for `s.dock`, or nothing. */
     function Dock({ s, design, shown, canEdit, me }) {
         const props = { s, design, shown, canEdit, me };
+        const sheet = s.dock === "check" && env.sizeClass(s) === "narrow";
+        const shut = sheet && s.checkSheet === 0;
         const body =
             s.dock === "versions"
                 ? html`<${VersionsDock} ...${props} />`
@@ -633,12 +729,21 @@ export function createDocks(env) {
                     ? html`<${EditsDock} ...${props} />`
                     : s.dock === "tweaks"
                       ? html`<${TweaksDock} ...${props} />`
-                      : null;
+                      : s.dock === "check"
+                        ? html`<${CheckDock} ...${props} shut=${shut} />`
+                        : null;
 
         return (
             body &&
-            html`<aside class="dsn-dock" data-dock=${s.dock} aria-label=${DOCKS[s.dock]}>
-                ${body}
+            html`<aside
+                class="dsn-dock"
+                data-dock=${s.dock}
+                data-sheet=${sheet}
+                data-shut=${shut}
+                aria-label=${DOCKS[s.dock]}
+                style=${sheet && !shut ? `--sheet:${SHEET_SNAPS[Math.min(2, Math.max(0, s.checkSheet))]}%` : undefined}
+            >
+                ${sheet && !shut && html`<${SheetHandle} s=${s} />`} ${body}
             </aside>`
         );
     }

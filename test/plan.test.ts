@@ -13,6 +13,7 @@ import {
     scriptedModel,
     until,
     work,
+    offerSubagents,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -223,6 +224,7 @@ before(async () => {
     mkdirSync(dropIns, { recursive: true });
     writeFileSync(join(dropIns, "peek.ts"), peek);
     app = await openApp(scriptedModel(route));
+    offerSubagents(app);
     await app.setExtensionEnabled(owner(app), "peek.ts", true);
 });
 

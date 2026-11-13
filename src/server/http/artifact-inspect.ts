@@ -306,12 +306,197 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
         }
     };
 
+    // A pin's badge goes where no text or picture of the page lies under it.
+    const REPLACED = /^(IMG|SVG|VIDEO|CANVAS|INPUT|SELECT|TEXTAREA|BUTTON|IFRAME|PICTURE)$/i;
+
+    const covered = (x, y, w, h) => {
+        const points = [[x + 2, y + 2], [x + w - 2, y + 2], [x + 2, y + h - 2], [x + w - 2, y + h - 2], [x + w / 2, y + h / 2]];
+
+        for (const [px, py] of points) {
+            if (px < 0 || py < 0 || px >= win.innerWidth || py >= win.innerHeight) {
+                continue;
+            }
+
+            for (const el of doc.elementsFromPoint(px, py)) {
+                if (el === doc.documentElement || (overlay && el === overlay.host)) {
+                    continue;
+                }
+
+                if (REPLACED.test(el.tagName)) {
+                    return true;
+                }
+
+                for (const node of el.childNodes) {
+                    if (node.nodeType === 3 && node.textContent.trim() !== "") {
+                        const range = doc.createRange();
+
+                        range.selectNodeContents(node);
+
+                        for (const box of range.getClientRects()) {
+                            if (box.right > x && box.left < x + w && box.bottom > y && box.top < y + h) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    };
+
+    const BADGE_H = 22;
+
+    const placesOf = (rect, w) => [
+        [rect.left, rect.top - BADGE_H - 3],
+        [rect.left - w - 3, rect.top],
+        [rect.right + 3, rect.top],
+        [rect.right - w, rect.top - BADGE_H - 3],
+        [rect.left, rect.bottom + 3],
+        [rect.right - w - 2, rect.top + 2],
+    ];
+
+    const onScreen = ([x, y], w) => x >= 0 && y >= 0 && x + w <= win.innerWidth && y + BADGE_H <= win.innerHeight;
+
+    // Each place costs a hit test: work it out when a pin first shows or its layout changes, not every frame.
+    const findPlace = (rect, w) => {
+        const places = placesOf(rect, w);
+        let first = -1;
+
+        for (let at = 0; at < places.length; at += 1) {
+            if (onScreen(places[at], w)) {
+                first = first === -1 ? at : first;
+
+                if (!covered(places[at][0], places[at][1], w, BADGE_H)) {
+                    return at;
+                }
+            }
+        }
+
+        return first === -1 ? 0 : first;
+    };
+
+    // A throttled stamp of what may have changed the layout; a pin compares it with its own.
+    let layoutStamp = 0;
+    let layoutDirty = false;
+    let stampedAt = 0;
+    let layoutWatch = null;
+    // How long one frame may spend finding places: the rest wait for the next frame (a pin is hidden until it has one).
+    const PLACE_BUDGET = 3;
+
+    const watchLayout = () => {
+        if (layoutWatch !== null || typeof win.ResizeObserver !== "function") {
+            return;
+        }
+
+        const dirty = () => {
+            layoutDirty = true;
+        };
+
+        layoutWatch = [new win.ResizeObserver(() => {
+            layoutStamp += 1;
+        }), typeof win.MutationObserver === "function" ? new win.MutationObserver(dirty) : null];
+        layoutWatch[0].observe(doc.documentElement);
+        layoutWatch[1]?.observe(doc.documentElement, { subtree: true, childList: true, characterData: true, attributes: true });
+    };
+
+    const unwatchLayout = () => {
+        if (layoutWatch !== null) {
+            layoutWatch[0].disconnect();
+            layoutWatch[1]?.disconnect();
+            layoutWatch = null;
+        }
+    };
+
+    // All the reads first, then all the writes, so the layout is worked out once, not once for each pin.
+    const updatePins = () => {
+        const started = now();
+        const sx = win.scrollX;
+        const sy = win.scrollY;
+        const vw = win.innerWidth;
+        const vh = win.innerHeight;
+
+        // After a mutation of the page, re-place at most once a second.
+        if (layoutDirty && started - stampedAt > 1000) {
+            layoutDirty = false;
+            stampedAt = started;
+            layoutStamp += 1;
+        }
+
+        const drawn = [];
+
+        for (const pin of pins) {
+            if (!pin.el || !pin.el.isConnected) {
+                pin.el = findPinTarget(pin.target);
+                pin.stamp = -1;
+            }
+
+            const rect = pin.el ? pin.el.getBoundingClientRect() : null;
+            const real = rect !== null && (rect.width > 0 || rect.height > 0);
+            const near = real && rect.bottom > -40 && rect.top < vh + 40 && rect.right > -40 && rect.left < vw + 40;
+            let at = null;
+
+            if (near) {
+                const key = rect.left + sx + "," + (rect.top + sy) + "," + rect.width + "," + rect.height;
+                const known =
+                    pin.place !== undefined &&
+                    pin.key === key &&
+                    pin.stamp === layoutStamp &&
+                    (pin.fallback === true || onScreen(placesOf(rect, pin.w)[pin.place], pin.w));
+
+                // A pin with a place moves at once; one without waits when the frame's time is spent.
+                if (!known && (pin.place !== undefined || now() - started < PLACE_BUDGET)) {
+                    pin.place = findPlace(rect, pin.w);
+                    pin.key = key;
+                    pin.stamp = layoutStamp;
+                    pin.fallback = !onScreen(placesOf(rect, pin.w)[pin.place], pin.w);
+                }
+
+                if (pin.place !== undefined) {
+                    at = placesOf(rect, pin.w)[pin.place];
+                }
+            }
+
+            drawn.push([pin, near ? rect : null, at]);
+        }
+
+        for (const [pin, rect, at] of drawn) {
+            const mine = pin.drawn;
+            const shown = rect !== null && at !== null;
+            const move = shown
+                ? "translate(" + Math.round(Math.min(Math.max(at[0], 2), vw - pin.w - 2)) + "px," + Math.round(Math.min(Math.max(at[1], 2), vh - BADGE_H - 2)) + "px)"
+                : "";
+            const box = shown
+                ? "translate(" + Math.round(rect.left) + "px," + Math.round(rect.top) + "px)"
+                : "";
+            const size = shown ? Math.round(rect.width) + "x" + Math.round(rect.height) : "";
+
+            if (mine.node !== move) {
+                css(pin.node, shown ? { display: "flex", transform: move } : { display: "none" });
+                mine.node = move;
+            }
+
+            if (pin.outline && (mine.box !== box || mine.size !== size)) {
+                css(
+                    pin.outline,
+                    shown
+                        ? { display: "block", transform: box, width: Math.round(rect.width) + "px", height: Math.round(rect.height) + "px" }
+                        : { display: "none" },
+                );
+                mine.box = box;
+                mine.size = size;
+            }
+        }
+    };
+
     const update = () => {
         if (!hoverEl && !pickedEl && pins.length === 0) {
             if (overlay) {
                 overlay.host.remove();
                 overlay = null;
             }
+
+            unwatchLayout();
 
             return false;
         }
@@ -321,30 +506,7 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
         place(shown.hover, hoverEl && hoverEl !== pickedEl ? hoverEl : null, true);
         place(shown.picked, pickedEl, true);
 
-        for (const pin of pins) {
-            if (!pin.el || !pin.el.isConnected) {
-                pin.el = findPinTarget(pin.target);
-            }
-
-            const rect = pin.el ? pin.el.getBoundingClientRect() : null;
-            const visible = rect !== null && (rect.width > 0 || rect.height > 0);
-
-            css(pin.node, {
-                display: visible ? "flex" : "none",
-                left: visible ? Math.min(Math.max(rect.left - 9, 2), win.innerWidth - 24) + "px" : "0",
-                top: visible ? Math.min(Math.max(rect.top - 9, 2), win.innerHeight - 24) + "px" : "0",
-            });
-
-            if (pin.outline) {
-                css(pin.outline, {
-                    display: visible ? "block" : "none",
-                    left: visible ? rect.left + "px" : "0",
-                    top: visible ? rect.top + "px" : "0",
-                    width: visible ? rect.width + "px" : "0",
-                    height: visible ? rect.height + "px" : "0",
-                });
-            }
-        }
+        updatePins();
 
         return true;
     };
@@ -376,6 +538,7 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
 
     const highlight = (targets) => {
         pins = [];
+        unwatchLayout();
 
         if (overlay) {
             overlay.layer.replaceChildren();
@@ -394,6 +557,8 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
                 const text = typeof target.label === "string" || typeof target.label === "number" ? clip(target.label, 8) : String(index + 1);
                 const outline = css(doc.createElement("div"), {
                     position: "absolute",
+                    left: "0",
+                    top: "0",
                     display: "none",
                     "box-sizing": "border-box",
                     border: "1px solid " + ACCENT,
@@ -402,6 +567,8 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
                 });
                 const node = css(doc.createElement("div"), {
                     position: "absolute",
+                    left: "0",
+                    top: "0",
                     display: "none",
                     "align-items": "center",
                     "justify-content": "center",
@@ -414,12 +581,44 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
                     color: "#1a1b26",
                     font: "700 12px/1 system-ui, sans-serif",
                     "box-shadow": "0 1px 4px rgba(0,0,0,.45)",
+                    "pointer-events": "auto",
+                    cursor: "pointer",
+                });
+
+                node.addEventListener("click", (event) => {
+                    event.stopPropagation();
+                    send({ type: "pocket-pin", label: text, tap: true });
                 });
 
                 node.textContent = text;
                 shown.layer.append(outline, node);
-                pins.push({ target: { selector: clip(target.selector, 500), pid: typeof target.pid === "string" ? clip(target.pid, 200) : "" }, el: null, node, outline });
+
+                const pin = { selector: clip(target.selector, 500), pid: typeof target.pid === "string" ? clip(target.pid, 200) : "" };
+
+                // w: the badge's width (words and padding), to find a place before it is drawn.
+                pins.push({ target: pin, el: null, node, outline, w: Math.max(22, 12 + 8 * text.length), drawn: {} });
+
+                if (target.reveal === true) {
+                    const el = findPinTarget(pin);
+
+                    css(outline, { border: "2px solid " + ACCENT, opacity: "1" });
+                    css(node, { "box-shadow": "0 0 0 2px #fff, 0 1px 6px rgba(0,0,0,.6)", "z-index": "1" });
+
+                    if (el && typeof el.scrollIntoView === "function") {
+                        el.scrollIntoView({ block: "center", inline: "nearest" });
+
+                        // The canvas can be bigger than its room: tell the app where the pin is.
+                        const at = el.getBoundingClientRect();
+
+                        send({
+                            type: "pocket-pin",
+                            label: text,
+                            rect: { x: at.left, y: at.top, width: at.width, height: at.height },
+                        });
+                    }
+                }
             });
+            watchLayout();
         }
 
         paint();
@@ -872,6 +1071,10 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
     const deckSheet = () => {
         const { width, height } = deck.size;
         const scale = Math.min(win.innerWidth / width, win.innerHeight / height) || 1;
+
+        // A frame not laid out at the start gets no resize event for its first size: the watch below compares with this.
+        deck.fit = [win.innerWidth, win.innerHeight];
+
         return (
             "html,body{margin:0!important;padding:0!important;width:100%!important;height:100%!important;overflow:hidden!important}" +
             (deck.bare ? "html{background:#000}" : "") +
@@ -1013,6 +1216,8 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
             return;
         }
 
+        deck.watch?.disconnect();
+
         for (const slide of deck.slides) {
             slide.removeAttribute("data-pocket-current");
             unshow(slide);
@@ -1067,6 +1272,8 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
                 view: null,
                 display: shown || "block",
                 shownInline: new Map(),
+                fit: [0, 0],
+                watch: null,
             };
 
             // A phone lays a page with no viewport out at 980 pixels wide: a deck needs the real width to fit it.
@@ -1088,6 +1295,16 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
 
             deckEvents.add("keydown", onDeckKey);
             deckEvents.add("resize", paintDeck);
+
+            // A window sized after the deck started fires no resize: the root is as big as the window, so watch it.
+            if (typeof win.ResizeObserver === "function") {
+                deck.watch = new win.ResizeObserver(() => {
+                    if (deck && (deck.fit[0] !== win.innerWidth || deck.fit[1] !== win.innerHeight)) {
+                        paintDeck();
+                    }
+                });
+                deck.watch.observe(doc.documentElement);
+            }
         } else {
             deck.slides = slides;
             deck.index = Math.min(deck.index, slides.length - 1);
@@ -1125,6 +1342,83 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
         if (watcher === null) {
             watcher = new MutationObserver(watch);
             watcher.observe(doc.documentElement, { childList: true, subtree: true, characterData: true });
+        }
+    };
+
+    // The height of the page's content, so that a Check can shorten a frame with more room than its page.
+
+    const SIZE_SCAN = 1500;
+    let sizeWatch = null;
+    let sizeTimer = null;
+    let sizeSent = -1;
+
+    /** Null when the page is too big to scan: the frame then keeps its room. */
+    const contentBottom = () => {
+        const body = doc.body;
+
+        if (!body) {
+            return null;
+        }
+
+        const all = body.querySelectorAll("*");
+
+        if (all.length > SIZE_SCAN) {
+            return null;
+        }
+
+        const scrolled = win.scrollY || 0;
+        let bottom = Math.max(doc.documentElement.getBoundingClientRect().bottom, body.getBoundingClientRect().bottom) + scrolled;
+
+        for (const el of all) {
+            if (el.localName !== "pocket-overlay") {
+                bottom = Math.max(bottom, el.getBoundingClientRect().bottom + scrolled);
+            }
+        }
+
+        return bottom;
+    };
+
+    const reportSize = () => {
+        sizeTimer = null;
+
+        const bottom = contentBottom();
+        const height = bottom === null ? 0 : Math.ceil(bottom);
+
+        if (Math.abs(height - sizeSent) >= 2) {
+            sizeSent = height;
+            send({ type: "pocket-size", height });
+        }
+    };
+
+    const sizeLater = () => {
+        if (sizeTimer === null) {
+            sizeTimer = later(reportSize, 150);
+        }
+    };
+
+    const watchSize = () => {
+        sizeSent = -1;
+        sizeLater();
+
+        if (sizeWatch === null && typeof win.ResizeObserver === "function") {
+            sizeWatch = new win.ResizeObserver(sizeLater);
+            sizeWatch.observe(doc.documentElement);
+
+            if (doc.body) {
+                sizeWatch.observe(doc.body);
+            }
+        }
+    };
+
+    const unwatchSize = () => {
+        if (sizeTimer !== null) {
+            unlater(sizeTimer);
+            sizeTimer = null;
+        }
+
+        if (sizeWatch !== null) {
+            sizeWatch.disconnect();
+            sizeWatch = null;
         }
     };
 
@@ -1176,6 +1470,12 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
 
         syncDeck();
         start();
+
+        if (!standalone) {
+            watchSize();
+            addListener("load", sizeLater, { once: true });
+        }
+
         ready = true;
 
         for (const data of backlog.splice(0)) {
@@ -1241,6 +1541,8 @@ export const ARTIFACT_INSPECT = String.raw`(send, standalone) => {
             hoverEl = null;
             pickedEl = null;
             pins = [];
+            unwatchLayout();
+            unwatchSize();
             inspectOn = false;
             editOn = false;
             ready = false;

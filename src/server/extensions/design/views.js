@@ -1,7 +1,7 @@
 // What can fill the canvas besides the live page: two versions side by side, a group's variations as a grid, the slide
 // strip of a deck, and the full-screen present mode.
 import { useArtifactBridge } from "/artifact-bridge.js";
-import { scaleOf } from "./devices.js";
+import { scaleOf, zoomOf } from "./devices.js";
 import { ALLOW, frameUrl, SANDBOX } from "./canvas.js";
 
 export function createViews(env, canvas) {
@@ -71,7 +71,7 @@ export function createViews(env, canvas) {
         const pane = stacked
             ? { w: room.w, h: Math.max(0, room.h / 2 - 40) }
             : { w: room.w / 2, h: Math.max(0, room.h - 40) };
-        const scale = scaleOf(s.zoom, size, pane);
+        const scale = scaleOf(zoomOf(s.zoom, false), size, pane);
 
         return html`<div class=${`dsn-compare ${stacked ? "stacked" : ""}`} ref=${probe}>
             <${ComparePane}

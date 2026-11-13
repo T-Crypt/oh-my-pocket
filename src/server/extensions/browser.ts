@@ -11,11 +11,12 @@
  * its address comes back when it opens again, but not what was typed or clicked on it.
  */
 import { awaitWithContext } from "@earendil-works/chord/context";
-import { type ImageContent, type TextContent, Type } from "@earendil-works/pi-ai";
+import { type ImageContent, StringEnum, type TextContent } from "@earendil-works/pi-ai";
+import { bool, num, obj, opt, str } from "@earendil-works/pi-schema";
 import { AgentDoc, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
 import { BrowserUseDoc } from "../docs.ts";
 import type { BrowserPage, LogEntry, Target } from "../browser/page.ts";
-import { displayUrl, hostOf, normalizeUrl } from "../browser/urls.ts";
+import { displayUrl, hostOf, normalizeUrl, REMOTE_FILES } from "../browser/urls.ts";
 import {
     FOCUS_SCRIPT,
     POLICY_SETTINGS,
@@ -26,6 +27,7 @@ import {
 } from "../browser/policy.ts";
 import { presetOf, viewportFrom } from "../browser/viewport.ts";
 import type { ExtensionWeb, PocketHost } from "../host.ts";
+import { workspaceScheme } from "../paths.ts";
 
 const ACTIONS = [
     "navigate",
@@ -66,11 +68,9 @@ const MAX_LINE = 300;
 /** The console action reads this many of the newest lines. */
 const CONSOLE_LINES = 80;
 
-const GUIDE = `You have a browser tool: a real Chromium on this machine. The people in this conversation see the same page live in the app's Browser panel and can click and type in it too, so it is how you show and test web work: local dev servers (http://localhost:5173), HTML files on this machine (give their path), or any site.
-- Start a dev server in the background with bash first, for example \`nohup npm run dev > /tmp/dev.log 2>&1 &\`, then navigate to it.
-- snapshot lists the page's text and its controls with refs like [e12]; click, type, select, and hover take a ref (or a CSS selector, or the visible label). Refs last until the next snapshot.
-- screenshot shows you how the page looks: use it to check layout and styling. viewport switches between mobile, tablet, and desktop sizes.
-- After a change, check console for errors. evaluate runs JavaScript in the page.
+const GUIDE = `The browser tool is a real Chromium on this machine. The people in this conversation see its page live in the Browser panel and can use it too: show and test web work there (local dev servers, HTML files on this machine, any site).
+- Start a dev server in the background with bash first (\`nohup npm run dev > /tmp/dev.log 2>&1 &\`), then navigate to it.
+- snapshot gives refs like [e12] for click, type, select, and hover, valid until the next snapshot. screenshot shows the layout; viewport changes the size. After a change, check console for errors.
 - Failed loads to other sites (analytics, trackers) are usually blocked on purpose: ignore them unless the page itself breaks.`;
 
 function clip(text: string, max = MAX_TEXT): string {
@@ -135,100 +135,98 @@ export default function createBrowser(host: PocketHost, web: ExtensionWeb) {
         deferred: true,
         description:
             "Use a real web browser (Chromium on this machine) that the people in this conversation watch live. Open pages (local dev servers, files, sites), read them as a snapshot with element refs, click, type, take screenshots you can see, read console errors, and run JavaScript in the page.",
-        parameters: Type.Object({
-            action: Type.Union(
-                ACTIONS.map((action) => Type.Literal(action)),
-                {
+        parameters: obj(
+            {
+                action: StringEnum(ACTIONS, {
                     description:
                         "navigate (url), snapshot, screenshot, click/hover (ref, selector, label, or x and y), type (text into ref/selector/label, or the focused element), press (key), select (value in a select element), scroll (to ref/selector/label, or by dy), wait (text, selector, or timeoutMs), evaluate (script), console, back, forward, reload, viewport.",
-                },
-            ),
-            url: Type.Optional(
-                Type.String({
-                    description:
-                        "navigate: an http(s) URL, host:port such as localhost:5173, or a path to an HTML file on this machine.",
                 }),
-            ),
-            ref: Type.Optional(
-                Type.String({ description: "An element ref from the last snapshot, such as e12." }),
-            ),
-            selector: Type.Optional(
-                Type.String({
-                    description: "Instead of ref: a CSS selector. wait: wait until it is visible.",
-                }),
-            ),
-            label: Type.Optional(
-                Type.String({
-                    description:
-                        "Instead of ref: the element's visible text or label, such as a button's text.",
-                }),
-            ),
-            x: Type.Optional(
-                Type.Number({
-                    description:
-                        "click, hover: a point in CSS pixels of the viewport, as seen in a screenshot (one shown smaller says how to scale its points).",
-                }),
-            ),
-            y: Type.Optional(Type.Number()),
-            text: Type.Optional(
-                Type.String({
-                    description:
-                        "type: the text to type (empty clears the field). wait: text to wait for.",
-                }),
-            ),
-            submit: Type.Optional(Type.Boolean({ description: "type: press Enter afterwards." })),
-            append: Type.Optional(
-                Type.Boolean({
-                    description: "type: add to what the field holds instead of replacing it.",
-                }),
-            ),
-            key: Type.Optional(
-                Type.String({
-                    description:
-                        "press: a key or combination, such as Enter, Escape, Tab, ArrowDown, Control+A.",
-                }),
-            ),
-            value: Type.Optional(
-                Type.String({ description: "select: the option's value or text." }),
-            ),
-            dy: Type.Optional(
-                Type.Number({
-                    description:
-                        "scroll: pixels down (negative: up). Default: most of a screen down.",
-                }),
-            ),
-            script: Type.Optional(
-                Type.String({
-                    description:
-                        "evaluate: JavaScript run in the page: an expression or statements (top-level await works), or a body that ends with return. Its value comes back as JSON.",
-                }),
-            ),
-            viewport: Type.Optional(
-                Type.String({
-                    description:
-                        "viewport: mobile (390×844), tablet (820×1180), desktop (1280×800), or WIDTHxHEIGHT.",
-                }),
-            ),
-            fullPage: Type.Optional(
-                Type.Boolean({
-                    description: "screenshot: the whole page, not only what fits the viewport.",
-                }),
-            ),
-            timeoutMs: Type.Optional(
-                Type.Number({
-                    description:
-                        "navigate, wait: how long to wait in milliseconds (default 30000 for navigate, 10000 for wait).",
-                }),
-            ),
-            snapshot: Type.Optional(
-                Type.Boolean({
-                    description: "After an action that changes the page: also return its snapshot.",
-                }),
-            ),
-            clear: Type.Optional(
-                Type.Boolean({ description: "console: clear the lines after reading them." }),
-            ),
-        }),
+                url: opt(
+                    str({
+                        description:
+                            "navigate: an http(s) URL, host:port such as localhost:5173, or a path to an HTML file on this machine.",
+                    }),
+                ),
+                ref: opt(
+                    str({ description: "An element ref from the last snapshot, such as e12." }),
+                ),
+                selector: opt(
+                    str({
+                        description:
+                            "Instead of ref: a CSS selector. wait: wait until it is visible.",
+                    }),
+                ),
+                label: opt(
+                    str({
+                        description:
+                            "Instead of ref: the element's visible text or label, such as a button's text.",
+                    }),
+                ),
+                x: opt(
+                    num({
+                        description:
+                            "click, hover: a point in CSS pixels of the viewport, as seen in a screenshot (one shown smaller says how to scale its points).",
+                    }),
+                ),
+                y: opt(num()),
+                text: opt(
+                    str({
+                        description:
+                            "type: the text to type (empty clears the field). wait: text to wait for.",
+                    }),
+                ),
+                submit: opt(bool({ description: "type: press Enter afterwards." })),
+                append: opt(
+                    bool({
+                        description: "type: add to what the field holds instead of replacing it.",
+                    }),
+                ),
+                key: opt(
+                    str({
+                        description:
+                            "press: a key or combination, such as Enter, Escape, Tab, ArrowDown, Control+A.",
+                    }),
+                ),
+                value: opt(str({ description: "select: the option's value or text." })),
+                dy: opt(
+                    num({
+                        description:
+                            "scroll: pixels down (negative: up). Default: most of a screen down.",
+                    }),
+                ),
+                script: opt(
+                    str({
+                        description:
+                            "evaluate: JavaScript run in the page: an expression or statements (top-level await works), or a body that ends with return. Its value comes back as JSON.",
+                    }),
+                ),
+                viewport: opt(
+                    str({
+                        description:
+                            "viewport: mobile (390×844), tablet (820×1180), desktop (1280×800), or WIDTHxHEIGHT.",
+                    }),
+                ),
+                fullPage: opt(
+                    bool({
+                        description: "screenshot: the whole page, not only what fits the viewport.",
+                    }),
+                ),
+                timeoutMs: opt(
+                    num({
+                        description:
+                            "navigate, wait: how long to wait in milliseconds (default 30000 for navigate, 10000 for wait).",
+                    }),
+                ),
+                snapshot: opt(
+                    bool({
+                        description:
+                            "After an action that changes the page: also return its snapshot.",
+                    }),
+                ),
+                clear: opt(bool({ description: "console: clear the lines after reading them." })),
+            },
+            { open: true },
+        ),
         // Pages are shared and stateful: a round's calls run in order.
         executionMode: "sequential",
         execute: async (args, api, context) => {
@@ -347,6 +345,10 @@ export default function createBrowser(host: PocketHost, web: ExtensionWeb) {
                         throw new Error(
                             `"${args.url}" is not an address the browser opens: give an http(s) URL, host:port, or a file path.`,
                         );
+                    }
+
+                    if (url.startsWith("file:") && workspaceScheme(cwd) !== undefined) {
+                        throw new Error(REMOTE_FILES);
                     }
 
                     await allowSite(url);
@@ -689,8 +691,14 @@ export default function createBrowser(host: PocketHost, web: ExtensionWeb) {
         name: "pocket-browser",
         tools: [browser],
         sections: [
-            section("browser", (input) =>
-                input.agent.tools.some((tool) => tool.name === "browser") ? GUIDE : undefined,
+            // Offered, or for scripts alone (codemode's Only mode).
+            section("browser", ({ agent }) =>
+                agent.tools.some((tool) => tool.name === "browser") ||
+                agent.callable.some(
+                    (tool) => tool.name === "browser" && tool.callers?.includes("model") === false,
+                )
+                    ? GUIDE
+                    : undefined,
             ),
         ],
     });

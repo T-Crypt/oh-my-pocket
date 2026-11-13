@@ -5,6 +5,7 @@
 // Kept per browser, in localStorage, like pins and marks. To share it between someone's devices, the server would keep
 // each person's marks (a per-user document beside `SessionsDoc`), `markSeen` would send them, and the session list
 // would carry them back; `finishedUnseen` would not change.
+import { onPageVisibility, pageVisible } from "./host.js";
 import { serverClockOffset, store } from "./store.js";
 
 /** Each session's seen mark is a key of its own, so tabs that mark different sessions at once keep both. */
@@ -13,7 +14,7 @@ const SEEN_PREFIX = "pocket.peekSeen.";
 const SEEN_KEEP_MS = 30 * 24 * 60 * 60_000;
 const SINCE_KEY = "pocket.peekSince";
 
-const hidden = () => document.visibilityState === "hidden";
+const hidden = () => !pageVisible();
 
 /** The server's time now: runs end by the server's clock, which each hello gives (`serverClockOffset`). */
 const serverNow = () => Date.now() + serverClockOffset();
@@ -79,6 +80,38 @@ export function markSeen(...ids) {
     }
 }
 
+export function seenSnapshot(ids) {
+    return Object.fromEntries(ids.map((id) => [id, store.state.peekSeen?.[id] ?? 0]));
+}
+
+/** With `expected`, only looks still as the marking left them go back: a session looked at since stays seen. */
+export function restoreSeen(snapshot, expected) {
+    const peekSeen = { ...store.state.peekSeen };
+    const back = new Set();
+
+    for (const [id, at] of Object.entries(snapshot)) {
+        const now = Number(localStorage.getItem(SEEN_PREFIX + id)) || 0;
+
+        if (expected !== undefined && now !== (expected[id] ?? 0)) {
+            continue;
+        }
+
+        back.add(Number(id));
+
+        if (at > 0) {
+            localStorage.setItem(SEEN_PREFIX + id, String(at));
+            peekSeen[id] = at;
+        } else {
+            localStorage.removeItem(SEEN_PREFIX + id);
+            delete peekSeen[id];
+        }
+    }
+
+    store.set({ peekSeen });
+
+    return back;
+}
+
 /**
  * A session whose run ended since this browser last had it open. A run older than the marks are kept counts as seen:
  * its mark may be gone, with the server up all that time.
@@ -134,4 +167,4 @@ store.subscribe((state) => {
     seeOpen(store.state);
 });
 
-document.addEventListener("visibilitychange", () => seeOpen(store.state));
+onPageVisibility(() => seeOpen(store.state));

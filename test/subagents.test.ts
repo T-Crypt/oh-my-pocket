@@ -14,6 +14,7 @@ import {
     root,
     scriptedModel,
     until,
+    offerSubagents,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { join } from "node:path";
@@ -21,7 +22,7 @@ import { after, before, beforeEach, test } from "node:test";
 import { isDeepStrictEqual } from "node:util";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { type ConversationId, InboxDoc, type TaskId } from "@earendil-works/pi-durable";
+import { type ConversationId, InboxDoc } from "@earendil-works/pi-durable";
 import { dealtWith } from "../src/server/commands.ts";
 import { SubagentsDoc } from "../src/server/docs.ts";
 
@@ -113,6 +114,7 @@ let app: App;
 
 before(async () => {
     app = await openApp(scriptedModel(route), join(root, "subagents-data"));
+    offerSubagents(app);
 });
 
 // What the scripted model does starts plain in every test, however the one before ended.
@@ -301,57 +303,11 @@ test("a courier that is gone does not strand reports: the next report starts ano
     }, "both reports");
 });
 
-test("a report a reporter from before 0.12 sent itself, before a restart cut it off, is not sent again", async () => {
-    slow = { early: 2 };
-    const id = await orchestrate({ spawn: ["early"], rounds: 0, sleep: 0 });
-    let reporter: TaskId | undefined;
-
-    await until(async () => {
-        const graph = await app.harness.taskGraph(context);
-
-        try {
-            reporter = Object.values(graph.value.tasks).find(
-                (node) => node.kind === "pocket.subagent-reporter" && node.conversationId === id,
-            )?.id;
-        } finally {
-            graph.dispose();
-        }
-
-        return reporter !== undefined;
-    }, "the reporter");
-    // As 0.11's reporter sent it, under its own request, before it ended: the new one must see it went already.
-    await (await app.harness.conversation(id, context))!.submit(
-        {
-            type: "input",
-            content: "[subagent early answered, no reply needed] result of early",
-            whenBusy: "followUp",
-            requestId: `subagent-report:${reporter}`,
-        },
-        context,
-    );
-    await until(
-        async () => {
-            const graph = await app.harness.taskGraph(context);
-
-            try {
-                return graph.value.tasks[reporter!] === undefined && !app.isBusy(id);
-            } finally {
-                graph.dispose();
-            }
-        },
-        "the reporter, done",
-        15_000,
-    );
-    // Long enough for a courier's gather and send, had the report gone to the outbox too.
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    assert.deepEqual(await delivered(id), { early: 1 });
-    assert.equal(await queued(id), 0);
-    slow = {};
-});
-
 test("reports waiting in the parent's queue across a restart arrive once", async () => {
     const data = join(root, "subagents-restart");
     let first: App | undefined = await openApp(scriptedModel(route), data);
+
+    offerSubagents(first);
     const id = await orchestrate({ spawn: names(3, "r"), rounds: 1, sleep: 3 }, first);
 
     try {
@@ -362,6 +318,7 @@ test("reports waiting in the parent's queue across a restart arrive once", async
         // app steps aside meanwhile: one app per data folder in the process.
         await app.close();
         app = await openApp(scriptedModel(route), data);
+        offerSubagents(app);
         await until(
             async () => Object.keys(await delivered(id)).length === 3 && !app.isBusy(id),
             "the reports after the restart",
@@ -373,6 +330,7 @@ test("reports waiting in the parent's queue across a restart arrive once", async
         // Closed already if the test failed after it stepped aside.
         await app.close().catch(() => {});
         app = await openApp(scriptedModel(route), join(root, "subagents-data"));
+        offerSubagents(app);
     }
 });
 
@@ -502,7 +460,7 @@ test("a subagent whose run fails while a follow-up waits reports it, instead of 
         assert.equal(await queued(child), 0);
 
         await until(async () => {
-            const graph = await app.harness.taskGraph(context);
+            const graph = await app.harness.watchTaskGraph(context);
 
             try {
                 return !Object.values(graph.value.tasks).some(
@@ -510,7 +468,7 @@ test("a subagent whose run fails while a follow-up waits reports it, instead of 
                         node.kind === "pocket.subagent-reporter" && node.conversationId === id,
                 );
             } finally {
-                graph.dispose();
+                await graph.stop();
             }
         }, "no reporter left waiting");
     } finally {
@@ -644,4 +602,26 @@ test("reports taken out of the queue by something other than a person go again, 
         15_000,
     );
     assert.deepEqual(await delivered(id), { "again-a": 1, "again-b": 1 });
+});
+
+test("a subagent's conversation shows what it cost itself, not its session's spend or limit", async () => {
+    slow = { thrifty: 3 };
+    const id = await orchestrate({ spawn: ["thrifty"], rounds: 0, sleep: 0 });
+
+    await until(
+        async () =>
+            (await app.harness.snapshot(SubagentsDoc, id, context))?.agents.thrifty !== undefined,
+        "the subagent",
+    );
+    const child = (await app.harness.snapshot(SubagentsDoc, id, context))!.agents.thrifty!
+        .conversationId;
+
+    await recordCost(app, id, 2);
+    await recordCost(app, child, 0.5);
+    await app.spend.setSessionBudget(owner(app), id, 10);
+    await until(() => app.spend.conversationSpent(child) === 0.5, "the subagent's cost");
+
+    assert.deepEqual(app.conversationInfo(await app.room(child)).spend, { spent: 0.5 });
+    assert.equal(app.conversationInfo(await app.room(id)).spend.budget, 10);
+    slow = {};
 });

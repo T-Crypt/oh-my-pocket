@@ -63,6 +63,14 @@ export default function createUpdates(host: PocketHost, web: ExtensionWeb) {
             type: "boolean",
             default: false,
         },
+        {
+            name: "beta",
+            label: "Beta updates",
+            description:
+                "Also offer beta versions (such as 0.27.0-beta.1) before the stable release. A beta can be less tested. Off keeps stable releases only; a beta then still gets the next stable release.",
+            type: "boolean",
+            default: false,
+        },
     ]);
 
     /** Errors as they are, to the owner: they say what stands in the way, and name nothing secret. */
@@ -152,6 +160,24 @@ export default function createUpdates(host: PocketHost, web: ExtensionWeb) {
 
         void updates.check().then(autoInstall, () => {});
     };
+
+    const channel = () => {
+        if (
+            typeof updates.setBeta !== "function" ||
+            updates.beta === (web.setting("beta") === true)
+        ) {
+            return;
+        }
+
+        updates.setBeta(web.setting("beta") === true);
+        look();
+    };
+
+    if (typeof updates.setBeta === "function") {
+        updates.setBeta(web.setting("beta") === true);
+    }
+
+    web.onDispose(web.onSettings(channel));
 
     // Waiting for quiet sessions needs no new look at GitHub: the last one is enough.
     const wait = () => {

@@ -16,14 +16,104 @@ export const VIEWPORTS = {
 } as const;
 
 export type ViewportName = keyof typeof VIEWPORTS;
+export type TweakValues = Record<string, string | number | boolean>;
+export type DesignAction = { type: "hover" | "click" | "focus"; selector: string };
 export type DesignViewport = { width: number; height: number };
 const LIMIT_MS = 90_000;
+const QUEUE_MS = 300_000;
+const QUEUE_LENGTH = 16;
 // Keep the /a/ page policy and add a separate, stricter render-only policy. CSP policies intersect.
 const ARTIFACT_CSP =
     "sandbox allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-pointer-lock allow-downloads; frame-ancestors 'self'";
 const RENDER_CSP =
     "sandbox allow-scripts allow-modals; frame-src 'none'; worker-src 'none'; object-src 'none'; connect-src http: https:;";
-let active = 0;
+
+export class Slots {
+    readonly #limit: number;
+    readonly #queue: number;
+    readonly #waitMs: number;
+    readonly #waiting: (() => void)[] = [];
+    #active = 0;
+
+    constructor(limit: number, queue: number, waitMs = QUEUE_MS) {
+        this.#limit = limit;
+        this.#queue = queue;
+        this.#waitMs = waitMs;
+    }
+
+    get active(): number {
+        return this.#active;
+    }
+
+    get waiting(): number {
+        return this.#waiting.length;
+    }
+
+    async acquire(signal?: AbortSignal): Promise<() => void> {
+        signal?.throwIfAborted();
+
+        if (this.#active < this.#limit && this.#waiting.length === 0) {
+            this.#active++;
+
+            return this.#releaser();
+        }
+
+        if (this.#waiting.length >= this.#queue) {
+            throw new Error(
+                `${this.#queue} design renders are already waiting. Try again in a minute.`,
+            );
+        }
+
+        await new Promise<void>((resolve, reject) => {
+            const leave = () => {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+                const index = this.#waiting.indexOf(grant);
+
+                if (index !== -1) {
+                    this.#waiting.splice(index, 1);
+                }
+            };
+
+            const grant = () => {
+                leave();
+                this.#active++;
+                resolve();
+            };
+
+            const onAbort = () => {
+                leave();
+                reject(signal?.reason ?? new Error("The design render stopped."));
+            };
+
+            const timer = setTimeout(() => {
+                leave();
+                reject(new Error("Waited too long for a free design render."));
+            }, this.#waitMs);
+
+            this.#waiting.push(grant);
+            signal?.addEventListener("abort", onAbort, { once: true });
+        });
+
+        return this.#releaser();
+    }
+
+    #releaser(): () => void {
+        let done = false;
+
+        return () => {
+            if (done) {
+                return;
+            }
+
+            done = true;
+            this.#active--;
+            this.#waiting.shift()?.();
+        };
+    }
+}
+
+const renders = new Slots(2, QUEUE_LENGTH);
 
 /** The default slide size of a deck, as the canvas lays slides out. */
 export const SLIDE_SIZE: DesignViewport = { width: 1920, height: 1080 };
@@ -44,6 +134,70 @@ export function parseSlideSize(value: string): DesignViewport {
     }
 
     return { width, height };
+}
+
+export function tweakValues(value: unknown): TweakValues {
+    if (value === undefined || value === null) {
+        return {};
+    }
+
+    if (typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Tweaks must be an object of names and values.");
+    }
+
+    const entries = Object.entries(value);
+
+    if (entries.length > 40) {
+        throw new Error("Tweaks can set up to 40 values.");
+    }
+
+    const out: TweakValues = {};
+
+    for (const [name, item] of entries) {
+        if (name.length === 0 || name.length > 80) {
+            throw new Error("A tweak name is 1 to 80 characters.");
+        }
+
+        if (
+            !(typeof item === "boolean" || (typeof item === "number" && Number.isFinite(item))) &&
+            !(typeof item === "string" && item.length <= 200)
+        ) {
+            throw new Error(
+                `Tweak ${name} needs a string (up to 200 characters), number, or boolean.`,
+            );
+        }
+
+        out[name] = item;
+    }
+
+    return out;
+}
+
+export function designActions(value: unknown): DesignAction[] {
+    if (value === undefined || value === null) {
+        return [];
+    }
+
+    if (!Array.isArray(value) || value.length > 10) {
+        throw new Error("Actions must be a list of up to 10 steps.");
+    }
+
+    return value.map((item, index) => {
+        const { type, selector } = (item ?? {}) as { type?: unknown; selector?: unknown };
+
+        if (
+            (type !== "hover" && type !== "click" && type !== "focus") ||
+            typeof selector !== "string" ||
+            selector.length === 0 ||
+            selector.length > 300
+        ) {
+            throw new Error(
+                `Action ${index + 1} needs a type (hover, click, or focus) and a selector of up to 300 characters.`,
+            );
+        }
+
+        return { type, selector };
+    });
 }
 
 export function viewportOf(value: string | DesignViewport = "desktop"): DesignViewport {
@@ -306,14 +460,41 @@ export class DesignPage {
         return result.result?.value;
     }
 
-    async load(viewport: DesignViewport): Promise<void> {
-        this.#slideDisplays = undefined;
-        await this.send("Emulation.setDeviceMetricsOverride", {
-            ...viewport,
-            deviceScaleFactor: 1,
-            mobile: viewport.width < 500,
+    // An isolated world: the script sees the page's DOM and styles but none of the page's own scripts, so a page cannot change the objects that the script uses.
+    async evaluateIsolated(expression: string): Promise<Json> {
+        const tree = await this.send("Page.getFrameTree");
+        const world = await this.send("Page.createIsolatedWorld", {
+            frameId: tree.frameTree.frame.id,
+            worldName: "pocket-check",
         });
-        const result = await this.send("Page.navigate", { url: this.#url });
+        const result = await this.send("Runtime.evaluate", {
+            expression,
+            contextId: world.executionContextId,
+            returnByValue: true,
+            awaitPromise: true,
+            timeout: 10_000,
+        });
+
+        if (result.exceptionDetails !== undefined) {
+            throw new Error(
+                String(result.exceptionDetails.exception?.description ?? "Check script failed."),
+            );
+        }
+
+        return result.result?.value;
+    }
+
+    async load(
+        viewport: DesignViewport,
+        options: { scale?: number; page?: string } = {},
+    ): Promise<void> {
+        this.#slideDisplays = undefined;
+        await this.setScale(viewport, options.scale ?? 1);
+        const url =
+            options.page === undefined
+                ? this.#url
+                : this.#url + options.page.split("/").map(encodeURIComponent).join("/");
+        const result = await this.send("Page.navigate", { url });
 
         if (result.errorText) {
             throw new Error(String(result.errorText));
@@ -328,10 +509,125 @@ export class DesignPage {
             await new Promise((resolve) => setTimeout(resolve, 100));
         }
 
-        await this.evaluate(`Promise.race([
+        await this.settle();
+    }
+
+    async setScale(viewport: DesignViewport, scale = 1): Promise<void> {
+        await this.send("Emulation.setDeviceMetricsOverride", {
+            ...viewport,
+            deviceScaleFactor: scale,
+            mobile: viewport.width < 500,
+        });
+    }
+
+    async settle(): Promise<void> {
+        await this.evaluateIsolated(`Promise.race([
             Promise.all([document.fonts.ready, ...Array.from(document.images, image => image.decode().catch(() => {}))]),
             new Promise(resolve => setTimeout(resolve, 3000))
         ]).then(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))`);
+    }
+
+    async applyView(
+        view: {
+            colorScheme?: "light" | "dark";
+            theme?: string;
+            forceTheme?: boolean;
+            tweaks?: TweakValues;
+        } = {},
+    ): Promise<void> {
+        if (view.colorScheme !== undefined) {
+            await this.send("Emulation.setEmulatedMedia", {
+                features: [{ name: "prefers-color-scheme", value: view.colorScheme }],
+            });
+        }
+
+        if (view.theme !== undefined && /^[a-z0-9][a-z0-9-]{0,63}$/.test(view.theme)) {
+            await this.evaluate(
+                view.forceTheme === true
+                    ? `document.documentElement.setAttribute('data-theme', ${JSON.stringify(view.theme)})`
+                    : `document.documentElement.hasAttribute('data-theme') || document.documentElement.setAttribute('data-theme', ${JSON.stringify(view.theme)})`,
+            );
+        }
+
+        const tweaks = view.tweaks ?? {};
+
+        if (Object.keys(tweaks).length > 0) {
+            await this.evaluate(`((values) => {
+                let manifest = [];
+                try { manifest = JSON.parse(document.getElementById('pocket-tweaks')?.textContent ?? '[]'); } catch {}
+                const units = Object.create(null);
+                for (const knob of Array.isArray(manifest) ? manifest.slice(0, 40) : []) {
+                    if (knob && typeof knob.name === 'string' && typeof knob.unit === 'string') units[knob.name] = knob.unit;
+                }
+                for (const [name, value] of Object.entries(values)) {
+                    if (/^--[A-Za-z0-9_-]{1,78}$/.test(name)) {
+                        const style = document.documentElement.style;
+                        if (typeof value === 'number') style.setProperty(name, value + (units[name] ?? ''));
+                        else style.setProperty(name, typeof value === 'boolean' ? (value ? '1' : '0') : value);
+                    }
+                    window.dispatchEvent(new CustomEvent('pocket:tweak', { detail: { name, value } }));
+                }
+            })(${JSON.stringify(tweaks)})`);
+        }
+
+        await this.settle();
+    }
+
+    async act(actions: DesignAction[]): Promise<string[]> {
+        const notes: string[] = [];
+
+        for (const [index, action] of actions.entries()) {
+            const label = `action ${index + 1} (${action.type} ${action.selector.slice(0, 60)})`;
+            let box: { x: number; y: number } | null | undefined;
+
+            try {
+                box = (await this.evaluate(`(() => {
+                    const el = document.querySelector(${JSON.stringify(action.selector)});
+                    if (el === null) return null;
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                    if (${JSON.stringify(action.type)} === 'focus') {
+                        el.focus({ preventScroll: true, focusVisible: true });
+                        return { x: 0, y: 0 };
+                    }
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) return undefined;
+                    return {
+                        x: Math.min(Math.max(rect.left + rect.width / 2, 1), innerWidth - 1),
+                        y: Math.min(Math.max(rect.top + rect.height / 2, 1), innerHeight - 1),
+                    };
+                })()`)) as typeof box;
+            } catch (error) {
+                notes.push(`${label}: ${error instanceof Error ? error.message : String(error)}`);
+
+                continue;
+            }
+
+            if (box === null) {
+                notes.push(`${label}: no element matches.`);
+            } else if (box === undefined) {
+                notes.push(`${label}: the element has no size on screen.`);
+            } else if (action.type !== "focus") {
+                const point = { x: box.x, y: box.y, button: "none", pointerType: "mouse" };
+
+                await this.send("Input.dispatchMouseEvent", { ...point, type: "mouseMoved" });
+
+                if (action.type === "click") {
+                    const press = { ...point, button: "left", clickCount: 1 };
+
+                    await this.send("Input.dispatchMouseEvent", { ...press, type: "mousePressed" });
+                    await this.send("Input.dispatchMouseEvent", {
+                        ...press,
+                        type: "mouseReleased",
+                    });
+                }
+            }
+
+            // Let a transition run out before the next step or the screenshot.
+            await new Promise((resolve) => setTimeout(resolve, 350));
+            await this.settle();
+        }
+
+        return notes;
     }
 
     async init(): Promise<void> {
@@ -353,6 +649,8 @@ export class DesignPage {
             this.send("Network.enable"),
             this.send("Fetch.enable", { patterns: [{ urlPattern: "*" }] }),
             this.send("Browser.setDownloadBehavior", { behavior: "deny" }),
+            // No scrollbar takes a strip of the width, so a page is as wide as its viewport.
+            this.send("Emulation.setScrollbarsHidden", { hidden: true }),
         ]);
     }
 
@@ -394,8 +692,10 @@ export class DesignPage {
         return parseSlideSize(typeof value === "string" ? value : "");
     }
 
-    async pdf(): Promise<string> {
-        if (await this.isDeck()) {
+    async pdf(viewport?: DesignViewport): Promise<string> {
+        const deck = await this.isDeck();
+
+        if (deck) {
             await this.slides();
             const displays = await this.#displays();
             const { width, height } = await this.slideSize();
@@ -415,7 +715,19 @@ export class DesignPage {
             })()`);
         }
 
+        const paper =
+            viewport === undefined || deck
+                ? {}
+                : {
+                      paperWidth: viewport.width / 96,
+                      paperHeight: viewport.height / 96,
+                      marginTop: 0,
+                      marginBottom: 0,
+                      marginLeft: 0,
+                      marginRight: 0,
+                  };
         const result = await this.send("Page.printToPDF", {
+            ...paper,
             printBackground: true,
             preferCSSPageSize: true,
             transferMode: "ReturnAsBase64",
@@ -427,7 +739,19 @@ export class DesignPage {
     async slides(): Promise<string[]> {
         const result = await this.evaluate(`(() => {
             if (document.querySelector('meta[name="pocket-kind"]')?.content !== 'deck') return null;
-            return Array.from(document.querySelectorAll('section.slide'), slide => (slide.textContent ?? '').slice(0, 20000));
+            // The words a person reads: not the text of style, script, template, or noscript elements.
+            const skip = new Set(['STYLE', 'SCRIPT', 'TEMPLATE', 'NOSCRIPT', 'TITLE']);
+            const textOf = (node, out) => {
+                if (out.length > 20000) return;
+                if (node.nodeType === 3) { out.push(node.nodeValue ?? ''); return; }
+                if (node.nodeType !== 1 || skip.has(node.nodeName.toUpperCase())) return;
+                for (const child of node.childNodes) textOf(child, out);
+            };
+            return Array.from(document.querySelectorAll('section.slide'), slide => {
+                const out = [];
+                textOf(slide, out);
+                return out.join('').slice(0, 20000);
+            });
         })()`);
 
         if (!Array.isArray(result) || result.length === 0 || result.length > 100) {
@@ -517,17 +841,14 @@ export async function withRender<T>(
     signal: AbortSignal | undefined,
     run: (page: DesignPage) => Promise<T>,
 ): Promise<T> {
-    if (active >= 2) {
-        throw new Error("2 design renders are already running. Try again when one finishes.");
-    }
-
     const executable = findBrowser();
 
     if (executable === undefined) {
         throw new Error("Install Chromium or set PI_POCKET_BROWSER to render designs.");
     }
 
-    active++;
+    // The time limit starts when the render does, not while it waits.
+    const release = await renders.acquire(signal);
     const controller = new AbortController();
     const abort = () => controller.abort(new Error("The design render stopped."));
     const timer = setTimeout(abort, LIMIT_MS);
@@ -547,6 +868,7 @@ export async function withRender<T>(
         server = await serveBundle(bundle);
         browser = await Chromium.launch(executable, profile, [
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            ...(process.env.PI_POCKET_BROWSER_ARGS?.split(/\s+/).filter(Boolean) ?? []),
         ]);
         controller.signal.throwIfAborted();
         const context = await browser.connection.send("Target.createBrowserContext");
@@ -587,7 +909,7 @@ export async function withRender<T>(
                 await rm(folder, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
             }
         } finally {
-            active--;
+            release();
         }
     }
 }

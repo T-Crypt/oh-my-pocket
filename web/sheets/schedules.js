@@ -8,6 +8,9 @@ export function SchedulesSheet() {
     const { view, users, me } = store.state;
     const [when, setWhen] = useState("");
     const steer = canSteer();
+    const archived = store.state.sessions.some(
+        (session) => session.id === store.state.conversationId && session.archived,
+    );
     const setBy = (id) =>
         id === undefined
             ? "Pi"
@@ -51,8 +54,14 @@ export function SchedulesSheet() {
                         <div class="grow">
                             <div>${schedule.text}</div>
                             <div class="muted small">
-                                ${schedule.repeat ? `${schedule.repeat} · next ${formatWhen(schedule.next)}` : formatWhen(schedule.next)} · set by ${setBy(schedule.by)}
+                                ${schedule.repeat ? `${schedule.repeat} · next ${formatWhen(schedule.next)}` : formatWhen(schedule.next)} · set by ${setBy(schedule.by)}${archived ? " · session archived" : ""}
                             </div>
+                            ${
+                                schedule.skipped > 0 &&
+                                html`<div class="muted small" data-part="schedule-skipped">
+                                    Skipped ${schedule.skipped === 1 ? "once" : `${schedule.skipped} times`}, last ${formatWhen(schedule.skippedAt)}: its last message still waits in the queue
+                                </div>`
+                            }
                         </div>
                         ${
                             steer &&

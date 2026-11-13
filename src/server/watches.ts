@@ -10,7 +10,7 @@
  * or closed, when there is more to tell than it may send, after two weeks with nothing new, after an hour of failed
  * looks, or when someone stops it. The triggers extension (`extensions/triggers.ts`) installs the task and Pi's tool.
  */
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
     type ConversationId,
@@ -326,6 +326,14 @@ export class Watches {
 
         if (meta === undefined || meta.pip !== undefined) {
             throw new HttpError(400, "Only sessions can watch a pull request.");
+        }
+
+        // gh finds the PR through the session's folder: a workspace URI is not a folder here.
+        if (app.workspaceScheme(app.cwdOf(asking)) !== undefined) {
+            throw new HttpError(
+                400,
+                "Pull request watches are not available for remote workspaces.",
+            );
         }
 
         const person = app.config.userById(personId ?? meta.createdBy ?? "");

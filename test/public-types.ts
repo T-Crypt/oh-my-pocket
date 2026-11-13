@@ -11,6 +11,8 @@ import type {
     ExtensionModule,
     ExtensionWeb,
     LinkedSession as RealLinkedSession,
+    LinkedSessionsApi as RealLinkedSessions,
+    SessionsApi as RealSessions,
     PocketHost,
     AppEvents as RealAppEvents,
     SettingField as RealSettingField,
@@ -37,6 +39,8 @@ import type {
     HumanLinkedSessions,
     Host,
     LinkedSession,
+    LinkedSessions,
+    Sessions,
     Module,
     AppEvents,
     SettingField,
@@ -81,7 +85,8 @@ type Internal =
     | "pruner"
     | "readOnlyCalls"
     | "reloadModule"
-    | "hosts";
+    | "hosts"
+    | "toolNames";
 
 type PublicHost = Pick<PocketHost, keyof Host>;
 
@@ -147,6 +152,10 @@ export const settingField = (real: RealSettingField): SettingField => real;
 export const settingFieldBack = (types: SettingField): RealSettingField => types;
 export const linked = (real: RealLinkedSession): LinkedSession => real;
 export const linkedBack = (types: LinkedSession): RealLinkedSession => types;
+export const links = (real: RealLinkedSessions): LinkedSessions => real;
+export const linksBack = (types: LinkedSessions): RealLinkedSessions => types;
+export const sessions = (real: RealSessions): Sessions => real;
+export const sessionsBack = (types: Sessions): RealSessions => types;
 
 /** A module written against the public types is one the loader takes. */
 export const module = (types: Module): ExtensionModule => types;

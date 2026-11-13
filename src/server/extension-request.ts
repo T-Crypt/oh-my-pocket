@@ -1,5 +1,5 @@
 /** Request-lifetime document access and conversation authorization for extension routes. */
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
 import type { AgentState, ConversationId, DocumentReader, Tx } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
@@ -36,6 +36,21 @@ export class ExtensionRequest implements RequestActor {
 
     get signal(): AbortSignal {
         return this.#stopped.signal;
+    }
+
+    async createSession(request: { cwd: string; title?: string }): Promise<{ id: number }> {
+        if (this.#access !== "owner" || this.current().role !== "owner") {
+            throw new HttpError(403, "Only the owner can start an app-wide session here.");
+        }
+
+        if (typeof request?.cwd !== "string" || request.cwd.trim() === "") {
+            throw new HttpError(400, "A workspace URI or folder path is required.");
+        }
+
+        return this.#app.commands.createSession(this.current(), {
+            cwd: request.cwd,
+            ...(request.title === undefined ? {} : { title: request.title }),
+        });
     }
 
     close = (): void => {

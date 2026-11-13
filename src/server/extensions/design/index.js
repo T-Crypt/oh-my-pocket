@@ -2,21 +2,12 @@
 // places, the launcher, and the artifact viewer's "Open in Design" button open it), and keeps the workspace's state in one
 // store made here, so going back to the chat on a phone and coming again leaves the canvas as it was.
 //
-// Unlike most modules it imports two of the app's own files, `/store.js` (the session's artifacts, who the person is) and
-// `/artifact-bridge.js` (the artifact frame's bridge, which the viewer uses too): it is built in, and both are served
-// by the same server as this file.
-import { openSheet, store as app } from "/store.js";
-import { createData, designsOf } from "./data.js";
-import { clampSize } from "./devices.js";
-import { variationMessage } from "./messages.js";
-import { createParts, PATHS } from "./parts.js";
+// This file loads at startup for everyone, so it stays small (`test/design-system-ui.test.ts` holds the budget): the
+// workspace (`app.js`) loads when the panel first opens, and its docks and views (`workspace.js`) when first needed.
+import { DESIGN_PATH } from "./paths.js";
 import { createStore, initialState, loadPick, savePrefs, sessionState } from "./state.js";
-import { createWorkspace } from "./workspace.js";
 
 export const pocketApi = 1;
-
-/** The most the message box takes (`insertText`). */
-const BOX_LIMIT = 90_000;
 
 export default function setup(pocket) {
     if (typeof pocket.panel !== "function") {
@@ -24,190 +15,123 @@ export default function setup(pocket) {
         return undefined;
     }
 
-    const store = createStore(initialState());
-    const data = createData(pocket, store);
-    const parts = createParts(pocket);
-    const canEdit = () => app.state.me?.role !== undefined && app.state.me.role !== "viewer";
-    /** The mode goes off, so an editor's comments or edits dock goes too, or its tab stays lit. */
-    const modeless = () =>
-        canEdit() && ["comments", "edits"].includes(store.get().dock) ? { dock: null } : {};
+    const store = createStore({
+        ...initialState(),
+        appDark: document.documentElement.dataset.mode !== "light",
+    });
 
-    const env = {
-        pocket,
-        store,
-        data,
-        parts,
-        app,
-        /** The page's frame, for the parts that talk to it (the slide strip): `{ send, goto, supported }`, or null. */
-        frame: { current: null },
-        canEdit,
-        darkTheme: () => document.documentElement.dataset.mode !== "light",
-        sizeClass: (state) => {
-            const width = state.width || 1000;
+    const watchTheme = new MutationObserver(() => {
+        const appDark = document.documentElement.dataset.mode !== "light";
 
-            return width < 560 ? "narrow" : width < 900 ? "medium" : "wide";
-        },
-        beside: () => matchMedia("(min-width: 1100px)").matches,
-        designs: () => designsOf(app.state.view, store.get().listed),
-        current: () => env.designs().find((each) => each.id === store.get().artifact) ?? null,
-        /** The design a person means by a name: its id, else the start of an id, else words of its title. */
-        find(designs, query) {
-            const words = String(query ?? "")
-                .trim()
-                .toLowerCase();
+        if (store.get().appDark !== appDark) {
+            store.set({ appDark });
+        }
+    });
 
-            if (words === "") {
-                return designs[0];
-            }
+    watchTheme.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-mode"],
+    });
 
-            return (
-                designs.find((each) => each.id === words) ??
-                designs.find((each) => each.id.startsWith(words)) ??
-                designs.find((each) => each.title.toLowerCase().includes(words))
+    const styled = new Map();
+
+    const style = (name) => {
+        if (!styled.has(name)) {
+            const before = new Set(document.head.querySelectorAll("style[data-extension]"));
+
+            pocket.style(name);
+
+            const sheet = [...document.head.querySelectorAll("style[data-extension]")].find(
+                (each) => !before.has(each),
             );
-        },
 
-        /** Put a message in the message box for the person to read and send. On a phone the chat comes back to show it. */
-        sendToBox(text) {
-            if (text.length > BOX_LIMIT) {
-                pocket.notify(
-                    "error",
-                    "That is too much for one message. Mark some comments done, and send the rest.",
-                );
+            styled.set(
+                name,
+                new Promise((resolve) => {
+                    const until = performance.now() + 2500;
 
-                return;
-            }
+                    const look = () => {
+                        // The `@import` of the sheet has its rules once its file is in.
+                        const imported = sheet?.sheet?.cssRules?.[0]?.styleSheet;
 
-            pocket.insertText(text);
-            pocket.notify("info", "In your message box: read it, then send it.");
+                        if (!sheet || imported || performance.now() > until) {
+                            resolve();
+                        } else {
+                            requestAnimationFrame(look);
+                        }
+                    };
 
-            if (!env.beside()) {
-                pocket.closePanel();
-            }
-        },
-
-        open(id, version = null) {
-            const same = store.get().artifact === id;
-
-            // The page's own knobs and slides go when its frame does (`CanvasView`): the same design's frame stays.
-            store.set({
-                artifact: id,
-                version,
-                view: "canvas",
-                compare: null,
-                mode: "view",
-                ...modeless(),
-                draft: null,
-                present: false,
-                ...(same ? {} : { slide: 0 }),
-            });
-        },
-        showVersion(version) {
-            store.set({ version, view: "canvas", draft: null });
-        },
-        compare(a, b) {
-            const design = env.current();
-            const latest = design?.versions.at(-1)?.version ?? 1;
-
-            store.set({
-                view: "compare",
-                compare: { a: a ?? Math.max(1, latest - 1), b: b ?? latest },
-                mode: "view",
-                ...modeless(),
-                draft: null,
-            });
-        },
-        setView(view) {
-            // Variations fill the room: the side panel goes.
-            store.set({
-                view,
-                mode: view === "canvas" ? store.get().mode : "view",
-                draft: null,
-                ...(view === "grid" ? { dock: null } : {}),
-            });
-        },
-        setDock(dock) {
-            store.set(dock === null ? { dock: null, mode: "view", draft: null } : { dock });
-        },
-        setTab(tab) {
-            const s = store.get();
-            const edit = canEdit();
-            const tabs = {
-                view: { mode: "view", dock: null },
-                comment: { mode: edit ? "comment" : "view", dock: "comments" },
-                edit: { mode: "edit", dock: "edits" },
-                tweaks: { mode: "view", dock: "tweaks" },
-                versions: { mode: "view", dock: "versions" },
-            };
-            const next = tabs[tab] ?? tabs.view;
-            const same = s.mode === next.mode && s.dock === next.dock;
-            const to = same ? tabs.view : next;
-
-            store.set({
-                ...to,
-                draft: to.mode === "comment" ? s.draft : null,
-                view: tab === "versions" || s.view === "canvas" ? s.view : "canvas",
-            });
-
-            // Others comment as this tab looks: read them when the list opens, as well as when they say so.
-            if (to.dock === "comments" && s.artifact !== null) {
-                void data.notes(s.artifact);
-            }
-        },
-        setDevice(device) {
-            store.set({ device });
-        },
-        setCustom(size) {
-            const custom = { ...store.get().custom };
-
-            for (const [key, value] of Object.entries(size)) {
-                custom[key] = clampSize(value, custom[key]);
-            }
-
-            store.set({ custom, device: "custom" });
-        },
-        setZoom(zoom) {
-            store.set({ zoom });
-        },
-        setBackdrop(backdrop) {
-            store.set({ backdrop });
-        },
-        reloadFrame() {
-            store.set((s) => ({ reload: s.reload + 1 }));
-        },
-
-        setTweak(artifact, knob, value) {
-            const s = store.get();
-            const values = { ...(s.tweaks[artifact] ?? {}), [knob.name]: value };
-
-            if (value === knob.value) {
-                delete values[knob.name];
-            }
-
-            store.set({ tweaks: { ...s.tweaks, [artifact]: values } });
-            data.saveTweaks(artifact, values);
-        },
-        resetTweaks(artifact) {
-            store.set((s) => ({ tweaks: { ...s.tweaks, [artifact]: {} } }));
-            data.saveTweaks(artifact, null);
-        },
-
-        useVariation(each, others) {
-            env.sendToBox(
-                variationMessage({ title: each.title, id: each.id, group: each.group, others }),
+                    look();
+                }),
             );
-            env.open(each.id);
-        },
-        share(id, version) {
-            openSheet({ type: "artifact-share", id, version, back: "design" });
-        },
+        }
+
+        return styled.get(name);
     };
 
-    const { Workspace } = createWorkspace(env);
+    let loading = null;
+    let ready = null;
+
+    const load = () => {
+        loading ??= Promise.all([import("./app.js"), style("style.css")]).then(([module]) => {
+            ready = module.createApp(pocket, store, { style });
+
+            if (store.get().conversation !== null) {
+                void ready.data.list();
+            }
+
+            return ready;
+        });
+
+        return loading;
+    };
 
     function Panel() {
-        return pocket.html`<${Workspace} />`;
+        const { useEffect, useState, html } = pocket;
+        const [workspace, setWorkspace] = useState(ready);
+        const [failed, setFailed] = useState(null);
+
+        useEffect(() => {
+            if (workspace === null) {
+                load().then(setWorkspace, (error) => {
+                    loading = null;
+                    setFailed(error);
+                });
+            }
+        }, []);
+
+        if (failed) {
+            return html`<div class="dsn-load-failed">
+                <p>Design did not load.</p>
+                <p class="muted small">${String(failed?.message ?? failed)}</p>
+                <button
+                    type="button"
+                    class="button"
+                    onClick=${() => {
+                        setFailed(null);
+                        load().then(setWorkspace, (error) => {
+                            loading = null;
+                            setFailed(error);
+                        });
+                    }}
+                >
+                    Try again
+                </button>
+            </div>`;
+        }
+
+        return workspace
+            ? html`<${workspace.Workspace} />`
+            : html`<${pocket.Loader} label="Opening Design" />`;
     }
+
+    let focused = false;
+    const stopFocus = store.subscribe((s) => {
+        if (s.focus !== focused) {
+            focused = s.focus;
+            document.documentElement.toggleAttribute("data-dsn-focus", focused);
+        }
+    });
 
     // How the canvas looks is kept in this browser.
     let looks = "";
@@ -236,31 +160,8 @@ export default function setup(pocket) {
             version: pick?.version ?? null,
         });
 
-        if (id !== null) {
-            void data.list();
-        }
-    });
-
-    // Pi published or changed something: the server's list (groups, kinds) is read again.
-    let signature = "";
-    let seen = null;
-    let later = 0;
-    const stopApp = app.subscribe((state) => {
-        const list = state.view.artifacts;
-
-        // The app tells this on every change while Pi writes: most leave the list as it was.
-        if (!list || list === seen || state.conversationId !== store.get().conversation) {
-            return;
-        }
-
-        seen = list;
-
-        const next = list.map((each) => `${each.id}@${each.versions.at(-1)?.version}`).join();
-
-        if (next !== signature) {
-            signature = next;
-            clearTimeout(later);
-            later = setTimeout(() => void data.list(), 150);
+        if (id !== null && ready !== null) {
+            void ready.data.list();
         }
     });
 
@@ -268,20 +169,41 @@ export default function setup(pocket) {
     const stopComments = pocket.on("comments", (event) => {
         const s = store.get();
 
-        if (event?.conversation === s.conversation && s.notes[event.artifact]?.loaded) {
-            void data.notes(event.artifact);
+        if (
+            ready !== null &&
+            event?.conversation === s.conversation &&
+            s.notes[event.artifact]?.loaded
+        ) {
+            void ready.data.notes(event.artifact);
         }
     });
 
-    const ask = (artifact, version) => {
-        store.set({ wanted: { artifact: String(artifact ?? ""), version: version ?? null } });
+    const ask = (artifact, version, system = false) => {
+        store.set({
+            wanted: { artifact: String(artifact ?? ""), version: version ?? null, system },
+        });
         pocket.openPanel("design");
     };
 
-    // `/design-open [artifact]`, run on the server, asks this tab to open the panel.
     const stopOpen = pocket.on("open", (event) => {
         if (event?.conversation === store.get().conversation) {
-            ask(event.artifact);
+            const word = String(event.artifact ?? "")
+                .trim()
+                .toLowerCase();
+
+            ask(event.artifact, null, word === "system");
+        }
+    });
+
+    const stopSystem = pocket.on("system", (event) => {
+        const s = store.get();
+
+        if (
+            ready !== null &&
+            event?.conversation === s.conversation &&
+            s.system.status !== "idle"
+        ) {
+            void ready.systemData.load({ quiet: true });
         }
     });
 
@@ -291,35 +213,55 @@ export default function setup(pocket) {
             wanted: {
                 artifact: String(event.detail?.artifact ?? ""),
                 version: event.detail?.version ?? null,
+                system: false,
             },
         });
     };
 
     addEventListener("pocket:design-open", onOpen);
 
-    pocket.style("style.css");
     pocket.panel({
         id: "design",
         title: "Design",
-        iconPath: PATHS.design,
+        iconPath: DESIGN_PATH,
         component: Panel,
         wide: true,
     });
-    pocket.rail({ id: "design", title: "Design", iconPath: PATHS.design, panel: "design" });
+    pocket.rail({ id: "design", title: "Design", iconPath: DESIGN_PATH, panel: "design" });
     pocket.launcher({
         id: "design",
         label: "Open Design",
         detail: "A canvas for prototypes, screens, and decks",
-        iconPath: PATHS.design,
+        iconPath: DESIGN_PATH,
         keywords: ["design", "canvas", "prototype", "mockup", "deck", "slides"],
         panel: "design",
+    });
+    pocket.launcher({
+        id: "design-system",
+        label: "Open the design system",
+        detail: "Colors, type, spacing, and components of the project",
+        icon: "palette",
+        keywords: [
+            "design",
+            "system",
+            "tokens",
+            "colors",
+            "type",
+            "theme",
+            "components",
+            "palette",
+        ],
+        run: () => ask("", null, true),
     });
 
     return () => {
         removeEventListener("pocket:design-open", onOpen);
-        clearTimeout(later);
+        document.documentElement.removeAttribute("data-dsn-focus");
+        watchTheme.disconnect();
+        ready?.stop();
+        stopFocus();
+        stopSystem();
         stopConversation();
-        stopApp();
         stopComments();
         stopOpen();
     };

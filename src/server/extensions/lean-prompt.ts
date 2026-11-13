@@ -9,7 +9,7 @@
  *
  * The browser is deferred too, but it is the session's switch (`extensions/browser.ts`): load_tools never loads it.
  */
-import { Type } from "@earendil-works/pi-ai";
+import { arr, obj, str } from "@earendil-works/pi-schema";
 import {
     defineExtension,
     defineTool,
@@ -101,12 +101,15 @@ export default function createLeanPrompt(host: PocketHost, web: ExtensionWeb) {
         name: "load_tools",
         description:
             "Load tools that are offered on request (listed under more_tools in your instructions); they are yours from your next step on.",
-        parameters: Type.Object({
-            names: Type.Array(Type.String(), {
-                description: "Tool names from the more_tools list.",
-                minItems: 1,
-            }),
-        }),
+        parameters: obj(
+            {
+                names: arr(str(), {
+                    description: "Tool names from the more_tools list.",
+                    minItems: 1,
+                }),
+            },
+            { open: true },
+        ),
         replay: "safe",
         execute: async (args, api, context) => {
             const agent = await api.agent(context);

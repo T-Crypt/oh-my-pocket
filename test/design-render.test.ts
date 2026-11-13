@@ -5,6 +5,7 @@ import { createSocket } from "node:dgram";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { Chromium } from "../src/server/browser/cdp.ts";
 import { findBrowser } from "../src/server/browser/discovery.ts";
 import type { DesignBundle } from "../src/server/design/bundle.ts";
 import { exportDesign } from "../src/server/design/export.ts";
@@ -521,5 +522,41 @@ test(
         );
 
         assert.deepEqual(results, [true, true]);
+    },
+);
+
+test(
+    "PI_POCKET_BROWSER_ARGS reaches the design render's Chromium",
+    { skip: browser === undefined },
+    async () => {
+        const realLaunch = Chromium.launch;
+        let launched: readonly string[] | undefined;
+        const fake = {
+            connection: { send: async () => ({}), listen: () => {} },
+            kill: () => {},
+            exited: Promise.resolve(),
+        } as unknown as Chromium;
+
+        Chromium.launch = async (
+            _executable: string,
+            _profile: string,
+            extra: readonly string[],
+        ) => {
+            launched = extra;
+
+            return fake;
+        };
+
+        process.env.PI_POCKET_BROWSER_ARGS = "--no-sandbox --design-flag";
+
+        try {
+            await withRender(bundle, host, undefined, async () => true);
+        } finally {
+            Chromium.launch = realLaunch;
+            delete process.env.PI_POCKET_BROWSER_ARGS;
+        }
+
+        assert.ok(launched?.includes("--no-sandbox"), "the env flag reaches Chromium");
+        assert.ok(launched?.includes("--design-flag"), "space-separated args are kept apart");
     },
 );

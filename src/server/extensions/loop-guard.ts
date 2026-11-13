@@ -8,7 +8,7 @@
  * the same tool that ran it - so a call the wrapper repaired or validation coerced, a string limit or a JSON
  * string of an object, is blocked like the clean identical call.
  */
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import {
     GenerationTask,
     ToolTask,

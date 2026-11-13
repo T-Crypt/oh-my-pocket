@@ -1,6 +1,6 @@
 # Changing how Pi works, without code
 
-Most changes that people ask for need no code: "always use pnpm", "review the way we do it here", "never touch the migrations". Pi Pocket reads the same files as Pi. So what you write for Pi works here too, and the other way round. Pi's own documentation tells all about each file; the system prompt gives its path.
+Most changes that people ask for need no code: "always use pnpm", "review the way we do it here", "never touch the migrations". Pi Pocket reads the same files as Pi, except Pi's extensions ([below](#pis-extensions-and-packages)). So what you write for Pi works here too, and the other way round. Pi's own documentation tells all about each file; the system prompt gives its path.
 
 ## Instructions for one session
 
@@ -22,6 +22,17 @@ Pi Pocket loads context files as Pi does:
 Pi's `configuration.md` gives the full list of names, with `AGENTS.override.md`. Pi Pocket reads the files again at most 30 seconds after they change. The next request has them.
 
 Keep the files short and true. They go with each request, and a rule that Pi cannot obey is worse than no rule.
+
+## PiP's instructions
+
+PiP has no project, so it does not read AGENTS.md files. Write the rules for PiP in `pip.md` in Pi Pocket's data folder: `~/.pi-pocket/pip.md`, unless `--data` or `PI_POCKET_DIR` names another folder (since 0.28.0).
+
+- PiP gets the file with each message. When the file changes, the next message has the new text.
+- Only PiP reads it: sessions, subagents, and Pi's terminal app do not.
+
+## The language agents write in
+
+Since 0.28.0, agents write to each other in the language of the person they work for: PiP to the sessions it starts or messages, a session to its linked sessions and its subagents, and each answer back. A session you open later, that PiP or another session worked in, reads in your language, with no setting. PiP takes the language from your messages to it, and for a watch, a webhook, or a schedule from the instructions you gave it. In English they write Simplified Technical English (ASD-STE100); in another language, the same short, plain style. Their answers to you follow your own messages, as before. To choose another language for PiP's messages to sessions, say so in `pip.md`.
 
 ## Skills: procedures that Pi follows on request
 
@@ -64,11 +75,22 @@ Use one for a role with its own model or rules: a planner on a large model, a re
 
 ## Models and providers
 
-People sign in to providers in Menu → **Providers**, and pick a model for each session with the model chip in the message box. Pi Pocket uses Pi's sign-ins (`~/.pi/agent/auth.json`) and Pi's list of models. To add a model or a provider that Pi does not know, follow Pi's `models.md` and `custom-provider.md`.
+People sign in to providers in Menu → **Providers**, and pick a model for each session with the model chip in the message box. Pi Pocket uses Pi's sign-ins (`~/.pi/agent/auth.json`) and Pi's list of models. To add an OpenAI-compatible endpoint (LM Studio, Ollama, vLLM, a proxy), the owner taps **Add** on the **OpenAI Compatible** row in Providers: a name, a base URL, an API key (or **No key**), and models picked from the endpoint's list (**Find models**) or typed by hand. Pi Pocket writes the endpoint into Pi's `models.json`, which it makes, with its folder, when missing, and keeps the key in `auth.json`. **Edit** and **Remove** change it later. A `models.json` with comments, or one Pi refuses, is left alone. To add another model or provider that Pi does not know, or the fields the form does not set (headers, compat, costs), add it to `models.json` as Pi's `models.md` says; the form keeps those fields when it edits the endpoint. A provider that needs code comes as a Pi Pocket drop-in that calls `host.registerModelProvider` ([host.md](extensions/reference/host.md#registermodelprovider)), not as a Pi extension: see [Pi's extensions and packages](#pis-extensions-and-packages).
+
+**A Claude subscription.** Sign in to Anthropic with it in Providers. Then turn on **Claude subscription billing** in Menu → Extensions → Installed → **Built in**, so that requests count against the plan. It is off by default, and it asks before it turns on. Without it, Anthropic can bill the requests as extra usage, and refuse them when that is used up.
+
+> [!WARNING]
+> **Using a Claude subscription in Pi Pocket is at your own risk.** Anthropic's terms and its help pages disagree on it:
+>
+> - Anthropic's [Consumer Terms](https://www.anthropic.com/legal/consumer-terms) forbid accessing its services "through automated or non-human means, whether through a bot, script, or otherwise", except with an Anthropic API key or where Anthropic explicitly permits it.
+> - Its help pages say that third-party apps can use your subscription limits. Yet its servers often bill such requests as extra usage.
+> - Claude subscription billing makes Pi Pocket's requests look like Claude Code's.
+>
+> Anthropic can change how it counts these requests, refuse them, or act on an account it finds using them. An Anthropic API key, or a model from another provider, has none of these risks.
 
 Models are the person's to choose, never Pi's: a subagent runs on its session's model unless the session's person allows others with the Subagents chip or `/subagents`, or the owner allows them everywhere under **Models for subagents** at the top of the Providers sheet (none by default), and PiP passes a model only when its person named it. Instructions, skills, or `AGENTS.md` cannot widen that; tell the person where the setting is instead.
 
-- A subagent runs on its session's model, unless the owner allows models under **Models for subagents**, at the top of the Providers sheet. By default, there are none. Once some are allowed, subagents and linked sessions run only on those: on the session's model when it is one of them and Pi names none, else on a model Pi chooses from them (Pi must name one when the session's is not among them).
+- A subagent runs on its session's model, unless the owner allows models under **Subagent models** in the Providers sheet (a pane on the right on wide screens, at the top on phones). By default, there are none. Once some are allowed, subagents and linked sessions run only on those: on the session's model when it is one of them and Pi names none, else on a model Pi chooses from them (Pi must name one when the session's is not among them).
 - PiP gives a model only when its person named it.
 
 Instructions, skills, and `AGENTS.md` cannot change this. Tell the person where the setting is instead.
@@ -85,7 +107,7 @@ Pi Pocket compacts a session's context with Pi's settings in `~/.pi/agent/settin
 }
 ```
 
-Other models keep the general values. An entry that Pi refuses (not a whole number, or a name with no provider) is left out, and the server log says so. PiP uses its model's values too. An edit of `settings.json` counts once Pi Pocket reads Pi's settings again: soon after the next message, or at once with Menu → **Refresh models**. See Pi's `settings.md` for each setting.
+Other models keep the general values. With no `compaction.reserveTokens` in Pi's settings, Pi Pocket gives each model its own reserve instead of Pi Durable's 16,384: room for the whole summary the model can write, up to 32,768 tokens and a quarter of its context window (since 0.28.1). Pi Durable writes a summary in at most 80% of the reserve, thinking included, so the old 13,107 tokens cut off the cumulative summary of a long session, and from then on every run failed. A model with a 200,000-token window and 32,768 output tokens now compacts from about 167,000 tokens (before, about 184,000). A `reserveTokens` of your own, general or in a model's override, wins. An entry that Pi refuses (not a whole number, or a name with no provider) is left out, and the server log says so. PiP uses its model's values too. An edit of `settings.json` counts once Pi Pocket reads Pi's settings again: soon after the next message, or at once with Menu → **Refresh models**. See Pi's `settings.md` for each setting.
 
 ## Project model defaults for new sessions
 
@@ -138,6 +160,10 @@ These are in the app, not in files. Tell the person where they are. Do not chang
 - **Lancet Guard and approvals** (Menu → Extensions): when the guard is on, risky commands wait for a person to allow them. "Approvals need someone else" makes that person another than the one who asked.
 
 See [features.md](features.md) for each of them.
+
+## Pi's extensions and packages
+
+Pi Pocket reads Pi's sign-ins, models, settings, skills, prompt templates, and AGENTS.md files, but not Pi's extensions. It does not load `~/.pi/agent/extensions/`, the `extensions` setting, or the packages of the `packages` setting in Pi's `settings.json`. Pi Pocket runs on Pi Durable, and its extensions are of another kind ([extensions.md](extensions.md)). For something that a Pi package gives, look in Menu → Extensions: under **Built in**, and in **Discover**.
 
 ## When this is not enough
 

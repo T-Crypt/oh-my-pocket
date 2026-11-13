@@ -2,7 +2,17 @@
 // names is refused; the owner may allow others, and Pi may use only those. A subagent on a
 // model no longer allowed gets no more work. A subagent its model failed is reported as such, with the model, and Pi is
 // told to stop and tell the user rather than try another model; the people in the session are told too.
-import { type App, cleanUp, context, lastText, openApp, owner, until, work } from "./helpers.ts";
+import {
+    type App,
+    cleanUp,
+    context,
+    lastText,
+    openApp,
+    owner,
+    until,
+    work,
+    offerSubagents,
+} from "./helpers.ts";
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
@@ -92,6 +102,7 @@ let app: App;
 
 before(async () => {
     app = await openApp(faux);
+    offerSubagents(app);
 });
 
 after(async () => {
@@ -140,6 +151,11 @@ test("with no models allowed, a subagent runs on its session's model, and Pi is 
         (await app.agentState(started.agents.plain!.conversationId))?.model?.modelId,
         "mine",
     );
+    // The bar and the board say the model it runs on: its session's, so not marked as another.
+    const shown = app.subagents(owner(app)).find((entry) => entry.name === "plain");
+
+    assert.equal(shown?.runsOn?.name, "mine");
+    assert.equal(shown?.runsOn?.other, undefined);
     assert.ok(offered !== undefined, "the parent was offered the tool");
     // Always offered, as which models a subagent may use depends on the session; the call checks.
     assert.ok("model" in offered, "a model parameter");

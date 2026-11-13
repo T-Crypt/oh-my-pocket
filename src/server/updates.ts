@@ -36,7 +36,7 @@ import {
     updatePaths,
     writePending,
 } from "./update-state.ts";
-import { atLeast, versionParts } from "./versions.ts";
+import { atLeast, compareReleases } from "./versions.ts";
 
 /** A release: its tag (`v0.23.0`), version, and notes (undefined when only the tag was found). */
 export type Release = {
@@ -47,6 +47,7 @@ export type Release = {
     notes?: string;
     url?: string;
     publishedAt?: string;
+    beta?: boolean;
     /** The notes have a `[!WARNING]` alert: a step that cannot be undone, or one that needs care. */
     warning: boolean;
     /**
@@ -71,6 +72,7 @@ export type UpdateStatus = {
     branch?: string | null;
     /** Where releases come from. */
     repository: string;
+    beta: boolean;
     latest?: Release;
     checkedAt?: number;
     /** Why the last check failed. */
@@ -113,13 +115,15 @@ export interface UpdatesOptions {
     log: (line: string) => void;
     /** The git address releases come from; `package.json`'s repository when not given. */
     repository?: string;
-    /** Tests give the newest release here, rather than asking GitHub. */
-    releases?: (signal?: AbortSignal) => Promise<Release | undefined>;
+    beta?: boolean;
+    /** Tests give the newest release here, rather than asking GitHub. `beta` says whether the channel is on. */
+    releases?: (signal?: AbortSignal, beta?: boolean) => Promise<Release | undefined>;
     now?: () => number;
 }
 
 /** A release's tag: only these are taken, so the tag is safe in a refspec and its version is a version. */
-const TAG = /^v?(\d{1,4}\.\d{1,4}\.\d{1,4})$/;
+const TAG = /^v?(\d{1,4}\.\d{1,4}\.\d{1,4}(-beta\.\d{1,4})?)$/;
+const STABLE = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
 /** Where the release's commit is kept in the checkout: a ref of the updater's own, never a branch or tag of yours. */
 const TARGET_REF = "refs/pocket-update/target";
 /** The most of a release's notes kept. */
@@ -163,13 +167,8 @@ export function githubRepository(url: string): { owner: string; name: string } |
     return match === null ? undefined : { owner: match[1]!, name: match[2]! };
 }
 
-/** `version` is newer than `than`. */
 export function newer(version: string, than: string): boolean {
-    return (
-        versionParts(version) !== undefined &&
-        versionParts(than) !== undefined &&
-        !atLeast(than, version)
-    );
+    return (compareReleases(version, than) ?? 0) > 0;
 }
 
 /** Node.js `version` meets an `engines.node` of the form `>=22.19`; any other form is not checked. */
@@ -198,18 +197,24 @@ function releaseOf(tag: string, fields: Partial<Release>): Release | undefined {
         return undefined;
     }
 
-    return { name: tag, ...fields, tag, version: match[1]!, warning: notesWarn(fields.notes) };
+    return {
+        name: tag,
+        ...fields,
+        tag,
+        version: match[1]!,
+        ...(match[2] === undefined ? {} : { beta: true }),
+        warning: notesWarn(fields.notes),
+    };
 }
 
-/** The newest release on GitHub, or undefined when the repository has none. */
-async function githubRelease(
+async function githubGet(
     repository: { owner: string; name: string },
+    path: string,
     signal?: AbortSignal,
-    tag?: string,
-): Promise<Release | undefined> {
+): Promise<unknown> {
     const timeout = AbortSignal.timeout(20_000);
     const response = await fetch(
-        `https://api.github.com/repos/${repository.owner}/${repository.name}/releases/${tag === undefined ? "latest" : `tags/${encodeURIComponent(tag)}`}`,
+        `https://api.github.com/repos/${repository.owner}/${repository.name}/${path}`,
         {
             headers: {
                 accept: "application/vnd.github+json",
@@ -228,7 +233,13 @@ async function githubRelease(
         throw new Error(`GitHub answered ${response.status} for the newest release`);
     }
 
-    const body = (await response.json()) as Record<string, unknown>;
+    return response.json();
+}
+
+function githubReleaseOf(
+    repository: { owner: string; name: string },
+    body: Record<string, unknown>,
+): Release | undefined {
     const notes = typeof body.body === "string" ? body.body : "";
     const foundTag = typeof body.tag_name === "string" ? body.tag_name : "";
     const page = `https://github.com/${repository.owner}/${repository.name}/releases/tag/${foundTag}`;
@@ -240,18 +251,108 @@ async function githubRelease(
         ...(typeof body.published_at === "string" ? { publishedAt: body.published_at } : {}),
     });
 
-    if (release === undefined) {
-        throw new Error(`The release's tag is not a version: ${foundTag.slice(0, 40)}`);
-    }
-
     // Read all notes for safety, even when only the first part is displayed.
-    return { ...release, warning: notesWarn(notes) };
+    return release === undefined ? undefined : { ...release, warning: notesWarn(notes) };
 }
 
-/** npm's published latest version, with the notes for that exact version from GitHub. */
+async function githubRelease(
+    repository: { owner: string; name: string },
+    signal?: AbortSignal,
+    tag?: string,
+): Promise<Release | undefined> {
+    const body = (await githubGet(
+        repository,
+        `releases/${tag === undefined ? "latest" : `tags/${encodeURIComponent(tag)}`}`,
+        signal,
+    )) as Record<string, unknown> | undefined;
+
+    if (body === undefined) {
+        return undefined;
+    }
+
+    const release = githubReleaseOf(repository, body);
+
+    if (release === undefined) {
+        throw new Error(
+            `The release's tag is not a version: ${String(body.tag_name ?? "").slice(0, 40)}`,
+        );
+    }
+
+    return release;
+}
+
+/** The highest version wins, not the latest one made: a fix for an older line may come later. */
+export function newestOfReleases(
+    repository: { owner: string; name: string },
+    list: unknown,
+): Release | undefined {
+    let best: Release | undefined;
+
+    for (const body of Array.isArray(list) ? list : []) {
+        if (typeof body !== "object" || body === null || body.draft === true) {
+            continue;
+        }
+
+        const release = githubReleaseOf(repository, body as Record<string, unknown>);
+
+        if (release !== undefined && (best === undefined || newer(release.version, best.version))) {
+            best = release;
+        }
+    }
+
+    return best;
+}
+
+async function githubNewestRelease(
+    repository: { owner: string; name: string },
+    signal?: AbortSignal,
+): Promise<Release | undefined> {
+    return newestOfReleases(
+        repository,
+        await githubGet(repository, "releases?per_page=30", signal),
+    );
+}
+
+export function pickNpmVersion(
+    body: {
+        "dist-tags"?: Record<string, unknown>;
+        versions?: Record<string, unknown>;
+    },
+    beta = false,
+): string {
+    const tags = body["dist-tags"];
+    const found: string[] = [];
+    let problem: string | undefined;
+
+    if (typeof tags?.latest !== "string" || !STABLE.test(tags.latest)) {
+        problem = "npm's latest dist-tag is not a release version.";
+    } else if (body.versions?.[tags.latest] === undefined) {
+        problem = "npm's latest dist-tag has no published package metadata.";
+    } else {
+        found.push(tags.latest);
+    }
+
+    if (
+        beta &&
+        typeof tags?.beta === "string" &&
+        TAG.test(tags.beta) &&
+        !tags.beta.startsWith("v") &&
+        body.versions?.[tags.beta] !== undefined
+    ) {
+        found.push(tags.beta);
+    }
+
+    if (found.length === 0) {
+        throw new Error(problem ?? "npm's latest dist-tag is not a release version.");
+    }
+
+    return found.reduce((best, each) => (newer(each, best) ? each : best));
+}
+
 export async function npmRelease(
     repository: { owner: string; name: string } | undefined,
     signal?: AbortSignal,
+    beta = false,
 ): Promise<Release> {
     const timeout = AbortSignal.timeout(20_000);
     const response = await fetch("https://registry.npmjs.org/pi-pocket", {
@@ -267,21 +368,11 @@ export async function npmRelease(
     }
 
     const body = (await response.json()) as {
-        "dist-tags"?: { latest?: unknown };
+        "dist-tags"?: Record<string, unknown>;
         versions?: Record<string, { engines?: { node?: unknown } }>;
     };
-    const version = body["dist-tags"]?.latest;
-
-    if (typeof version !== "string" || !TAG.test(version) || version.startsWith("v")) {
-        throw new Error("npm's latest dist-tag is not a release version.");
-    }
-
-    const manifest = body.versions?.[version];
-
-    if (manifest === undefined) {
-        throw new Error("npm's latest dist-tag has no published package metadata.");
-    }
-
+    const version = pickNpmVersion(body, beta);
+    const manifest = body.versions![version]!;
     const tag = `v${version}`;
     const node = manifest.engines?.node;
     const fields = typeof node === "string" ? { node } : {};
@@ -309,23 +400,36 @@ export async function npmRelease(
     };
 }
 
-/** The newest version tag of a repository anywhere git reaches, without notes. */
-async function tagRelease(repository: string, cwd: string): Promise<Release | undefined> {
-    const out = await git(cwd, ["ls-remote", "--tags", "--refs", "--", repository], {
-        timeoutMs: FETCH_TIMEOUT_MS,
-    });
+export function newestTag(output: string, beta = false): Release | undefined {
     let best: Release | undefined;
 
-    for (const line of out.split("\n")) {
+    for (const line of output.split("\n")) {
         const tag = /\trefs\/tags\/(\S+)$/.exec(line)?.[1];
         const release = tag === undefined ? undefined : releaseOf(tag, {});
 
-        if (release !== undefined && (best === undefined || newer(release.version, best.version))) {
+        if (
+            release !== undefined &&
+            (beta || release.beta !== true) &&
+            (best === undefined || newer(release.version, best.version))
+        ) {
             best = release;
         }
     }
 
     return best;
+}
+
+async function tagRelease(
+    repository: string,
+    cwd: string,
+    beta: boolean,
+): Promise<Release | undefined> {
+    return newestTag(
+        await git(cwd, ["ls-remote", "--tags", "--refs", "--", repository], {
+            timeoutMs: FETCH_TIMEOUT_MS,
+        }),
+        beta,
+    );
 }
 
 /**
@@ -416,6 +520,7 @@ export class Updates {
     readonly repository: string;
     readonly #listeners = new Set<(status: UpdateStatus) => void>();
     #latest: Release | undefined;
+    #beta: boolean;
     /** The last check asked npm, not GitHub. */
     #fromNpm = false;
     #checkedAt: number | undefined;
@@ -437,6 +542,28 @@ export class Updates {
         this.#options = options;
         this.#root = resolve(options.appRoot);
         this.repository = options.repository ?? repositoryOf(this.#root);
+        this.#beta = options.beta === true;
+    }
+
+    get beta(): boolean {
+        return this.#beta;
+    }
+
+    /** A running pre-release is never offered an older version, whatever the channel. */
+    setBeta(on: boolean): void {
+        if (on === this.#beta) {
+            return;
+        }
+
+        this.#beta = on;
+
+        if (!on && this.#latest?.beta === true) {
+            this.#latest = undefined;
+            this.#target = undefined;
+            this.#targetError = undefined;
+        }
+
+        void this.#changed();
     }
 
     get #now(): number {
@@ -636,6 +763,7 @@ export class Updates {
                 version: this.#options.version,
                 installKind: this.#knownKind,
                 repository: this.repository,
+                beta: this.#beta,
                 ...(this.#latest === undefined ? {} : { latest: this.#latest }),
                 ...(this.#checkedAt === undefined ? {} : { checkedAt: this.#checkedAt }),
                 available: true,
@@ -659,6 +787,8 @@ export class Updates {
         let packages = false;
 
         if (available && latest !== undefined) {
+            const dist = latest.beta === true ? "beta" : "latest";
+
             if (!this.#options.supervised) {
                 blockers.push(
                     "Pi Pocket runs without its launcher, so it cannot restart itself. Start it with `npm start` (or `bin/pi-pocket.js`) to update from the app.",
@@ -678,7 +808,7 @@ export class Updates {
 
                 if (!(await npmWritable(this.#root))) {
                     blockers.push(
-                        `The server's user cannot write to ${this.#root} and its global node_modules folder. Update it as the user who owns it with \`npm install -g pi-pocket@latest\` (a system install may need sudo).`,
+                        `The server's user cannot write to ${this.#root} and its global node_modules folder. Update it as the user who owns it with \`npm install -g pi-pocket@${dist}\` (a system install may need sudo).`,
                     );
                 }
 
@@ -690,9 +820,9 @@ export class Updates {
             } else if (!local.git) {
                 blockers.push(
                     installKind === "npm-local"
-                        ? "This is a local npm install. Update it with `npm install pi-pocket@latest` in that project, then start it again."
+                        ? `This is a local npm install. Update it with \`npm install pi-pocket@${dist}\` in that project, then start it again.`
                         : installKind === "npx"
-                          ? "This copy runs with npx. Stop it, then run `npx pi-pocket@latest`."
+                          ? `This copy runs with npx. Stop it, then run \`npx pi-pocket@${dist}\`.`
                           : "This copy of Pi Pocket is not a git checkout. Update it the way you installed it.",
                 );
             } else if (gitVersion !== undefined && !atLeast(gitVersion, MIN_GIT)) {
@@ -757,6 +887,12 @@ export class Updates {
         }
 
         if (available) {
+            if (latest?.beta === true) {
+                cautions.push(
+                    "This is a beta version: it may have bugs that the stable release does not. Turn off Beta updates (Menu → Extensions → Installed → Pi Pocket updates) to get stable releases only; the next stable release still updates a beta.",
+                );
+            }
+
             if (latest?.warning === true) {
                 cautions.push(
                     "The release notes have a warning. Read it, and back up the data folder, before you update. If this version does not start, Pi Pocket does not go back by itself.",
@@ -799,6 +935,7 @@ export class Updates {
             installKind,
             ...(local.git ? { commit: local.commit, branch: local.branch } : {}),
             repository: this.repository,
+            beta: this.#beta,
             ...(latest === undefined ? {} : { latest }),
             ...(this.#checkedAt === undefined ? {} : { checkedAt: this.#checkedAt }),
             ...(this.#error === undefined ? {} : { error: this.#error }),
@@ -831,7 +968,9 @@ export class Updates {
 
     async #check(signal?: AbortSignal): Promise<void> {
         try {
-            const release = await this.#findRelease(signal);
+            const found = await this.#findRelease(signal);
+            // The channel may be turned off while the look goes on: a pre-release it found is not offered.
+            const release = found?.beta === true && !this.#beta ? undefined : found;
 
             this.#latest = release;
             this.#error = undefined;
@@ -859,26 +998,30 @@ export class Updates {
         }
 
         const kind = await this.#installKind(await this.#local());
+        const beta = this.#beta;
 
         this.#fromNpm = kind === "npm-global" || kind === "npm-local" || kind === "npx";
 
         if (this.#options.releases !== undefined) {
-            return this.#options.releases(signal);
+            return this.#options.releases(signal, beta);
         }
 
         const github = githubRepository(this.repository);
 
         if (this.#fromNpm) {
-            return npmRelease(github, signal);
+            return npmRelease(github, signal, beta);
         }
 
         let failed: unknown;
 
         if (github !== undefined) {
             try {
-                const found = await githubRelease(github, signal);
+                const found = beta
+                    ? await githubNewestRelease(github, signal)
+                    : await githubRelease(github, signal);
 
-                if (found !== undefined) {
+                // GitHub may not mark a beta tag as a pre-release: only the beta channel takes it.
+                if (found !== undefined && (beta || found.beta !== true)) {
                     return found;
                 }
             } catch (error) {
@@ -888,7 +1031,7 @@ export class Updates {
 
         // No release page (or GitHub did not answer): the tags give the newest version, without its notes.
         try {
-            const tagged = await tagRelease(this.repository, this.#root);
+            const tagged = await tagRelease(this.repository, this.#root, beta);
 
             // GitHub failed, rather than said there is no release: notes may exist, with a warning Pi Pocket cannot see.
             if (failed !== undefined && github !== undefined && tagged !== undefined) {
