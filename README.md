@@ -11,6 +11,7 @@ A fork of [TannerMidd/pi-pocket](https://github.com/TannerMidd/pi-pocket) with t
 [![Release](https://img.shields.io/github/v/release/TannerMidd/pi-pocket?color=7aa2f7)](https://github.com/TannerMidd/pi-pocket/releases)
 [![Node.js 22.19+](https://img.shields.io/badge/node-%E2%89%A5%2022.19-339933?logo=nodedotjs&logoColor=white)](https://nodejs.org)
 [![MIT license](https://img.shields.io/badge/license-MIT-ff9e64)](LICENSE)
+[![Support on Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b?logo=kofi&logoColor=white)](https://ko-fi.com/tcrypt)
 
 [Website](https://tannermidd.github.io/pi-pocket/) · [Quick start](#quick-start) · [Feature tour](docs/features.md) · [Docs](https://tannermidd.github.io/pi-pocket/docs/)
 
@@ -43,7 +44,7 @@ only then merge into `oh-my-pocket`.
 | Read economy                    | A read without an explicit limit returns at most five hundred lines, and the result carries a structural map of the part it did not read: how many lines remain and where the sections sit. To see more, the model reads on with an offset and a limit.                                                                                                                                                                                          | 6 tests; keeps whole-file dumps out of a small model's context                        |
 | KV-prefix discipline            | The system prompt is byte-stable and append-friendly: the one line that changes on its own (the day) sits in the last section of each pack, behind drop-ins' sections too, so a cache hit stays a hit through the day instead of re-prefilling the tail. Pinned by test for sessions, PiP, and drop-ins.                                                                                                                                         | the date's flip re-prefills one short line, not the pack                              |
 | Context baseline                | `/context baseline` (or a tap on the status line) takes a meter of where the context goes; the next `/context` lines it up against that and names the rows a change touched, before and after, biggest moves first. `/context clear` puts the meter back on its own.                                                                                                                                                                             | 4 tests; names the row a prompt, tool, or skill change lands on                       |
-| Lean prompt                     | Seldom-used tools (artifacts, design, codemode, background, schedules, PR watches) are offered on request: a one-line list and `load_tools`, not their schemas and guides.                                                                                                                                                                                                                                                                       | 15,904 → 7,312 prompt tokens per request; tools that made 0.4% of 27,163 real calls   |
+| Tool search                     | Seldom-used tools (browser, background, schedules, PR watches, design) wait until Pi searches for them; on a model whose prompt cache a changed tool list would break, the list stays and Pi calls the tool from codemode. Upstream's, since the 0.28.2 merge; it replaced the fork's lean prompt. The subagent tool waits too, except in a session that runs a router.                                                                          |
 | One GPU, many sessions          | Requests to llama-swap take turns by model (role names resolved from `/v1/models`); a run keeps the card between its tool calls; the status line shows a model loading or waiting; a session's local model starts loading while you write.                                                                                                                                                                                                       | two agent runs on two models: 2 swaps instead of one per turn (test/gpu-lane.test.ts) |
 | Browser use per session         | A Browser switch by the message box; off, the tool and its guide are not in the prompt. On, Pi asks before new sites, the local network, sign-ins, forms, purchases, deletions, and scripts, as the owner sets; it never types passwords.                                                                                                                                                                                                        | 4 tests (test/browser-use.test.ts)                                                    |
 | Lighter server                  | Changes counts new files in-process instead of a git process per file; the server's young generation and old space are capped.                                                                                                                                                                                                                                                                                                                   | on a copy of real data: spawn time 548 → 136 ms, RSS 401 → 298 MB                     |
@@ -189,6 +190,10 @@ npm run lint        # check the layout rules
 - The built-in browser needs Chromium, Chrome, Brave, or Edge on the server. It is tested on Linux and macOS.
 
 The [full list](docs/features.md#limitations) has the details.
+
+## Support
+
+If this project is useful to you, you can support its work on [Ko-fi](https://ko-fi.com/tcrypt).
 
 ## Credits and license
 
