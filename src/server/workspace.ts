@@ -20,11 +20,15 @@ import {
     switchBranch,
     validBranchName,
 } from "./branches.ts";
-import { type Changes, changesIn, diffOf, revertFile } from "./changes.ts";
+import { type Changes, changesIn, diffOf, editFacts, revertFile } from "./changes.ts";
 import type { User } from "./config.ts";
 import { describe, HttpError } from "./errors.ts";
 import { FileLists, type FileListing, type FileView, viewFile } from "./files.ts";
 import { displayPath, expandHome } from "./paths.ts";
+import type { ClientEntry } from "./projection.ts";
+
+/** How many sessions' Pi edits are kept between looks at Changes (`#edits`). */
+const EDITS_KEPT = 64;
 
 export class Workspace {
     readonly #app: PocketApp;
@@ -36,13 +40,29 @@ export class Workspace {
     /** The files in each folder, for `@` mentions. */
     readonly #files = new FileLists();
 
+    /** Refuse a local file or Git action for a session on a workspace URI. */
+    requireLocal(id: ConversationId): void {
+        if (this.#app.workspaceScheme(this.#app.cwdOf(id)) !== undefined) {
+            throw new HttpError(
+                400,
+                "Local file and Git operations are not available for remote workspaces.",
+            );
+        }
+    }
+
     /**
      * The looks at what a conversation's folder changed that are under way, per reach (its folder only, or its
      * repository). Every tab that shows a session asks (the top bar's count), often together as Pi moves on; those that
-     * ask while a look is under way share it, as each reads the whole history for Pi's edits and runs git. One asked
-     * after it ends looks again, so what it says is never older than the question.
+     * ask while a look is under way share it, as each reads the new history for Pi's edits and runs git. One asked after
+     * it ends looks again, so what it says is never older than the question.
      */
     readonly #changesUnderWay = new Map<string, Promise<Changes>>();
+
+    /**
+     * What Changes needs of each session's history (`editFacts`) and the newest entry it read, for the sessions looked
+     * at last: entries never change, so a look reads only those added since, not the whole history each time.
+     */
+    readonly #edits = new Map<ConversationId, { last: number; entries: ClientEntry[] }>();
 
     /**
      * Where each folder's repository keeps its files, for a minute: views ask on every update. A folder in none is
@@ -51,6 +71,11 @@ export class Workspace {
     readonly #gitDirs = new Map<string, { gitDir: string | undefined; at: number }>();
 
     #gitDir(cwd: string): string | undefined {
+        if (this.#app.workspaceScheme(cwd) !== undefined) {
+            // View metadata has no local repository; explicit local Git actions stay guarded.
+            return undefined;
+        }
+
         const known = this.#gitDirs.get(cwd);
 
         if (
@@ -82,6 +107,7 @@ export class Workspace {
     /** The branches of a session's repository, for the branch sheet: for people who can steer, as Changes is. */
     async branches(id: ConversationId, user: User): Promise<Branches> {
         this.#app.requireSee(user, id);
+        this.requireLocal(id);
         this.#app.requireSteer(user);
 
         const cwd = this.#app.cwdOf(id);
@@ -107,6 +133,7 @@ export class Workspace {
         request: { name?: unknown; create?: unknown; track?: unknown },
     ): Promise<{ branch: string }> {
         this.#app.requireSee(user, id);
+        this.requireLocal(id);
         this.#app.requireSteer(user);
 
         if (user.sessions !== undefined) {
@@ -158,6 +185,13 @@ export class Workspace {
 
     /** A folder to work in, as its whole path: a 404 when it is not there, so the folder picker can offer to make it. */
     checkDirectory(path: string): string {
+        if (this.#app.workspaceScheme(path.trim()) !== undefined) {
+            throw new HttpError(
+                400,
+                "Use the registered workspace resolver for remote workspace URIs.",
+            );
+        }
+
         const absolute = resolve(expandHome(path.trim() === "" ? "~" : path.trim()));
         let found;
 
@@ -239,6 +273,8 @@ export class Workspace {
 
     /** A path as a conversation means it: absolute, `~/…`, or relative to the conversation's working directory. */
     conversationPath(id: ConversationId, path: string): string {
+        this.requireLocal(id);
+
         return resolve(this.#app.cwdOf(id), expandHome(path.trim()));
     }
 
@@ -347,6 +383,7 @@ export class Workspace {
      */
     async fileList(id: ConversationId, user: User): Promise<FileListing> {
         this.#app.requireSee(user, id);
+        this.requireLocal(id);
         this.#app.requireSteer(user);
         await this.#app.conversation(id);
 
@@ -390,6 +427,7 @@ export class Workspace {
      */
     async revertChange(id: ConversationId, user: User, path: string): Promise<void> {
         this.#app.requireSee(user, id);
+        this.requireLocal(id);
         await this.#app.requireDriver(id, user);
 
         if (this.#app.isBusy(id)) {
@@ -417,6 +455,7 @@ export class Workspace {
     /** What changed in a session's folder: Pi's edits, and the uncommitted changes of its git repository. */
     async changes(id: ConversationId, user: User): Promise<Changes> {
         this.#app.requireSee(user, id);
+        this.requireLocal(id);
         this.#app.requireSteer(user);
 
         // Someone invited to this session only sees the files in its folder, here as in `conversationFile`.
@@ -429,11 +468,7 @@ export class Workspace {
         }
 
         const pending = (async () =>
-            changesIn(
-                this.#app.cwdOf(id),
-                await this.#app.transcripts.allEntries(id, false),
-                onlyHere,
-            ))().finally(() => {
+            changesIn(this.#app.cwdOf(id), await this.#editEntries(id), onlyHere))().finally(() => {
             if (this.#changesUnderWay.get(key) === pending) {
                 this.#changesUnderWay.delete(key);
             }
@@ -442,6 +477,35 @@ export class Workspace {
         this.#changesUnderWay.set(key, pending);
 
         return pending;
+    }
+
+    /** A session's history as far as Changes reads it, oldest first, read from storage since the last look. */
+    async #editEntries(id: ConversationId): Promise<ClientEntry[]> {
+        const read = await this.#app.transcripts.entriesAfter(
+            id,
+            this.#edits.get(id)?.last ?? 0,
+            false,
+        );
+        // Another look may have read some of them meanwhile: keep each entry once, in order.
+        const known = this.#edits.get(id) ?? { last: 0, entries: [] };
+        const added = read.entries.flatMap((entry) => {
+            const facts = entry.id > known.last ? editFacts(entry) : undefined;
+
+            return facts === undefined ? [] : [facts];
+        });
+        const next = {
+            last: Math.max(known.last, read.last),
+            entries: added.length === 0 ? known.entries : [...known.entries, ...added],
+        };
+
+        this.#edits.delete(id);
+        this.#edits.set(id, next);
+
+        if (this.#edits.size > EDITS_KEPT) {
+            this.#edits.delete(this.#edits.keys().next().value!);
+        }
+
+        return next.entries;
     }
 
     /** Looks under way began before a file was undone: one asked from now on looks again. */
@@ -453,6 +517,7 @@ export class Workspace {
     /** The diff of one changed file in a session's repository. */
     async changeDiff(id: ConversationId, user: User, path: string): Promise<string> {
         this.#app.requireSee(user, id);
+        this.requireLocal(id);
         this.#app.requireSteer(user);
 
         try {

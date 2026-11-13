@@ -2,6 +2,8 @@
 // what was sent before (↑, Ctrl+R), fold long pastes, pick the model, stop.
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
 import { Avatar } from "./avatar.js";
+import { boxKey, keyBox } from "./box-keys.js";
+import { browserAvailable } from "./browser.js";
 import { chatUnread, TypingLine } from "./chat.js";
 import {
     loadTemplates,
@@ -12,8 +14,10 @@ import {
     slashAt,
     suggestCommands,
 } from "./commands.js";
+import { withQuote } from "./quote-text.js";
 import { loadFiles, mentionAt, mentionText, suggestFiles } from "./files.js";
 import { remember, searchHistory, sentHistory } from "./history.js";
+import { personStorage } from "./person-storage.js";
 import {
     actions,
     attempt,
@@ -23,24 +27,33 @@ import {
     navigate,
     notify,
     openSheet,
+    dropQuote,
+    giveBackQuote,
+    onItsWay,
     store,
+    takeInsert,
     typing,
     uid,
 } from "./store.js";
 import { useDock } from "./dock.js";
+import { defineItem, slotItems } from "./slots.js";
 import { SubagentsBar } from "./subagents.js";
 import { TrustBar } from "./trust.js";
 import { prefs } from "./theme.js";
+import { fingerprint } from "./text-hash.js";
+import { says } from "./turns.js";
 import { MicButton, useDictation } from "./voice.js";
 import {
     APPLE,
     contextLevel,
+    fileUrl,
     formatBytes,
     formatTokens,
     html,
     Icon,
     Marked,
     modelLabel,
+    shortModelName,
     Spinner,
 } from "./ui.js";
 
@@ -72,8 +85,6 @@ const coarse = matchMedia("(pointer: coarse)").matches;
 let openedByAlt = null;
 
 export const openingByAlt = (id) => (openedByAlt = APPLE ? id : null);
-/** The newest "Send to Pi" text already put into a message box (see `insertIntoComposer`). */
-let insertedUpTo = 0;
 
 /** Pasted text this long goes into the box as a placeholder; the message goes out with the text in its place. */
 const PASTE_LINES = 20;
@@ -85,25 +96,69 @@ const REMEMBER_CHARS = 20_000;
 const MENTIONS_FILE = /(?:^|[\s([{])@(?:"[^"\n]+"|[^\s"]*[./][^\s"]*)/;
 const INLINE_KEY = "pocket.inlineFiles";
 
-const pasteKey = (id) => `pocket.pastes.${id ?? "home"}`;
+const pasteKey = (id) => `pastes.${id ?? "home"}`;
 
 /** Each conversation's pastes by number, kept with its draft so a reload keeps them. */
 function loadPastes(id) {
     try {
-        return JSON.parse(localStorage.getItem(pasteKey(id)) ?? "{}");
+        return JSON.parse(personStorage.get(pasteKey(id)) ?? "{}");
     } catch {
         return {};
     }
 }
 
-function savePastes(id, pastes) {
+const attachedKey = (id) => `attached.${id ?? "home"}`;
+let attachmentsStopped = false;
+
+addEventListener("pocket:signedOut", () => {
+    attachmentsStopped = true;
+});
+
+/**
+ * Each conversation's uploaded files, kept with its draft: the browser drops a tab in the background, or reloads it after
+ * an update, and the files must still be there. A file still uploading is not kept: its upload ends with the page.
+ */
+function loadAttached(id) {
+    if (attachmentsStopped || !store.state.me?.id) {
+        return [];
+    }
+
     try {
-        if (Object.keys(pastes).length === 0) {
-            localStorage.removeItem(pasteKey(id));
-        } else {
-            localStorage.setItem(pasteKey(id), JSON.stringify(pastes));
-        }
+        const list = JSON.parse(personStorage.get(attachedKey(id)) ?? "[]");
+
+        return list.map(chipOf);
     } catch {
+        return [];
+    }
+}
+
+/** The box's chip of a file uploaded before. */
+const chipOf = (attachment) => ({
+    key: uid(),
+    name: attachment.name,
+    size: attachment.size,
+    state: "done",
+    preview: /^image\/(?!heic|heif)/.test(attachment.mime ?? "") ? fileUrl(attachment.path) : null,
+    attachment,
+});
+
+function saveAttached(id, files) {
+    if (attachmentsStopped || !store.state.me?.id) {
+        return;
+    }
+
+    const list = files.filter((file) => file.state === "done").map((file) => file.attachment);
+
+    personStorage.set(attachedKey(id), list.length === 0 ? null : JSON.stringify(list));
+}
+
+function savePastes(id, pastes) {
+    const saved = personStorage.set(
+        pasteKey(id),
+        Object.keys(pastes).length === 0 ? null : JSON.stringify(pastes),
+    );
+
+    if (!saved) {
         notify("warning", "This browser has no room to keep the paste after a reload.");
     }
 }
@@ -111,22 +166,166 @@ function savePastes(id, pastes) {
 /** The message with each paste's placeholder replaced by what was pasted. */
 const expandPastes = (text, pastes) => text.replace(PASTED, (whole, n) => pastes[n] ?? whole);
 
-/** The subagents whose answers a queued message of reports carries (`extensions/subagents.ts`); null for any other. */
-function reportNames(text) {
-    // Only a message that starts with a report is one: a person's own may begin "[subagent " too.
-    if (!/^\[subagent \S+ (?:answered|failed)/.test(text ?? "")) {
+/**
+ * Each conversation's message (or command) on its way, by its id: `{ text, quote, files }`, the box's words, its quote,
+ * and the paths of the files that go. It lives here, not in the box: a box shown again meanwhile (another route, Alt+A
+ * twice) holds it as on its way, and cannot send it twice. Its words and files stay in the draft until it went, and
+ * meanwhile its words are all the draft holds: what comes for the box (an insert, a queued message taken back) waits
+ * until it ended, so what leaves the draft once it went is only what went.
+ */
+const onTheWay = new Map();
+/** The boxes shown, each told when a message from its conversation went. */
+const sentListeners = new Set();
+/** The queued messages whose Edit is under way: a second tap meanwhile does nothing. */
+const takingBack = new Set();
+/** How many queued messages were taken back (`keepBack`): a box looks for one when it grows. */
+let takenBack = 0;
+/** The request ids of the sends that ended in this page (`endSend`). */
+const ended = new Set();
+
+const requestKey = (id) => `sendRequest.${id}`;
+const backKey = (id) => `takenBack.${id}`;
+
+/** The queued messages of conversation `id` taken back that no box took yet, oldest first. */
+function keptBack(id) {
+    try {
+        const list = JSON.parse(personStorage.get(backKey(id)) ?? "[]");
+
+        return Array.isArray(list) ? list : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * Keep `back`, a queued message of conversation `id` taken back (`{ text, attachments }`), in the
+ * person's storage until a box of `id` with no send on its way takes it: the box that asked can
+ * go meanwhile (another route, a session switch), or the page reload. Taken back during a send
+ * (`after`, its request id), it waits until that send ended: in this page, or elsewhere (another
+ * tab, before a reload) once its request id is gone. Before, the words of the box may go again.
+ */
+function keepBack(id, back) {
+    const after = onTheWay.get(id)?.requestId ?? null;
+    const kept = { text: back.text, attachments: back.attachments, after };
+
+    personStorage.set(backKey(id), JSON.stringify([...keptBack(id), kept]));
+    takenBack += 1;
+    store.set({});
+}
+
+/** The request id kept for conversation `id`, `{ what, requestId }`, or null. */
+function keptRequest(id) {
+    try {
+        const kept = JSON.parse(personStorage.get(requestKey(id)) ?? "null");
+
+        return typeof kept?.requestId === "string" ? kept : null;
+    } catch {
+        // A damaged value is no request id: a new one replaces it.
+        return null;
+    }
+}
+
+/**
+ * The request id of `message` (what goes: its kind, words, and files) with `quote` from
+ * conversation `id`. It is kept with the draft in the person's storage until the send went
+ * (`endSend`), or the person changes the words (`edit`). Sent again before, from a box shown
+ * again or after a reload, it goes with the same id, and the server gives back its first send
+ * instead of a second; a refusal stored nothing, so the same id goes as new. A reload loses the
+ * quote: the same words without one are the same message, and with another quote a new one.
+ */
+function requestFor(id, message, quote) {
+    const what = fingerprint(JSON.stringify(message));
+    const about = quote ? fingerprint(quote) : null;
+    const kept = keptRequest(id);
+
+    if (kept?.what === what && (about === null || kept.about === about)) {
+        return kept.requestId;
+    }
+
+    const requestId = uid();
+
+    personStorage.set(requestKey(id), JSON.stringify({ what, about, requestId }));
+
+    return requestId;
+}
+
+/**
+ * Start a send of `record` from conversation `id`'s box, with the request id of `message` (`record.requestId`; none for
+ * a command that runs in the browser); null while one is on its way from there.
+ */
+function beginSend(id, record, message) {
+    if (onTheWay.has(id)) {
         return null;
     }
 
-    return [
-        ...new Set(
-            [...text.matchAll(/\[subagent (\S+) (?:answered|failed)/g)].map((match) => match[1]),
-        ),
-    ];
+    record.requestId = message === null ? undefined : requestFor(id, message, record.quote?.text);
+    onTheWay.set(id, record);
+    store.set({});
+
+    return record;
 }
 
-/** The subagents a waiting message carries reports from; null for a person's message, which has who sent it. */
-const queuedReports = (item) => (item.by === undefined ? reportNames(item.text) : null);
+/**
+ * The send of `record` from `id` ended. Once it went, its words, pastes, and files leave the draft, and what was put in
+ * meanwhile stays; if it did not go, the words and files are still there, and its quote comes back.
+ */
+function endSend(id, record, went) {
+    onTheWay.delete(id);
+    ended.add(record.requestId);
+
+    // It went: its request id is done with.
+    if (went && keptRequest(id)?.requestId === record.requestId) {
+        personStorage.set(requestKey(id), null);
+    }
+
+    if (went) {
+        // The draft held only what went, unless another tab wrote it since: that stays.
+        if (drafts.get(id) === record.text) {
+            drafts.set(id, "");
+            savePastes(id, {});
+        }
+
+        saveAttached(
+            id,
+            loadAttached(id).filter((file) => !record.files.includes(file.attachment.path)),
+        );
+        sentListeners.forEach((listener) => listener(id, record));
+    } else {
+        giveBackQuote(record.quote, false, id);
+    }
+
+    store.set({});
+}
+
+/**
+ * The subagents a waiting message carries reports from (`extensions/subagents.ts`), as the server reads them from its
+ * whole text: the queue gets only the start. Null for any other message, such as a person's, which has who sent it.
+ */
+const queuedReports = (item) => item.reports ?? null;
+
+/** How a message can go while Pi works: the value the server takes, its label, and what it does. */
+const SEND_MODES = [
+    ["steer", "Steer", "Pi reads it now, between steps"],
+    ["followUp", "Queue", "Pi reads it when this run ends"],
+    [
+        "interrupt",
+        "Interrupt",
+        "Stops the run right now (also its tool call), then sends it. The queued messages stay queued",
+    ],
+];
+
+/** What a send mode does, for a queued message's buttons. */
+const modeHint = (mode) => SEND_MODES.find(([value]) => value === mode)[2];
+
+/** What Interrupt does to a message waiting in the queue: the others there stay queued. */
+const QUEUED_INTERRUPT_HINT =
+    "Stops the run right now (also its tool call), then sends this one. The other queued messages stay queued";
+
+/**
+ * Whether a queued message's Interrupt asks first: the first tap reads "Interrupt now?", a second within 4 s sends it.
+ * Set to false to send it on the first tap.
+ */
+const CONFIRM_INTERRUPT = true;
 
 /** What kind of message waits for Pi: a steer, one queued for after its answer, a note, or subagents' reports. */
 function queuedMode(item) {
@@ -144,6 +343,15 @@ const FROM = /^\[from: [^\]\n]{1,60}\] /;
 
 /** What a waiting message says (its row names who sent it); subagents' reports say whose, as their text is long. */
 function queuedText(item) {
+    // An input an extension presents: its label and summary, as the transcript shows it, never its body.
+    if (typeof item.label === "string" && item.label !== "") {
+        return html`<span class="presented-label">${item.label}</span>${
+            typeof item.summary === "string" &&
+            item.summary !== "" &&
+            html`<span class="presented-summary"> · ${item.summary}</span>`
+        }`;
+    }
+
     const names = queuedReports(item);
 
     if (!names) {
@@ -176,7 +384,7 @@ function DriverBar() {
         );
 
         return html`<div class="driver-bar mine">
-            <span class="driver-label">🚗 You're driving</span>
+            <span class="driver-label"><${Icon} name="wheel" size=${14} /> You're driving</span>
             ${turns.asks.map(
                 (id) => html`<span class="driver-ask">
                     ${name(id)} asks to drive <button class="link small" onClick=${() => run("handover", id)}>Hand over</button>
@@ -211,7 +419,8 @@ function DriverBar() {
 
     return html`<div class="driver-bar">
         <span class="driver-label">
-            ${turns.driver === undefined ? "🚗 No one is driving" : `🚗 ${name(turns.driver)} is driving${driverHere ? "" : " (away)"}`}
+            <${Icon} name="wheel" size=${14} />
+            ${turns.driver === undefined ? "No one is driving" : `${name(turns.driver)} is driving${driverHere ? "" : " (away)"}`}
         </span>
         <span class="grow"></span>
         ${
@@ -231,6 +440,87 @@ function DriverBar() {
 }
 
 /** Plan mode: Pi proposes and changes nothing until someone here approves its plan. */
+/**
+ * What a Stop held out of the queue: it waits until someone sends it. Send sends them all, in their order; Show lists
+ * them, each with Edit (its sender's) and a × to withdraw it.
+ */
+function HeldBar({ blocked, onEdit }) {
+    const { view, me, users } = store.state;
+    const held = view.held ?? [];
+    const [open, setOpen] = useState(false);
+
+    if (held.length === 0) {
+        return null;
+    }
+
+    const steer = canSteer();
+    const heldBy = (item) =>
+        item.by === undefined
+            ? ""
+            : item.by === me?.id
+              ? " · you"
+              : ` · ${users.find((user) => user.id === item.by)?.name ?? "someone"}`;
+
+    return html`<div class="held-bar" data-part="held">
+        <span class="grow">
+            <strong>${held.length === 1 ? "1 message held." : `${held.length} messages held.`}</strong> Stop kept ${held.length === 1 ? "it" : "them"} from Pi until sent.
+        </span>
+        <button class="link small" aria-expanded=${open} onClick=${() => setOpen(!open)}>
+            ${open ? "Hide" : "Show"}
+        </button>
+        ${
+            steer &&
+            !blocked &&
+            html`<button
+                class="button small primary"
+                title="Send them to Pi, in their order"
+                onClick=${() => attempt(actions.sendHeld)}
+            >
+                Send
+            </button>`
+        }
+        ${
+            open &&
+            html`<div class="held-list">
+                ${held.map(
+                    (item) => html`<div class="queued" key=${item.key}>
+                        <span class="queued-mode">
+                            ${item.mode === "steer" ? "Steer" : "Queue"}
+                            <span class="muted">${heldBy(item)}</span>
+                        </span>
+                        <span class="queued-text">${(item.text ?? "").replace(FROM, "")}</span>
+                        ${
+                            steer &&
+                            !blocked &&
+                            item.by !== undefined &&
+                            item.by === me?.id &&
+                            html`<button
+                                class="link small"
+                                title="Take it back into the message box to change it"
+                                onClick=${() => onEdit(item)}
+                            >
+                                Edit
+                            </button>`
+                        }
+                        ${
+                            steer &&
+                            (!blocked || item.by === me?.id) &&
+                            html`<button
+                                class="icon-button small queued-remove"
+                                aria-label="Withdraw"
+                                title="Withdraw: Pi will not get it"
+                                onClick=${() => attempt(() => actions.dropHeld(item.key))}
+                            >
+                                <${Icon} name="close" size=${13} />
+                            </button>`
+                        }
+                    </div>`,
+                )}
+            </div>`
+        }
+    </div>`;
+}
+
 function PlanBar({ blocked }) {
     const { view } = store.state;
 
@@ -240,6 +530,16 @@ function PlanBar({ blocked }) {
 
     // A subagent follows its session's plan mode; it is approved there.
     const subagent = view.conversation?.kind === "subagent";
+    // There is a plan to approve once Pi has answered since plan mode went on.
+    const proposed =
+        view.plan.at === undefined ||
+        [...view.entries.values()].some(
+            (entry) =>
+                entry.kind === "assistant" &&
+                entry.at > view.plan.at &&
+                entry.stopReason !== "toolUse" &&
+                entry.blocks.some(says),
+        );
 
     return html`<div class="plan-bar">
         <span class="grow">
@@ -253,7 +553,8 @@ function PlanBar({ blocked }) {
             </button>
             <button
                 class="button small primary"
-                disabled=${view.live.busy}
+                disabled=${view.live.busy || !proposed}
+                title=${proposed ? undefined : "Pi has not proposed a plan yet."}
                 onClick=${() => attempt(actions.approvePlan)}
             >
                 Approve plan
@@ -349,10 +650,15 @@ function WatchBar() {
 
 export function Composer() {
     const { view, conversationId } = store.state;
+    const historyScope = { person: store.state.me?.id, conversation: conversationId };
     const [text, setText] = useState(() => drafts.get(conversationId));
-    const [files, setFiles] = useState([]);
-    const [steer, setSteer] = useState(true);
-    const [sending, setSending] = useState(false);
+    const [files, setFiles] = useState(() => loadAttached(conversationId));
+    // How a message goes while Pi works: "steer", "followUp" (Queue), or "interrupt" (stop the run, then send).
+    const [sendMode, setSendMode] = useState("steer");
+    // The queued message tapped open, wrapped: one line each until then. The queue holds only a message's start.
+    const [reading, setReading] = useState(null);
+    // The queued message whose Interrupt was tapped once (`CONFIRM_INTERRUPT`).
+    const [interrupting, setInterrupting] = useState(null);
     // Slash command suggestions: the highlighted one, and whether Escape hid the list.
     const [pick, setPick] = useState(0);
     const [hideCommands, setHideCommands] = useState(false);
@@ -365,25 +671,134 @@ export function Composer() {
     const [searching, setSearching] = useState(false);
     const [inlineFiles, setInlineFiles] = useState(() => localStorage.getItem(INLINE_KEY) === "1");
     const box = useRef(null);
-    // The box as it comes and goes (taking the wheel shows it, with the draft in it): fitted to its text at once.
-    const [setBox] = useState(() => (element) => {
-        box.current = element;
-        fitBox(element);
+    // The box as it comes and goes (taking the wheel shows it, with the draft in it): fitted to its text at once, and
+    // again when its width changes, which can come after the window's resize (the Peek column becoming a strip).
+    const [setBox] = useState(() => {
+        let width = -1;
+        // A new width only (fitting changes the box's height, which this hears too), fitted a frame later.
+        const observer = new ResizeObserver(([entry]) => {
+            if (entry.contentRect.width !== width) {
+                width = entry.contentRect.width;
+                requestAnimationFrame(() => fitBox(box.current));
+            }
+        });
+
+        return (element) => {
+            box.current = element;
+            // A frame later, not now: measuring in the middle of a render lays the whole page out early, and again for
+            // the frame, which on a phone made opening a session freeze longer. Still before the frame is painted.
+            requestAnimationFrame(() => fitBox(element));
+            observer.disconnect();
+            width = -1;
+
+            if (element) {
+                observer.observe(element);
+            }
+        };
     });
     // Dictation writes into the box as typing does, so the draft keeps what was heard.
     const dictation = useDictation(box, (value, at) => {
         setBrowsing(null);
-        update(value, at);
+        edit(value, at);
     });
     // What is above the message box, and how it shares the room with the conversation (`dock.js`).
     const dock = useRef(null);
     const picker = useRef(null);
     const list = useRef(null);
-    // One per `!` command: sending it again after a lost reply runs it once.
-    const requestId = useRef(uid());
     const busy = view.live.busy;
     const agent = view.agent;
+    // The message on its way from here (`onTheWay`): the box holds it, read only, until it went.
+    const going = onTheWay.get(conversationId);
+    const sending = going !== undefined;
 
+    // An Interrupt is for the run it was chosen in: when Pi stops working, an unused one goes back to Steer, so it does
+    // not stop the next run. Steer and Queue stay as the person chose.
+    useEffect(() => {
+        if (!busy) {
+            setSendMode((mode) => (mode === "interrupt" ? "steer" : mode));
+        }
+    }, [busy]);
+    // A queued message's Interrupt asks for a second tap for a few seconds only, as Undo in a diff does.
+    useEffect(() => {
+        if (interrupting === null) {
+            return;
+        }
+
+        const timer = setTimeout(() => setInterrupting(null), 4000);
+
+        return () => clearTimeout(timer);
+    }, [interrupting]);
+    useEffect(() => saveAttached(conversationId, files), [files]);
+    useEffect(() => {
+        const clear = () => setFiles([]);
+
+        addEventListener("pocket:signedOut", clear);
+
+        return () => removeEventListener("pocket:signedOut", clear);
+    }, []);
+    // A message from here went (sent by this box, or by the one before it showed again): it leaves the box.
+    useEffect(() => {
+        const went = (id, record) => {
+            if (id !== conversationId) {
+                return;
+            }
+
+            setBrowsing(null);
+            update(drafts.get(id));
+            setPastes(loadPastes(id));
+            setFiles((current) => {
+                const gone = current.filter((file) => record.files.includes(file.attachment?.path));
+
+                forget(gone);
+
+                return current.filter((file) => !gone.includes(file));
+            });
+        };
+
+        sentListeners.add(went);
+
+        return () => sentListeners.delete(went);
+    }, [conversationId]);
+    // The request id kept for the box's words: a change ends the wait of what was taken back.
+    const request = keptRequest(conversationId)?.requestId;
+
+    // The queued messages of this conversation taken back (`keepBack`) go before the box's words,
+    // once no send is on its way.
+    useEffect(() => {
+        // Read now, not at the render: a send can begin between the two.
+        const all = onTheWay.has(conversationId) ? [] : keptBack(conversationId);
+        const now = keptRequest(conversationId)?.requestId;
+        const ready = (back) => !back.after || back.after !== now || ended.has(back.after);
+        const list = all.filter(ready);
+
+        if (list.length === 0) {
+            return;
+        }
+
+        const waiting = all.filter((back) => !ready(back));
+
+        personStorage.set(
+            backKey(conversationId),
+            waiting.length === 0 ? null : JSON.stringify(waiting),
+        );
+        let words = drafts.get(conversationId);
+        let chips = [];
+
+        for (const back of list) {
+            words = words.trim() === "" ? back.text : `${back.text}\n${words}`;
+            chips = [...back.attachments.map(chipOf), ...chips];
+        }
+
+        const at = list.at(-1).text.length;
+
+        setReading(null);
+        update(words, at);
+        setFiles((current) => [...chips, ...current]);
+        requestAnimationFrame(() => {
+            box.current?.focus();
+            box.current?.setSelectionRange(at, at);
+        });
+    }, [conversationId, sending, takenBack, request]);
     useEffect(() => {
         const draft = drafts.get(conversationId);
 
@@ -417,27 +832,19 @@ export function Composer() {
     const insert = store.state.composerInsert;
 
     useEffect(() => {
-        if (!insert || insert.n <= insertedUpTo) {
+        // It waits while a send is on its way: the box then holds only what goes.
+        const taken =
+            insert && !sending ? takeInsert(drafts.get(conversationId), conversationId) : null;
+
+        if (taken?.files.length > 0) {
+            addFiles(taken.files);
+        }
+
+        if (!taken?.text) {
             return;
         }
 
-        insertedUpTo = insert.n;
-
-        if (insert.files?.length > 0) {
-            addFiles(insert.files);
-        }
-
-        if (insert.text === "") {
-            return;
-        }
-
-        const current = drafts.get(conversationId);
-
-        update(
-            current.trim() === ""
-                ? insert.text
-                : `${current.replace(/\s+$/, "")}${insert.inline ? " " : "\n\n"}${insert.text}`,
-        );
+        update(taken.text);
         requestAnimationFrame(() => {
             const element = box.current;
 
@@ -448,16 +855,22 @@ export function Composer() {
             element.focus();
             element.setSelectionRange(element.value.length, element.value.length);
         });
-    }, [insert?.n]);
-    // Again when the text size changes (Appearance), which changes the lines' height.
+    }, [insert?.n, sending, conversationId]);
     useEffect(() => {
         const fit = () => fitBox(box.current);
 
         fit();
         addEventListener("resize", fit);
+        // A theme's font wraps the text another way, once its stylesheets or the font itself have loaded.
+        document.addEventListener("pocket:theme", fit);
+        document.fonts?.addEventListener("loadingdone", fit);
 
-        return () => removeEventListener("resize", fit);
-    }, [text, prefs().text]);
+        return () => {
+            removeEventListener("resize", fit);
+            document.removeEventListener("pocket:theme", fit);
+            document.fonts?.removeEventListener("loadingdone", fit);
+        };
+    }, [text]);
 
     const update = (value, at = value.length) => {
         setText(value);
@@ -477,10 +890,33 @@ export function Composer() {
 
         // A command is not a message to Pi: no "typing to Pi" for it.
         typing(value.trim() === "" || value.startsWith("/") ? null : "pi");
+
+        if (value.trim() !== "" && !value.startsWith("/") && canSteer()) {
+            warmSoon(conversationId);
+        }
+    };
+
+    /**
+     * The box's own change of its words (typing, dictation, history, a suggestion, a module's key): none while they are
+     * on their way (`onItsWay`). What comes from elsewhere (`insertIntoComposer`, Edit on a queued message) goes in, once
+     * they went or did not.
+     */
+    const edit = (value, at) => {
+        if (onTheWay.has(conversationId)) {
+            return;
+        }
+
+        // Changed words are a new message, also when typed again the same: not one sent again
+        // after a lost answer.
+        if (value !== text && keptRequest(conversationId)) {
+            personStorage.set(requestKey(conversationId), null);
+        }
+
+        update(value, at);
     };
 
     // Ctrl+R: what was sent before that has the words in the box.
-    const recalled = searching ? searchHistory(text) : [];
+    const recalled = searching ? searchHistory(text, historyScope) : [];
     const chosenRecall = recalled[Math.min(pick, recalled.length - 1)];
     const slash = slashAt(text, caret);
     const suggestions = hideCommands || searching ? [] : suggestCommands(text, caret);
@@ -532,19 +968,25 @@ export function Composer() {
         });
 
     /** Run a slash command. The text goes away once it worked; attached files stay for the next message. */
-    const runCommand = async ({ command, arg }) => {
-        setSending(true);
+    const runCommand = async ({ command, arg }, sent) => {
+        // Only an extension's command runs on the server, which finds a first run by its request id.
+        const record = beginSend(
+            conversationId,
+            { text, quote: null, files: [] },
+            command.extension ? ["command", command.id, sent] : null,
+        );
+
+        if (!record) {
+            return;
+        }
+
         const ok = await attempt(async () => {
-            await command.run(arg);
+            await command.run(arg, record.requestId);
 
             return true;
         });
 
-        setSending(false);
-
-        if (ok) {
-            update("");
-        }
+        endSend(conversationId, record, Boolean(ok));
     };
 
     /**
@@ -557,7 +999,7 @@ export function Composer() {
         const space = item.dir || /^\s/.test(rest) ? "" : " ";
         const at = mention.start + written.length + (item.dir ? 0 : 1);
 
-        update(`${text.slice(0, mention.start)}${written}${space}${rest}`, at);
+        edit(`${text.slice(0, mention.start)}${written}${space}${rest}`, at);
         requestAnimationFrame(() => {
             const element = box.current;
 
@@ -596,10 +1038,12 @@ export function Composer() {
         }
 
         if (command.args || command.template) {
-            update(`/${command.name} `);
+            edit(`/${command.name} `);
             focusEnd();
+        } else if (store.state.replyQuote) {
+            notify("info", "A quote cannot go with a command. Remove the quote to run it.");
         } else {
-            runCommand({ command, arg: "" });
+            runCommand({ command, arg: "" }, `/${command.name}`);
         }
     };
 
@@ -617,18 +1061,15 @@ export function Composer() {
     const canSend =
         !sending &&
         !uploading &&
-        (text.trim() !== "" || files.some((file) => file.state === "done"));
+        (text.trim() !== "" ||
+            store.state.replyQuote ||
+            files.some((file) => file.state === "done"));
 
-    /** What went out stays for ↑; its pastes are done with. */
+    /** What went out stays for ↑. */
     const sent = (full) => {
         if (full.length <= REMEMBER_CHARS) {
-            remember(full);
+            remember(full, historyScope);
         }
-
-        setPastes({});
-        savePastes(conversationId, {});
-        setBrowsing(null);
-        update("");
     };
 
     /** Run `!command` in the session's folder. Its entry shows once it is done; until then, a row says it runs. */
@@ -639,12 +1080,17 @@ export function Composer() {
             return notify("info", "Say which command to run, such as !git status.");
         }
 
-        setSending(true);
+        const record = beginSend(conversationId, { text, quote: null, files: [] }, ["shell", full]);
+
+        if (!record) {
+            return;
+        }
+
         const started = await attempt(() =>
-            actions.shell(command, !full.startsWith("!!"), requestId.current),
+            actions.shell(command, !full.startsWith("!!"), record.requestId),
         );
 
-        setSending(false);
+        endSend(conversationId, record, Boolean(started));
 
         if (!started) {
             return;
@@ -656,13 +1102,21 @@ export function Composer() {
                 { taskId: started.taskId, command, conversationId, at: Date.now() },
             ],
         }));
-        requestId.current = uid();
         sent(full);
     };
 
-    const send = async () => {
+    // `other`: Ctrl/⌘+Enter, which sends the other way round (Steer and Queue swap; Interrupt stays).
+    const send = async (other = false) => {
         if (!canSend) {
             return;
+        }
+
+        // A command runs or expands only when it starts the message: a quote in front would stop that.
+        if (
+            store.state.replyQuote &&
+            (parsed || shell || template || text.trimStart().startsWith("/skill:"))
+        ) {
+            return notify("info", "A quote cannot go with a command. Remove the quote to run it.");
         }
 
         // What shows is what goes: words still coming would land in the emptied box.
@@ -671,35 +1125,61 @@ export function Composer() {
 
         if (parsed) {
             if (full.length <= REMEMBER_CHARS) {
-                remember(full);
+                remember(full, historyScope);
             }
 
-            return runCommand(parseCommand(full) ?? parsed);
+            return runCommand(parseCommand(full) ?? parsed, full);
         }
 
         if (shell) {
             return runShell(full);
         }
 
-        setSending(true);
+        // The quote goes with the message, out of its box at once: no box shown again meanwhile offers it.
+        const quote = store.state.replyQuote;
         const attachments = files
             .filter((file) => file.state === "done")
             .map((file) => file.attachment);
+        const paths = attachments.map((attachment) => attachment.path);
+        // The message is its words and files, which a reload keeps; its quote, which lives in this
+        // page only, is apart.
+        const record = beginSend(conversationId, { text, quote, files: paths }, [
+            "message",
+            full,
+            paths,
+        ]);
+
+        if (!record) {
+            return;
+        }
+
+        dropQuote(quote);
         const ok = await attempt(() =>
             actions.submit(
-                full,
+                withQuote(quote?.text, full),
                 attachments,
-                busy && steer ? "steer" : "followUp",
+                busy
+                    ? other === true && sendMode !== "interrupt"
+                        ? sendMode === "steer"
+                            ? "followUp"
+                            : "steer"
+                        : sendMode
+                    : "followUp",
                 inlineFiles && mentionsFiles,
+                record.requestId,
             ),
         );
 
-        setSending(false);
+        // Files pasted while it went stay for the next message.
+        endSend(conversationId, record, Boolean(ok));
 
         if (ok) {
+            // Interrupting stops the run: do not let the next message stop one by habit.
+            if (sendMode === "interrupt") {
+                setSendMode("steer");
+            }
+
             sent(full);
-            forget(files);
-            setFiles([]);
 
             if (!coarse) {
                 box.current?.focus();
@@ -707,9 +1187,42 @@ export function Composer() {
         }
     };
 
+    // Edit on a queued message: it comes back for this conversation, also when another shows by
+    // then (another session, PiP's board), and waits there (`keepBack`).
+    const editQueued = async (item) => {
+        if (takingBack.has(item.id)) {
+            return;
+        }
+
+        takingBack.add(item.id);
+        const back = await attempt(() => actions.editQueued(item.id, conversationId));
+
+        takingBack.delete(item.id);
+
+        if (back) {
+            keepBack(conversationId, back);
+        }
+    };
+
+    // Edit on a held message: the same, for one a Stop held.
+    const editHeld = async (item) => {
+        if (takingBack.has(item.key)) {
+            return;
+        }
+
+        takingBack.add(item.key);
+        const back = await attempt(() => actions.editHeld(item.key, conversationId));
+
+        takingBack.delete(item.key);
+
+        if (back) {
+            keepBack(conversationId, back);
+        }
+    };
+
     /** Put a message sent before into the box, to send again or change. */
     const recall = (value, at = value.length) => {
-        update(value, at);
+        edit(value, at);
         requestAnimationFrame(() => box.current?.setSelectionRange(at, at));
     };
 
@@ -725,7 +1238,7 @@ export function Composer() {
             return false;
         }
 
-        const list = sentHistory();
+        const list = sentHistory(historyScope);
 
         if (event.key === "ArrowUp") {
             const starts =
@@ -767,6 +1280,18 @@ export function Composer() {
     };
 
     const onKey = (event) => {
+        // A module's key (`pocket.composerKey`) comes first: it may take any key, the box's own too.
+        const keyed = keyBox(event.currentTarget, "session", (value, start, end) => {
+            edit(value, start);
+            requestAnimationFrame(() => box.current?.setSelectionRange(start, end));
+        });
+
+        if (boxKey(event, keyed)) {
+            event.preventDefault();
+
+            return;
+        }
+
         if (
             event.ctrlKey &&
             !event.metaKey &&
@@ -901,9 +1426,15 @@ export function Composer() {
             return;
         }
 
-        if (event.key === "Enter" && !event.shiftKey && !coarse && !event.isComposing) {
+        const chord = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+
+        if (
+            event.key === "Enter" &&
+            !event.isComposing &&
+            (chord || (!event.shiftKey && !coarse))
+        ) {
             event.preventDefault();
-            send();
+            send(chord);
         }
     };
 
@@ -950,7 +1481,7 @@ export function Composer() {
         const value = event.clipboardData?.getData("text/plain") ?? "";
         const lines = value.replace(/\n$/, "").split("\n").length;
 
-        if (lines <= PASTE_LINES && value.length <= PASTE_CHARS) {
+        if (sending || (lines <= PASTE_LINES && value.length <= PASTE_CHARS)) {
             return;
         }
 
@@ -970,12 +1501,15 @@ export function Composer() {
         );
     };
 
+    const shownQuote = going?.quote ?? store.state.replyQuote;
     const placeholder = dictation.listening
         ? "Listening…"
         : busy
-          ? steer
+          ? sendMode === "steer"
               ? "Steer the current run…"
-              : "Queue a message for after this run…"
+              : sendMode === "interrupt"
+                ? "Stop the run and send this now…"
+                : "Queue a message for after this run…"
           : "Ask Pi anything…";
     const inbox = view.inbox ?? [];
     const { me, users } = store.state;
@@ -997,8 +1531,8 @@ export function Composer() {
     }, [writes]);
 
     if (collab() && !canSteer()) {
-        return html`<footer class="composer-wrap">
-            <div class="dock" ref=${dock}>
+        return html`<footer class="composer-wrap" data-part="composer">
+            <div class="dock" data-part="dock" ref=${dock}>
                 <${TypingLine} where="pi" />
                 <${SubagentsBar} />
             </div>
@@ -1022,9 +1556,10 @@ export function Composer() {
             ? agent.thinkingLevel
             : null;
 
-    return html`<footer class="composer-wrap">
-        <div class="dock" ref=${dock}>
+    return html`<footer class="composer-wrap" data-part="composer">
+        <div class="dock" data-part="dock" ref=${dock}>
             <${TypingLine} where="pi" />
+            <${HeldBar} blocked=${blocked} onEdit=${editHeld} />
             ${
                 // How many wait: shown when the queue does not show them all (`dock.js`).
                 inbox.length > 0 &&
@@ -1041,7 +1576,13 @@ export function Composer() {
                                 ${queuedMode(item)}
                                 <span class="muted">${queuedBy(item)}</span>
                             </span>
-                            <span class="queued-text">${queuedText(item)}</span>
+                            <button
+                                class=${`queued-text ${reading === item.id ? "open" : ""}`}
+                                aria-expanded=${reading === item.id}
+                                onClick=${() => setReading(reading === item.id ? null : item.id)}
+                            >
+                                ${queuedText(item)}
+                            </button>
                             ${
                                 canSteer() &&
                                 (!blocked || item.by === me?.id) &&
@@ -1053,6 +1594,58 @@ export function Composer() {
                                 >
                                     <${Icon} name="close" size=${13} />
                                 </button>`
+                            }
+                            ${
+                                // Tapped open, one's own message: move it, or send it now. Only its sender can.
+                                reading === item.id &&
+                                item.by !== undefined &&
+                                item.by === me?.id &&
+                                canSteer() &&
+                                !blocked &&
+                                (item.mode === "steer" || item.mode === "followUp") &&
+                                html`<div class="queued-actions">
+                                    <button
+                                        class="button small"
+                                        title="Take it back into the message box to change it"
+                                        onClick=${() => editQueued(item)}
+                                    >
+                                        Edit
+                                    </button>
+                                    <button
+                                        class="button small"
+                                        title=${modeHint(item.mode === "steer" ? "followUp" : "steer")}
+                                        onClick=${() =>
+                                            attempt(() =>
+                                                actions.move(
+                                                    item.id,
+                                                    item.mode === "steer" ? "followUp" : "steer",
+                                                ),
+                                            )}
+                                    >
+                                        ${item.mode === "steer" ? "Move to queue" : "Steer now"}
+                                    </button>
+                                    <button
+                                        class=${`button small ${interrupting === item.id ? "danger" : ""}`}
+                                        title=${
+                                            interrupting === item.id
+                                                ? "Tap again to stop the run and send this now. The other queued messages stay queued"
+                                                : QUEUED_INTERRUPT_HINT
+                                        }
+                                        onClick=${() => {
+                                            if (CONFIRM_INTERRUPT && interrupting !== item.id) {
+                                                setInterrupting(item.id);
+
+                                                return;
+                                            }
+
+                                            // A third quick tap must not send it again.
+                                            setInterrupting(null);
+                                            void attempt(() => actions.move(item.id, "interrupt"));
+                                        }}
+                                    >
+                                        ${interrupting === item.id ? "Interrupt now?" : "Interrupt now"}
+                                    </button>
+                                </div>`
                             }
                         </div>`,
                     )}
@@ -1084,7 +1677,7 @@ export function Composer() {
                           ref=${list}
                       >
                           <div class="file-note">
-                              Sent before${text.trim() ? ` with “${text.trim()}”` : ""} · Enter puts it in the box · Esc closes
+                              Sent in this session${text.trim() ? ` with “${text.trim()}”` : ""} · Enter puts it in the box · Esc closes
                           </div>
                           ${recalled.map(
                               (each) => html`<button
@@ -1105,7 +1698,7 @@ export function Composer() {
                           ${
                               recalled.length === 0 &&
                               html`<div class="file-note">
-                                  Nothing sent from this browser matches.
+                                  Nothing you sent from this browser in this session matches.
                               </div>`
                           }
                       </div>`
@@ -1229,7 +1822,9 @@ export function Composer() {
                     </div>`
                 }
                 <div
-                    class=${`composer ${busy ? "busy" : ""} ${filled ? "filled" : ""}`}
+                    class=${`composer ${busy ? "busy" : ""} ${filled ? "filled" : ""} ${sending ? "sending" : ""}`}
+                    data-part="message-box"
+                    aria-busy=${sending ? "true" : undefined}
                     onClick=${(event) => {
                         // The box is one target: a tap on its edge, around the files sent along, between its buttons,
                         // or on Send with nothing to send (a disabled button takes no taps), goes to the text.
@@ -1256,12 +1851,31 @@ export function Composer() {
                                 ) => html`<span class=${`chip ${file.preview ? "with-thumb" : ""}`}>
                                     ${
                                         file.preview &&
-                                        html`<img class="chip-thumb" src=${file.preview} alt="" />`
+                                        html`<img
+                                            class="chip-thumb"
+                                            src=${file.preview}
+                                            alt=""
+                                            onError=${() => {
+                                                // A browser that cannot decode the photo (HEIC in Chromium)
+                                                // shows the file's chip instead of a broken image.
+                                                URL.revokeObjectURL(file.preview);
+                                                setFiles((current) =>
+                                                    current.map((each) =>
+                                                        each.key === file.key
+                                                            ? { ...each, preview: null }
+                                                            : each,
+                                                    ),
+                                                );
+                                            }}
+                                        />`
                                     }
-                                    ${file.state === "uploading" ? html`<${Spinner} />` : file.preview ? "" : "📎"} ${file.name} <span class="muted">${formatBytes(file.size)}</span>
+                                    ${file.state === "uploading" ? html`<${Spinner} />` : file.preview ? "" : html`<${Icon} name="clip" size=${13} />`}
+                                    <span class="chip-name" title=${file.name}>${file.name}</span>
+                                    <span class="muted">${formatBytes(file.size)}</span>
                                     <button
                                         class="icon-button small"
                                         aria-label=${`Remove ${file.name}`}
+                                        disabled=${onItsWay(going?.files, file.attachment?.path)}
                                         onClick=${() => {
                                             forget([file]);
                                             setFiles((current) =>
@@ -1275,14 +1889,30 @@ export function Composer() {
                             )}
                         </div>`
                     }
+                    ${
+                        shownQuote &&
+                        html`<div class="quote-strip" data-part="quote-strip">
+                            <${Icon} name="reply" size=${13} />
+                            <span class="quote-strip-text">${shownQuote.text}</span>
+                            <button
+                                class="icon-button small"
+                                aria-label="Remove the quote"
+                                disabled=${onItsWay(going && [going.quote], shownQuote)}
+                                onClick=${() => dropQuote(shownQuote)}
+                            >
+                                <${Icon} name="close" size=${12} />
+                            </button>
+                        </div>`
+                    }
                     <textarea
                         ref=${setBox}
                         rows="1"
                         value=${text}
+                        readonly=${sending}
                         placeholder=${placeholder}
                         onInput=${(event) => {
                             setBrowsing(null);
-                            update(event.currentTarget.value, event.currentTarget.selectionStart);
+                            edit(event.currentTarget.value, event.currentTarget.selectionStart);
                         }}
                         onKeyDown=${onKey}
                         onKeyUp=${(event) => setCaret(event.currentTarget.selectionStart)}
@@ -1291,16 +1921,8 @@ export function Composer() {
                         onPaste=${onPaste}
                         enterkeyhint=${coarse ? "enter" : "send"}
                     ></textarea>
-                    <div class="composer-row">
-                        <${PlacesButton} />
-                        <button
-                            class="icon-button attach-button"
-                            aria-label="Attach files"
-                            title="Attach files"
-                            onClick=${() => picker.current?.click()}
-                        >
-                            <${Icon} name="clip" size=${17} />
-                        </button>
+                    <div class="composer-row" data-part="composer-tools">
+                        ${slotItems("composer", { picker, agent, level, view }).map(({ node }) => node)}
                         <input
                             ref=${picker}
                             type="file"
@@ -1311,84 +1933,59 @@ export function Composer() {
                                 event.currentTarget.value = "";
                             }}
                         />
-                        <button
-                            class=${`model-chip ${agent?.available === false ? "warn" : ""}`}
-                            aria-label=${`Model: ${modelLabel(agent)}${level ? `, thinking ${level}` : ""}`}
-                            title=${`Model and thinking: ${modelLabel(agent)}${level ? `, ${level}` : ""}`}
-                            onClick=${() => openSheet({ type: "model" })}
-                        >
-                            <${Icon} name="sparkle" size=${12} class="model-spark" />
-                            <span class="model-name">${view.router ? view.router.label : shortModel(agent)}</span>
-                            ${level && html`<span class="model-level">${level}</span>`}
-                        </button>
-                        ${
-                            view.subagentPolicy &&
-                            view.conversation?.kind !== "subagent" &&
-                            html`<button
-                                class=${`chip subagents-chip ${view.subagentPolicy.allowed.length > 0 ? "on" : ""}`}
-                                title=${`Subagents: ${view.subagentPolicy.label}. ${view.subagentPolicy.allowed.length === 0 ? "They run on this session's model." : `They may also run on ${view.subagentPolicy.allowed.join(", ")}.`}`}
-                                aria-label=${`Subagents: ${view.subagentPolicy.label}`}
-                                onClick=${() => openSheet({ type: "subagents" })}
-                            >
-                                ${view.subagentPolicy.label.split(" · ")[0]}
-                                ${
-                                    view.subagentPolicy.label.includes(" · ") &&
-                                    html`<span class="detail">${` · ${view.subagentPolicy.label.split(" · ")[1]}`}</span>`
-                                }
-                            </button>`
-                        }
-                        ${
-                            planAvailable() &&
-                            view.conversation?.kind !== "subagent" &&
-                            html`<button
-                                class=${`chip toggle plan-chip ${view.plan?.on ? "on" : ""}`}
-                                title="Plan mode: Pi reads and proposes, and changes nothing until you approve"
-                                onClick=${() => attempt(() => actions.setPlan(!view.plan?.on))}
-                            >
-                                Plan
-                            </button>`
-                        }
+                        <span class="grow"></span>
                         ${
                             busy &&
                             html`<div
                                 class="mode-switch"
+                                data-part="composer-button mode-switch"
                                 role="radiogroup"
                                 aria-label="Send as"
                                 onKeyDown=${(event) => {
-                                    // Arrows move between the two, as in any group of radio buttons.
+                                    // Arrows move between them, as in any group of radio buttons.
                                     if (/^Arrow(Left|Right|Up|Down)$/.test(event.key)) {
                                         const group = event.currentTarget;
+                                        const modes = SEND_MODES.map(([value]) => value);
+                                        const step = /^Arrow(Left|Up)$/.test(event.key) ? -1 : 1;
 
                                         event.preventDefault();
-                                        setSteer(!steer);
+                                        setSendMode(
+                                            modes[
+                                                (modes.indexOf(sendMode) + step + modes.length) %
+                                                    modes.length
+                                            ],
+                                        );
                                         requestAnimationFrame(() =>
                                             group.querySelector('[aria-checked="true"]')?.focus(),
                                         );
                                     }
                                 }}
                             >
-                                ${[
-                                    [true, "Steer", "Pi reads it now, between steps"],
-                                    [false, "Queue", "Pi reads it when this run ends"],
-                                ].map(
+                                ${SEND_MODES.map(
                                     ([value, label, tip]) => html`<button
                                         role="radio"
-                                        aria-checked=${steer === value ? "true" : "false"}
-                                        tabindex=${steer === value ? "0" : "-1"}
-                                        class=${steer === value ? "on" : ""}
+                                        aria-checked=${sendMode === value ? "true" : "false"}
+                                        tabindex=${sendMode === value ? "0" : "-1"}
+                                        class=${`${sendMode === value ? "on" : ""} ${value === "interrupt" ? "interrupt" : ""}`}
                                         title=${tip}
-                                        onClick=${() => setSteer(value)}
+                                        onMouseDown=${(event) => event.preventDefault()}
+                                        onClick=${() => setSendMode(value)}
                                     >
                                         ${label}
                                     </button>`,
                                 )}
                             </div>`
                         }
-                        <span class="grow"></span>
-                        ${busy && html`<${StopButton} />`}
-                        <${MicButton} dictation=${dictation} class="composer-mic" />
+                        <${MicButton}
+                            dictation=${dictation}
+                            class="composer-mic"
+                            part="composer-button"
+                            disabled=${sending}
+                        />
                         <button
                             class=${`send-button ${canSend ? "ready" : ""}`}
+                            data-part="send-button"
+                            data-state=${canSend ? "ready" : undefined}
                             aria-label="Send"
                             title=${coarse ? "Send" : "Send (Enter)"}
                             disabled=${!canSend}
@@ -1400,6 +1997,7 @@ export function Composer() {
                                     : html`<${Icon} name="send" size=${16} stroke=${2.4} />`
                             }
                         </button>
+                        ${busy && html`<${StopButton} />`}
                     </div>
                 </div>`
         }
@@ -1407,12 +2005,135 @@ export function Composer() {
     </footer>`;
 }
 
+// The buttons on the left of the message box's row: the app's own items of the `composer` slot (slots.js), which a
+// person can hide and reorder in Appearance, with extensions' after them. Each gets what the box knows: its file
+// picker, the model and thinking level, and the session's view. Send, Stop, the mic, and Steer and Queue stay on the
+// right, always.
+defineItem("composer", {
+    id: "core:places",
+    label: "Places (phones)",
+    order: 100,
+    render: () => html`<${PlacesButton} />`,
+});
+defineItem("composer", {
+    id: "core:attach",
+    label: "Attach files",
+    order: 200,
+    render: ({ picker }) =>
+        html`<button
+            class="icon-button attach-button"
+            data-part="composer-button"
+            aria-label="Attach files"
+            title="Attach files"
+            onClick=${() => picker.current?.click()}
+        >
+            <${Icon} name="clip" size=${17} />
+        </button>`,
+});
+defineItem("composer", {
+    id: "core:model",
+    label: "Model",
+    order: 300,
+    render: ({ agent, level, view }) =>
+        html`<button
+            class=${`model-chip ${agent?.available === false ? "warn" : ""}`}
+            data-part="model-chip"
+            aria-label=${`Model: ${modelLabel(agent)}${level ? `, thinking ${level}` : ""}`}
+            title=${`Model and thinking: ${modelLabel(agent)}${level ? `, ${level}` : ""}`}
+            onClick=${() => openSheet({ type: "model" })}
+        >
+            <${Icon} name="sparkle" size=${12} class="model-spark" />
+            <span class="model-name">${view.router ? view.router.label : shortModel(agent)}</span>
+            ${level && html`<span class="model-level">${level}</span>`}
+            <${Icon} name="chevron" size=${12} stroke=${2.2} class="model-caret" />
+        </button>`,
+});
+defineItem("composer", {
+    id: "core:subagents",
+    label: "Subagents",
+    order: 350,
+    render: ({ view }) =>
+        view.subagentPolicy &&
+        view.conversation?.kind !== "subagent" &&
+        html`<button
+            class=${`chip subagents-chip ${view.subagentPolicy.allowed.length > 0 ? "on" : ""}`}
+            data-part="composer-button subagents-chip"
+            title=${`Subagents: ${view.subagentPolicy.label}. ${view.subagentPolicy.allowed.length === 0 ? "They run on this session's model." : `They may also run on ${view.subagentPolicy.allowed.join(", ")}.`}`}
+            aria-label=${`Subagents: ${view.subagentPolicy.label}`}
+            onMouseDown=${(event) => event.preventDefault()}
+            onClick=${() => openSheet({ type: "subagents" })}
+        >
+            ${view.subagentPolicy.label.split(" · ")[0]}
+            ${
+                view.subagentPolicy.label.includes(" · ") &&
+                html`<span class="detail">${` · ${view.subagentPolicy.label.split(" · ")[1]}`}</span>`
+            }
+        </button>`,
+});
+defineItem("composer", {
+    id: "core:browser-use",
+    label: "Browser use",
+    order: 450,
+    render: ({ view }) =>
+        browserAvailable() &&
+        view.conversation?.kind !== "subagent" &&
+        html`<button
+            class=${`plan-chip browser-chip ${view.browserUse ? "on" : ""}`}
+            data-part="composer-button browser-chip"
+            aria-pressed=${view.browserUse === true}
+            title=${
+                view.browserUse
+                    ? "Pi may use the browser in this session (it asks before new sites, sign-ins, forms, and scripts). Tap to stop it."
+                    : "Let Pi use the browser in this session. Off, the browser costs Pi no context."
+            }
+            onMouseDown=${(event) => event.preventDefault()}
+            onClick=${() => attempt(() => actions.setBrowserUse(!view.browserUse))}
+        >
+            <${Icon} name="globe" size=${13} />
+            <span class="word">Browser</span>
+        </button>`,
+});
+defineItem("composer", {
+    id: "core:plan",
+    label: "Plan",
+    order: 400,
+    render: ({ view }) =>
+        planAvailable() &&
+        view.conversation?.kind !== "subagent" &&
+        html`<button
+            class=${`plan-chip ${view.plan?.on ? "on" : ""}`}
+            data-part="composer-button plan-chip"
+            aria-pressed=${view.plan?.on === true}
+            title="Plan mode: Pi reads and proposes, and changes nothing until you approve"
+            onMouseDown=${(event) => event.preventDefault()}
+            onClick=${() => attempt(() => actions.setPlan(!view.plan?.on))}
+        >
+            Plan
+        </button>`,
+});
+
+/** When each session last asked for its model to be warmed: once a minute is plenty. */
+const warmedAt = new Map();
+
+/** Ask the server to load this session's local model while the person writes (`PocketApp.warmFor`). */
+function warmSoon(conversationId) {
+    if (conversationId === null || Date.now() - (warmedAt.get(conversationId) ?? 0) < 60_000) {
+        return;
+    }
+
+    warmedAt.set(conversationId, Date.now());
+    actions.warm(conversationId).catch(() => {});
+}
+
+/** The browser sizes the message box to its text itself (`field-sizing` in style.css): nothing to measure. */
+const SIZES_ITSELF = globalThis.CSS?.supports?.("field-sizing", "content") ?? false;
+
 /**
  * The message box grows with what is written, to 40% of the screen; its least height (two lines, or one on a short
- * screen) is the stylesheet's, and changes with the screen.
+ * screen) is the stylesheet's, and changes with the screen. Browsers without `field-sizing` measure it here.
  */
 function fitBox(element) {
-    if (!element) {
+    if (!element || SIZES_ITSELF || !element.isConnected) {
         return;
     }
 
@@ -1421,19 +2142,15 @@ function fitBox(element) {
 }
 
 /** A model's short name for the message box: "opus 4.5" for "Claude Opus 4.5". */
-const shortModel = (agent) =>
-    modelLabel(agent)
-        // A provider's own prefix ("Anthropic: Claude Opus 4.5"), then the family's name.
-        .replace(/^[^:]{1,24}:\s*/, "")
-        .replace(/^(?:anthropic\s+)?claude\s+/i, "")
-        .toLowerCase();
+export const shortModel = (agent) => shortModelName(modelLabel(agent));
 
 /** Stop the run: a square in the failure color. */
 function StopButton() {
     return html`<button
         class="stop-button"
+        data-part="composer-button stop-button"
         aria-label="Stop"
-        title="Stop (Esc twice)"
+        title="Stop (Esc twice). Queued messages are held until someone sends them"
         onClick=${() => attempt(actions.abort)}
     >
         <span class="stop-square" aria-hidden="true"></span>
@@ -1452,6 +2169,7 @@ function PlacesButton() {
 
     return html`<button
         class="icon-button places-button badge-host"
+        data-part="composer-button"
         aria-label="Places: Files, Changes, Browser, and more"
         title="Places (or swipe up here)"
         onClick=${() => openSheet({ type: "places" })}
@@ -1463,11 +2181,11 @@ function PlacesButton() {
 
 /**
  * The status line's shorter forms, in the order a narrow line takes them until it fits on one row: shorter words and
- * gaps, no "1 here" while you are alone, the guard's and the context's labels, then the cache, then the wait for the
- * first token.
+ * gaps, no "1 here" while you are alone, extensions' items' short forms, the guard's and the context's labels, then the
+ * cache, then the wait for the first token.
  */
-const SHORTER = ["words", "here", "guard", "context", "cache", "wait"];
-/** What each status line was last fitted for: the text size and its text. Its width is the observer's to watch. */
+const SHORTER = ["words", "here", "ext", "guard", "context", "cache", "wait"];
+/** What each status line was last fitted for: its text. Its width is the observer's to watch. */
 const fitted = new WeakMap();
 
 /** Whether the items that show sit on one row: their middles line up. */
@@ -1481,15 +2199,15 @@ function oneRow(line) {
 }
 
 /**
- * The whole line where it fits on one row; otherwise each shorter form in turn, until one does. Only when its text or
- * the text size changed, or `again`: a render that changed neither measures nothing.
+ * The whole line where it fits on one row; otherwise each shorter form in turn, until one does. Only when its text
+ * changed, or `again`: a render that changed nothing measures nothing.
  */
 function fitStatus(line, again = false) {
     if (!line) {
         return;
     }
 
-    const key = `${prefs().text} ${line.textContent}`;
+    const key = line.textContent;
 
     // Hidden, it has no width to fit: the observer hears it show.
     if ((!again && fitted.get(line) === key) || line.clientWidth === 0) {
@@ -1531,13 +2249,20 @@ function useStatusFit(ref) {
             frame = requestAnimationFrame(() => fitStatus(line, true));
         });
 
+        // Fitted again once a font loads, and when a theme (with fonts of its own) has: its text measures another width.
+        const again = () => !gone && fitStatus(line, true);
+
         observer.observe(line);
-        document.fonts?.ready.then(() => !gone && fitStatus(line, true));
+        document.fonts?.ready.then(again);
+        document.fonts?.addEventListener("loadingdone", again);
+        document.addEventListener("pocket:theme", again);
 
         return () => {
             gone = true;
             cancelAnimationFrame(frame);
             observer.disconnect();
+            document.fonts?.removeEventListener("loadingdone", again);
+            document.removeEventListener("pocket:theme", again);
         };
     }, []);
 }
@@ -1571,7 +2296,7 @@ function SpeedPart({ stats }) {
         ${
             rate !== undefined &&
             html`<span class="rate">
-                ${rate < 9.95 ? rate.toFixed(1) : Math.round(rate)}${" "}
+                <span class="num">${rate < 9.95 ? rate.toFixed(1) : Math.round(rate)}</span>${" "}
                 <span class="long">tokens/s</span>
                 <span class="short">tok/s</span>
             </span>`
@@ -1580,109 +2305,270 @@ function SpeedPart({ stats }) {
             wait !== undefined &&
             html`<span class="wait">
                 <span class="word">first token${" "}</span>
-                ${seconds(wait)}
+                <span class="num">${seconds(wait)}</span>
             </span>`
         }
     </span>`;
 }
 
-/** Under the message box: who is here, how fast the last answer came (when turned on), how full the context is, the
- *  cache, the spend, and Lancet Guard. On one row: a narrow one takes shorter forms (`SHORTER`). */
-function StatusLine() {
-    const { view, connection, guard } = store.state;
-    const stats = view.stats ?? {};
-    const window = view.agent?.contextWindow;
-    const line = useRef(null);
-    const parts = [];
+// The status line's items: the app's own items of the `status` slot (slots.js), which a person can hide and reorder in
+// Appearance, with extensions' before the spend. The connection's warning leads and Lancet Guard ends it, always.
+defineItem("status", {
+    id: "core:connection",
+    label: "Connection",
+    order: 0,
+    fixed: true,
+    render() {
+        const { connection } = store.state;
 
-    useStatusFit(line);
-
-    if (connection !== "open") {
-        parts.push(
+        return (
+            connection !== "open" &&
             html`<span class="warn">
                 ${connection === "connecting" ? "connecting…" : "reconnecting…"}
-            </span>`,
+            </span>`
         );
-    }
+    },
+});
+defineItem("status", {
+    id: "core:here",
+    label: "People here",
+    order: 100,
+    render() {
+        const { view, presence } = store.state;
+        // People, not tabs: one person with a phone and a laptop open is one here (presence has a row per person).
+        const here = presence.length || view.viewers?.length || 1;
 
-    // People, not tabs: one person with a phone and a laptop open is one here (presence has a row per person).
-    const here = store.state.presence.length || view.viewers?.length || 1;
-
-    parts.push(
-        html`<span
+        return html`<span
             class=${`here ${here === 1 ? "alone" : ""}`}
             title=${`${(view.viewers ?? []).join(", ")}${view.clients > here ? ` · ${view.clients} tabs` : ""}`}
         >
             ${here} here
-        </span>`,
-    );
+        </span>`;
+    },
+});
+defineItem("status", {
+    id: "core:gpu",
+    label: "GPU",
+    order: 150,
+    render() {
+        const { loading, waiting, serving } = store.state.gpu ?? {};
 
-    if (prefs().speed === true) {
-        parts.push(html`<${SpeedPart} stats=${stats} />`);
+        if (loading?.length > 0) {
+            return html`<span
+                class="gpu"
+                data-part="status-gpu"
+                title="llama-swap is loading the model onto the GPU: the answer starts once it is there"
+            >
+                loading ${loading.join(", ")}…
+            </span>`;
+        }
+
+        if (waiting?.length > 0) {
+            const what = waiting.map((each) => `${each.model} (${each.count})`).join(", ");
+
+            return html`<span
+                class="gpu"
+                data-part="status-gpu"
+                title=${`The GPU holds ${serving ?? "another model"}; waiting for their turn: ${what}. Requests for one model go together, so it swaps models less.`}
+            >
+                GPU busy · ${waiting.length === 1 ? waiting[0].model : `${waiting.length} waiting`}
+            </span>`;
+        }
+
+        return null;
+    },
+});
+defineItem("status", {
+    id: "core:speed",
+    label: "Reply speed",
+    order: 200,
+    render: () =>
+        prefs().speed === true && html`<${SpeedPart} stats=${store.state.view.stats ?? {}} />`,
+});
+
+/** How full the context is: `{ used, window, percent, about }`, or null with no context window known. */
+function contextFill() {
+    const { view } = store.state;
+    const window = view.agent?.contextWindow;
+
+    if (!window) {
+        return null;
     }
 
-    if (window) {
-        const used = stats.contextTokens ?? 0;
-        const percent = Math.min(100, Math.round((used / window) * 100));
+    const used = view.stats?.contextTokens ?? 0;
+
+    return {
+        used,
+        window,
+        percent: Math.min(100, Math.round((used / window) * 100)),
         // Compacted since the last answer: what is left, estimated until the next answer measures it.
-        const about = stats.contextEstimated ? "~" : "";
-        const title = `${about}${formatTokens(used)} of ${formatTokens(window)} tokens in context`;
+        about: view.stats?.contextEstimated ? "~" : "",
+    };
+}
 
-        parts.push(
-            html`<button type="button" class="context" title=${`${title} · tap for where it goes`} onClick=${showContext}>
-                <span class="word">context</span>
-                <span class=${`meter ${contextLevel(percent)}`} aria-hidden="true">
-                    <span style=${`width:${percent}%`}></span>
-                </span>
-                ${about}${percent}%
-            </button>`,
-        );
+const contextTitle = ({ used, window, about }) =>
+    `${about}${formatTokens(used)} of ${formatTokens(window)} tokens in context`;
 
-        parts.push(
+defineItem("status", {
+    id: "core:context",
+    label: "Context",
+    order: 300,
+    render() {
+        const fill = contextFill();
+
+        return (
+            fill &&
             html`<button
                 type="button"
-                class="link"
-                title=${"Take a baseline of where the context goes; the next /context shows which rows a change moved"}
-                onClick=${() => showContext("baseline")}
+                class="context"
+                title=${`${contextTitle(fill)} · tap for where it goes`}
+                onClick=${() => showContext()}
             >
-                baseline
-            </button>`,
+                <span class="word">context</span>
+                <span class=${`meter ${contextLevel(fill.percent)}`} aria-hidden="true">
+                    <span style=${`width:${fill.percent}%`}></span>
+                </span>
+                <span class="num">${fill.about}${fill.percent}%</span>
+            </button>`
         );
-    }
+    },
+    detail() {
+        const fill = contextFill();
 
-    if (stats.cacheRate !== undefined) {
-        parts.push(html`<span class="cache">cache ${Math.round(stats.cacheRate * 100)}%</span>`);
-    }
+        return fill && contextTitle(fill);
+    },
+});
 
-    // The session's spend, its subagents' included, and its limit when it has one.
-    const spend = view.conversation?.spend;
-    const spent = spend?.spent ?? stats.cost ?? 0;
+const cacheRate = () => store.state.view.stats?.cacheRate;
 
-    parts.push(
-        html`<span class=${spend?.budget !== undefined && spent >= spend.budget ? "warn" : ""}>
-            $${spent.toFixed(2)}
-            ${spend?.budget !== undefined ? `/$${spend.budget.toFixed(2)}` : ""}
+defineItem("status", {
+    id: "core:cache",
+    label: "Cache",
+    order: 400,
+    render: () =>
+        cacheRate() !== undefined &&
+        html`<span class="cache">
+            cache <span class="num">${Math.round(cacheRate() * 100)}%</span>
         </span>`,
-    );
+    detail: () =>
+        cacheRate() !== undefined &&
+        `${Math.round(cacheRate() * 100)}% of the input came from the cache`,
+});
 
-    // On but not loaded: the guard blocks bash, write, and edit until it loads or is turned off.
-    const failed = guard?.enabled && guard.available === false;
+/**
+ * The session's spend, its subagents' included, and its limit; with a limit on a session that started others, the
+ * team's spend, which is what counts against it.
+ */
+function spendNow() {
+    const { view } = store.state;
+    const spend = view.conversation?.spend;
 
-    if (guard?.enabled || guard?.available) {
+    return { spent: spend?.spent ?? view.stats?.cost ?? 0, budget: spend?.budget };
+}
+
+defineItem("status", {
+    id: "core:spend",
+    label: "Spend",
+    order: 600,
+    render() {
+        const { spent, budget } = spendNow();
+
+        return html`<span class=${budget !== undefined && spent >= budget ? "warn" : ""}>
+            <span class="num">
+                $${spent.toFixed(2)} ${budget !== undefined ? `/$${budget.toFixed(2)}` : ""}
+            </span>
+        </span>`;
+    },
+    detail() {
+        const { spent, budget } = spendNow();
+
+        return `$${spent.toFixed(2)} spent${budget !== undefined ? ` of $${budget.toFixed(2)}` : ""}`;
+    },
+});
+
+/** How many commands the open session runs in the background now (the server's session list counts them). */
+function backgroundNow() {
+    const { sessions, conversationId } = store.state;
+
+    return sessions.find((session) => session.id === conversationId)?.background ?? 0;
+}
+
+const backgroundTitle = (count) =>
+    `${count} ${count === 1 ? "command runs" : "commands run"} in the background: open Background to watch ${count === 1 ? "it" : "them"}, or Running now to stop one`;
+
+defineItem("status", {
+    id: "core:background",
+    label: "Background tasks",
+    order: 650,
+    render() {
+        const count = backgroundNow();
+
+        return (
+            count > 0 &&
+            html`<button
+                class="background-now"
+                aria-label=${backgroundTitle(count)}
+                title=${backgroundTitle(count)}
+                onClick=${() => openSheet({ type: "background" })}
+            >
+                <span class="dot" aria-hidden="true"></span>
+                <span class="num">${count}</span>
+                <span class="word">${" "}in background</span>
+            </button>`
+        );
+    },
+    detail() {
+        const count = backgroundNow();
+
+        return count > 0 && backgroundTitle(count);
+    },
+});
+defineItem("status", {
+    id: "core:guard",
+    label: "Lancet Guard",
+    order: 700,
+    fixed: true,
+    render() {
+        const { guard } = store.state;
+        // On but not loaded: the guard blocks bash, background, write, and edit until it loads or is turned off.
+        const failed = guard?.enabled && guard.available === false;
+
+        if (!guard?.enabled && !guard?.available) {
+            return null;
+        }
+
         const state = failed ? "failed" : guard.enabled ? "on" : "off";
 
-        parts.push(
-            html`<button
-                class=${`guard ${guard.enabled && !failed ? "" : "off"}`}
-                aria-label=${`Lancet Guard ${state}`}
-                title=${guard.detail}
-                onClick=${() => openSheet({ type: "extensions" })}
-            >
-                <${Icon} name="shield" size=${11} />
-                <span><span class="word">guard${" "}</span>${state}</span>
-            </button>`,
-        );
-    }
+        return html`<button
+            class=${`guard ${guard.enabled && !failed ? "" : "off"}`}
+            aria-label=${`Lancet Guard ${state}`}
+            title=${guard.detail}
+            onClick=${() => openSheet({ type: "extensions", tab: "installed" })}
+        >
+            <${Icon} name="shield" size=${11} />
+            <span><span class="word">guard${" "}</span>${state}</span>
+        </button>`;
+    },
+});
 
-    return html`<div class="status-line" ref=${line}>${parts}</div>`;
+/** Under the message box: the `status` slot's items, on one row: a narrow one takes shorter forms (`SHORTER`). */
+export function StatusLine() {
+    const line = useRef(null);
+    const items = slotItems("status");
+    const parts = items.map(({ node }) => node);
+    // What each item says, for a tap on the line: a touch screen shows no tooltips.
+    const details = items.map(({ detail }) => detail).filter(Boolean);
+
+    useStatusFit(line);
+
+    // A tap on the line says what it shows (the guard's pill has its own); with a mouse, the tooltips do.
+    const explain = (event) => {
+        if (coarse && !event.target.closest("button")) {
+            notify("info", details.join(" · "));
+        }
+    };
+
+    return html`<div class="status-line" data-part="status-line" ref=${line} onClick=${explain}>
+        ${parts}
+    </div>`;
 }

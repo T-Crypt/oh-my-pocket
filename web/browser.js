@@ -3,27 +3,25 @@
 
 import { api, attempt, closePeople, notify, store } from "./store.js";
 
-const OPEN_KEY = "pocket.browser";
-
 /** The browser is on while its extension is: the owner turns it off in Extensions. */
 export const browserAvailable = () =>
     store.state.server?.extensions?.includes("pocket-browser") === true;
 
 /**
- * Show or hide the panel. Kept per tab, so a reload after a live edit keeps it open. It takes the People panel's and
- * the Files tile's place.
+ * Show or hide the panel. Kept for the session (`panel-layout.js`), so going back to it, or a reload, shows it again. It
+ * takes the People panel's and the Files tile's place.
  */
 export function setBrowserOpen(open) {
     if (open) {
-        sessionStorage.setItem(OPEN_KEY, "1");
-        sessionStorage.removeItem("pocket.files");
         closePeople();
-    } else {
-        sessionStorage.removeItem(OPEN_KEY);
     }
 
-    // One panel beside the conversation at a time: the browser takes the Files tile's place too.
-    store.set({ browserOpen: open, drawer: false, ...(open ? { filesOpen: false } : {}) });
+    // One panel beside the conversation at a time: the browser takes the Files tile's and an extension's place too.
+    store.set({
+        browserOpen: open,
+        drawer: false,
+        ...(open ? { filesOpen: false, extPanel: null } : {}),
+    });
 }
 
 export const toggleBrowser = () => setBrowserOpen(!store.state.browserOpen);

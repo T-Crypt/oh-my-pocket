@@ -8,7 +8,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import type { FauxResponseStep, Message } from "@earendil-works/pi-ai";
-import { Type } from "@earendil-works/pi-ai";
+import { num, obj, opt, str } from "@earendil-works/pi-schema";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import { getCurrentSystemMessage } from "@earendil-works/pi-ai/utils/transcript";
 import type { ContextView, ConversationId } from "@earendil-works/pi-durable";
@@ -256,7 +256,7 @@ test("the no-repeat rule is in the prompt the model gets", async () => {
 const probeTool = {
     name: "probe",
     description: "probe",
-    parameters: Type.Object({ path: Type.String(), limit: Type.Optional(Type.Number()) }),
+    parameters: obj({ path: str(), limit: opt(num()) }, { open: true }),
     prepareArguments: (args: unknown) =>
         typeof args === "string" ? (JSON.parse(args) as Record<string, unknown>) : args,
 };

@@ -20,14 +20,24 @@ import {
     quickTunnelHost,
 } from "../auth.ts";
 import type { User } from "../config.ts";
+import { MAX_AVATAR, readAvatar } from "../avatars.ts";
 import { HttpError } from "../errors.ts";
 import { desktopTheme, wallpaperFile } from "../omarchy.ts";
-import { runningNow } from "../running.ts";
+import { runningBoard, runningNow } from "../running.ts";
 import { serveImage } from "./assets.ts";
 import { browserRoutes } from "./browser-routes.ts";
 import { conversationRoutes } from "./conversation-routes.ts";
-import { createEventStreams } from "./events.ts";
-import { type ApiRequest, conversationId, type HttpOptions, json, readJson } from "./io.ts";
+import { createEventStreams, keptPart } from "./events.ts";
+import { extensionRoute } from "./extension-routes.ts";
+import { isIconColors, storeIconColors } from "../icon-store.ts";
+import {
+    type ApiRequest,
+    conversationId,
+    type HttpOptions,
+    json,
+    readBody,
+    readJson,
+} from "./io.ts";
 import { pushRoutes } from "./push-routes.ts";
 
 /** This machine's non-internal IPv4 addresses, for invite links other devices on its networks can open. */
@@ -151,7 +161,7 @@ export function createApi(options: HttpOptions, auth: Auth) {
             return json(response, 200, await app.hello(user));
         }
 
-        if (first === "me" && method === "POST") {
+        if (first === "me" && second === undefined && method === "POST") {
             const body = await readJson<{ name?: string }>(request);
             const name = String(body.name ?? "")
                 .replace(/\s+/g, " ")
@@ -163,6 +173,50 @@ export function createApi(options: HttpOptions, auth: Auth) {
             }
 
             app.rename(user, name);
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "me" && second === "avatar" && method === "POST") {
+            app.setAvatar(user, await readBody(request, MAX_AVATAR));
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "me" && second === "avatar" && method === "DELETE") {
+            app.setAvatar(user, undefined);
+
+            return json(response, 200, { ok: true });
+        }
+
+        // A picture of anyone this person may see in the people list.
+        if (first === "avatar" && second !== undefined && method === "GET") {
+            const picture = app.people(user).some((each) => each.id === second)
+                ? readAvatar(app.dataDir, second)
+                : undefined;
+
+            if (picture === undefined) {
+                throw new HttpError(404, "No picture");
+            }
+
+            // The address carries the picture's version, so a copy never goes stale.
+            response.writeHead(200, {
+                "content-type": picture.type,
+                "content-length": picture.bytes.length,
+                "cache-control": "private, max-age=31536000, immutable",
+                "x-content-type-options": "nosniff",
+            });
+            response.end(picture.bytes);
+
+            return;
+        }
+
+        if (first === "folder-favorites" && second === undefined && method === "GET") {
+            return json(response, 200, await app.folderFavorites.list(user));
+        }
+
+        if (first === "folder-favorites" && second === undefined && method === "POST") {
+            await app.folderFavorites.set(user, await readJson(request));
 
             return json(response, 200, { ok: true });
         }
@@ -217,6 +271,36 @@ export function createApi(options: HttpOptions, auth: Auth) {
                 body.ids.slice(0, MAX_PEEKS).map((id) => conversationId(String(id))),
                 body.seq as number | undefined,
             );
+
+            return json(response, 200, { ok: true });
+        }
+
+        // A tab shows another session, or the list (`c` null), on the connection it has; `have` is what it kept of it.
+        if (first === "switch" && method === "POST") {
+            const body = await readJson<{
+                connection?: unknown;
+                c?: unknown;
+                have?: unknown;
+                seq?: unknown;
+            }>(request);
+
+            if (!Number.isSafeInteger(body.seq)) {
+                throw new HttpError(400, "seq must be a whole number");
+            }
+
+            const switched = app.switchTo(
+                user,
+                String(body.connection ?? ""),
+                body.c === null || body.c === undefined
+                    ? undefined
+                    : conversationId(String(body.c)),
+                keptPart(typeof body.have === "string" ? body.have : null),
+                body.seq as number,
+            );
+
+            if (!switched) {
+                throw new HttpError(409, "This connection is not open");
+            }
 
             return json(response, 200, { ok: true });
         }
@@ -287,6 +371,12 @@ export function createApi(options: HttpOptions, auth: Auth) {
             return json(response, 200, { ok: true });
         }
 
+        if (first === "hooks" && second !== undefined && third === undefined && method === "POST") {
+            const body = await readJson<{ instructions?: unknown }>(request);
+
+            return json(response, 200, await app.hooks.update(user, second, body.instructions));
+        }
+
         // A new secret, for a hook whose address or secret got out.
         if (first === "hooks" && second !== undefined && third === "rotate" && method === "POST") {
             return json(response, 200, await app.hooks.rotate(user, second));
@@ -340,6 +430,79 @@ export function createApi(options: HttpOptions, auth: Auth) {
             });
         }
 
+        // Theme folders (`themes.ts`): everyone signed in lists them, as everyone chooses one for their own browsers;
+        // only the owner adds, edits, and removes them.
+        // The app icon's colors, which the owner's browser reports for the requests that carry no cookie (`icon-store.ts`).
+        if (first === "app-icon" && second === undefined && method === "PUT") {
+            requireOwner(user);
+
+            const { colors } = await readJson<{ colors?: unknown }>(request);
+
+            if (!isIconColors(colors)) {
+                throw new HttpError(400, "Colors are five hex colors joined by dots");
+            }
+
+            storeIconColors(app.dataDir, colors);
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "themes" && second === undefined && method === "GET") {
+            return json(response, 200, { themes: app.themes.list(user.role === "owner") });
+        }
+
+        if (first === "themes" && second === "default" && method === "PUT") {
+            await app.setThemeDefault(
+                user,
+                (await readJson<{ default?: unknown }>(request)).default,
+            );
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "themes" && second === "duplicate" && method === "POST") {
+            requireOwner(user);
+            const body = await readJson<{ from?: unknown; name?: unknown; colors?: unknown }>(
+                request,
+            );
+
+            if (typeof body.from !== "string") {
+                throw new HttpError(400, "Say which theme or colors to copy");
+            }
+
+            return json(response, 200, {
+                id: await app.themes.duplicate(body.from, body.name, body.colors === true),
+            });
+        }
+
+        if (first === "themes" && second !== undefined && third === "fonts" && method === "PUT") {
+            requireOwner(user);
+            app.themes.setFonts(
+                second,
+                await readJson<{ sans?: unknown; mono?: unknown; ligatures?: unknown }>(request),
+            );
+
+            return json(response, 200, { ok: true });
+        }
+
+        if (first === "themes" && second !== undefined && third === "edit" && method === "GET") {
+            requireOwner(user);
+
+            return json(response, 200, app.themes.edit(second));
+        }
+
+        if (
+            first === "themes" &&
+            second !== undefined &&
+            third === undefined &&
+            method === "DELETE"
+        ) {
+            requireOwner(user);
+            app.themes.remove(second);
+
+            return json(response, 200, { ok: true });
+        }
+
         if (first === "theme" && second === "wallpaper" && method === "GET") {
             if (user.role !== "owner") {
                 throw new HttpError(403, "Only the owner sees the desktop's wallpaper");
@@ -352,6 +515,10 @@ export function createApi(options: HttpOptions, auth: Auth) {
             }
 
             return serveImage(request, response, file);
+        }
+
+        if (first === "running" && second === "board" && method === "GET") {
+            return json(response, 200, await runningBoard(app, user));
         }
 
         if (first === "running" && method === "GET") {
@@ -384,6 +551,10 @@ export function createApi(options: HttpOptions, auth: Auth) {
 
         if (first === "sessions" && second === undefined && method === "GET") {
             return json(response, 200, app.sessions(user));
+        }
+
+        if (first === "artifacts" && second === undefined && method === "GET") {
+            return json(response, 200, await app.artifactOverview(user));
         }
 
         // Pi's sessions from the terminal, which the owner can continue here.
@@ -424,9 +595,13 @@ export function createApi(options: HttpOptions, auth: Auth) {
         if (first === "sessions" && second !== undefined && method === "POST") {
             const body = await readJson<{ title?: string; archived?: boolean }>(request);
 
-            await app.commands.updateSession(conversationId(second), user, body);
+            const { repeating } = await app.commands.updateSession(
+                conversationId(second),
+                user,
+                body,
+            );
 
-            return json(response, 200, { ok: true });
+            return json(response, 200, { ok: true, repeating });
         }
 
         if (first === "c" && second !== undefined) {
@@ -442,9 +617,18 @@ export function createApi(options: HttpOptions, auth: Auth) {
         }
 
         if (first === "approvals" && second !== undefined && method === "POST") {
-            const body = await readJson<{ allow?: boolean }>(request);
+            const body = await readJson<{ allow?: boolean; values?: unknown }>(request);
 
-            if (!(await app.answerApproval(second, body.allow === true, user))) {
+            // An id may hold a slash, which the path decoded into a part of its own: a codemode script's calls are
+            // named `<call>/<n>`. `values` answer an ask's fields (`host.ask`), and go to the asker alone.
+            if (
+                !(await app.answerApproval(
+                    parts.slice(1).join("/"),
+                    body.allow === true,
+                    user,
+                    body.values,
+                ))
+            ) {
                 throw new HttpError(404, "That approval is no longer pending");
             }
 
@@ -462,8 +646,21 @@ export function createApi(options: HttpOptions, auth: Auth) {
             const path = app.workspace.checkDirectory(requested);
             const showHidden = url.searchParams.get("hidden") === "1";
             const dirs: { name: string; path: string }[] = [];
+            let entries;
 
-            for (const entry of readdirSync(path, { withFileTypes: true })) {
+            try {
+                entries = readdirSync(path, { withFileTypes: true });
+            } catch (error) {
+                const code = (error as NodeJS.ErrnoException).code;
+
+                if (code === "EACCES" || code === "EPERM") {
+                    throw new HttpError(403, `Pi Pocket cannot read ${path}.`);
+                }
+
+                throw error;
+            }
+
+            for (const entry of entries) {
                 if (!showHidden && entry.name.startsWith(".")) {
                     continue;
                 }
@@ -484,10 +681,12 @@ export function createApi(options: HttpOptions, auth: Auth) {
             }
 
             dirs.sort((a, b) => a.name.localeCompare(b.name));
-            const recent = [...new Set(app.sessions(user).map((session) => session.cwd))].slice(
-                0,
-                8,
-            );
+            // A workspace URI is not a folder the picker can open: its provider's module starts sessions there.
+            const local = app
+                .sessions(user)
+                .map((session) => session.cwd)
+                .filter((cwd) => app.workspaceScheme(cwd) === undefined);
+            const recent = [...new Set(local)].slice(0, 8);
 
             return json(response, 200, {
                 path,
@@ -528,6 +727,7 @@ export function createApi(options: HttpOptions, auth: Auth) {
                 defaultModel?: unknown;
                 pipCompactAt?: unknown;
                 subagentModels?: unknown;
+                limitWaitHours?: unknown;
             }>(request);
 
             // One at a time: a second that fails must not leave the first changed.
@@ -537,18 +737,24 @@ export function createApi(options: HttpOptions, auth: Auth) {
                     body.defaultModel,
                     body.pipCompactAt,
                     body.subagentModels,
+                    body.limitWaitHours,
                 ].filter((value) => value !== undefined).length > 1
             ) {
                 throw new HttpError(400, "Change one setting at a time.");
             }
 
-            // The models subagents may run on besides their session's own: the owner's (checked in `app.ts`).
+            // The models subagents may run on: the owner's (checked in `app.ts`).
             if (body.subagentModels !== undefined) {
                 await app.setSubagentModels(user, body.subagentModels);
             }
 
             if (body.pipCompactAt !== undefined) {
                 await app.setPipCompactAt(user, body.pipCompactAt);
+            }
+
+            // How long a run waits for a provider's limit to clear: the owner's (checked in `app.ts`).
+            if (body.limitWaitHours !== undefined) {
+                await app.setLimitWaitHours(user, body.limitWaitHours);
             }
 
             if (body.approvalRule !== undefined) {
@@ -596,6 +802,35 @@ export function createApi(options: HttpOptions, auth: Auth) {
             return json(response, 200, { ok: true });
         }
 
+        // Routes extension modules add, each checking who may use it (`extension-routes.ts`).
+        if (first === "x" && second !== undefined) {
+            return extensionRoute(route, parts.slice(1));
+        }
+
+        // Fetch the LANCET model Lancet Guard needs. Answers at once; the download goes on and shows in the guard's status.
+        if (first === "guard" && second === "model" && third === undefined && method === "POST") {
+            await app.setupGuardModel(user);
+
+            return json(response, 200, await app.extensions(user));
+        }
+
+        // A module's settings (`web.settings`): the owner sets them; whoever its browser module is for reads them.
+        if (first === "extension-settings" && second !== undefined && third === undefined) {
+            if (method === "GET") {
+                return json(response, 200, app.extensionSettings(user, second));
+            }
+
+            if (method === "PUT") {
+                requireOwner(user);
+
+                return json(
+                    response,
+                    200,
+                    app.setExtensionSettings(user, second, await readJson(request)),
+                );
+            }
+        }
+
         if (first === "extensions" && second === undefined && method === "GET") {
             return json(response, 200, await app.extensions(user));
         }
@@ -628,6 +863,47 @@ export function createApi(options: HttpOptions, auth: Auth) {
             await app.reloadExtension(second);
 
             return json(response, 200, await app.extensions(user));
+        }
+
+        if (
+            first === "models" &&
+            second === "refresh" &&
+            third === undefined &&
+            method === "POST"
+        ) {
+            requireOwner(user);
+
+            return json(response, 200, await app.providers.modelRefresh.refresh());
+        }
+
+        // OpenAI-compatible endpoints, in Pi's models.json: the owner's alone, as they hold keys and decide models.
+        if (first === "custom-providers") {
+            requireOwner(user);
+            const providers = app.customProviders;
+
+            if (second === undefined && method === "GET") {
+                return json(response, 200, providers.list());
+            }
+
+            if (second === undefined && method === "POST") {
+                return json(response, 200, await providers.create(await readJson(request)));
+            }
+
+            if (second === "discover" && third === undefined && method === "POST") {
+                return json(response, 200, {
+                    models: await providers.discover(await readJson(request)),
+                });
+            }
+
+            if (second !== undefined && third === undefined && method === "PUT") {
+                return json(response, 200, await providers.update(second, await readJson(request)));
+            }
+
+            if (second !== undefined && third === undefined && method === "DELETE") {
+                await providers.remove(second);
+
+                return json(response, 200, { ok: true });
+            }
         }
 
         // For the owner, each subscription's sign-in is asked afresh first (three seconds at most; a mark found later

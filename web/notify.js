@@ -1,5 +1,6 @@
 // Phone notifications: this device subscribes to the server's pushes, and each person picks what they hear about.
 import { useEffect, useState } from "preact/hooks";
+import { callHost, hostCan } from "./host.js";
 import { api, attempt, closeSheet, notify, sessionUnread } from "./store.js";
 import { html, Loader, Sheet, Switch } from "./ui.js";
 
@@ -24,15 +25,22 @@ let badged = null;
 /** What the count was worked out from: it changes only with these, while streaming updates the store many times a second. */
 let countedFrom = null;
 
-/** The home-screen icon counts the sessions that need you: a call waits for approval, or the chat has news. */
+/**
+ * The home-screen icon counts the sessions that need you: a call waits for approval, or the chat has news. An
+ * embedder with a badge of its own (`web/host.js`) shows it on its icon and tray instead.
+ */
 export function updateBadge(state) {
-    if (!("setAppBadge" in navigator) || !state.me) {
+    const embedder = hostCan("badge");
+
+    if ((!embedder && !("setAppBadge" in navigator)) || !state.me) {
         return;
     }
 
     if (
         countedFrom?.sessions === state.sessions &&
         countedFrom.chatRead === state.chatRead &&
+        countedFrom.chatReads === state.chatReads &&
+        countedFrom.me === state.me &&
         countedFrom.conversationId === state.conversationId
     ) {
         return;
@@ -41,6 +49,8 @@ export function updateBadge(state) {
     countedFrom = {
         sessions: state.sessions,
         chatRead: state.chatRead,
+        chatReads: state.chatReads,
+        me: state.me,
         conversationId: state.conversationId,
     };
     const count = state.sessions.filter(
@@ -52,6 +62,13 @@ export function updateBadge(state) {
     }
 
     badged = count;
+
+    if (embedder) {
+        callHost("setBadge", count);
+
+        return;
+    }
+
     (count === 0 ? navigator.clearAppBadge() : navigator.setAppBadge(count)).catch(() => {});
 }
 
@@ -100,6 +117,11 @@ const KINDS = [
         "approval",
         "Approvals",
         "when Lancet Guard asks before a command; allow or deny it from the notification",
+    ],
+    [
+        "limit",
+        "Waiting for a limit",
+        "when a run waits more than ten minutes for a provider's limit to clear",
     ],
     ["mention", "Mentions", "when someone writes @your name in a chat"],
     ["chat", "Chat messages", "in sessions you take part in"],
@@ -183,7 +205,11 @@ export function NotificationsSheet() {
 
     const on = Boolean(subscription);
 
-    return html`<${Sheet} title="Notifications" onClose=${closeSheet}>
+    return html`<${Sheet}
+        title="Notifications"
+        onClose=${closeSheet}
+        className="notifications-sheet"
+    >
         <p class="muted small">
             Get a notification on this device when you are not looking at the session: Pi finished, Pi needs approval, or someone wrote to you.
         </p>
@@ -191,38 +217,42 @@ export function NotificationsSheet() {
         ${
             !info || subscription === undefined
                 ? html`<${Loader} label="Checking this device" />`
-                : html`<div class="extension">
-                    <div class="extension-main">
-                        <div class="extension-title">This device</div>
-                        <div class="muted small">
-                            ${on ? "Notifications are on." : "Notifications are off."} ${info.devices > 0 ? `${info.devices} device${info.devices === 1 ? "" : "s"} of yours ${info.devices === 1 ? "gets" : "get"} them.` : ""}
-                        </div>
-                    </div>
-                    <div class="extension-actions">
-                        <${Switch}
-                            on=${on}
-                            disabled=${busy || (!on && problem !== null)}
-                            label="Notifications on this device"
-                            onChange=${on ? disable : enable}
-                        />
-                    </div>
-                </div>
-                <div class="group-title">Notify me about</div>
-                ${KINDS.map(
-                    ([key, title, hint]) => html`<div class="extension">
+                : html`<div class="sheet-list">
+                    <div class="extension">
                         <div class="extension-main">
-                            <div>${title}</div>
-                            <div class="muted small">${hint}</div>
+                            <div class="extension-title">This device</div>
+                            <div class="muted small">
+                                ${on ? "Notifications are on." : "Notifications are off."} ${info.devices > 0 ? `${info.devices} device${info.devices === 1 ? "" : "s"} of yours ${info.devices === 1 ? "gets" : "get"} them.` : ""}
+                            </div>
                         </div>
                         <div class="extension-actions">
                             <${Switch}
-                                on=${info.prefs[key]}
-                                label=${title}
-                                onChange=${() => setPref(key, !info.prefs[key])}
+                                on=${on}
+                                disabled=${busy || (!on && problem !== null)}
+                                label="Notifications on this device"
+                                onChange=${on ? disable : enable}
                             />
                         </div>
-                    </div>`,
-                )}
+                    </div>
+                </div>
+                <div class="group-title">Notify me about</div>
+                <div class="sheet-list">
+                    ${KINDS.map(
+                        ([key, title, hint]) => html`<div class="extension">
+                            <div class="extension-main">
+                                <div>${title}</div>
+                                <div class="muted small">${hint}</div>
+                            </div>
+                            <div class="extension-actions">
+                                <${Switch}
+                                    on=${info.prefs[key]}
+                                    label=${title}
+                                    onChange=${() => setPref(key, !info.prefs[key])}
+                                />
+                            </div>
+                        </div>`,
+                    )}
+                </div>
                 ${
                     on &&
                     html`<button class="button wide" onClick=${test}>

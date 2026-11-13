@@ -7,7 +7,7 @@
  * halves the cost of a turn and matches or beats LLM summarization on solve rate (The Complexity Trap,
  * arXiv:2508.21433), and it keeps the conversation's KV prefix intact in the common case.
  */
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import type { Message, ToolResultMessage } from "@earendil-works/pi-ai";
 import { estimateMessageTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {

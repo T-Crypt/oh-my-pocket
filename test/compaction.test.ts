@@ -2,7 +2,22 @@
 // settings reader alone would drop.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { compactionSettings } from "../src/server/compaction.ts";
+import { withBackground } from "../src/server/compaction.ts";
+
+type Settings = Parameters<typeof withBackground>[1] & { getCompactionSettings: () => object };
+
+// What app.ts hands Pi Durable: Pi's values (none when unreadable) with backgroundTokens on top.
+const compactionSettings = (settings: Settings) => {
+    let base = {};
+
+    try {
+        base = settings.getCompactionSettings();
+    } catch {
+        // Unreadable: Pi Durable's defaults.
+    }
+
+    return withBackground(base, settings);
+};
 
 const settings = (compaction: Record<string, unknown> | undefined) => ({
     getCompactionSettings: () => ({ enabled: true, reserveTokens: 39000, keepRecentTokens: 20000 }),

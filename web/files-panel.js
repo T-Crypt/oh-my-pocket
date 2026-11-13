@@ -9,33 +9,41 @@ import { DiffReview, KIND_LETTERS, reloadChanges, useChanges, useWidth } from ".
 import { loadFiles, suggestFiles } from "./files.js";
 import { FileView } from "./sheets/file.js";
 import { actions, canSteer, closePeople, panelsBeside, store } from "./store.js";
-import { html, Icon, Loader, Marked, shortPath, usePresence } from "./ui.js";
+import {
+    dragWidth,
+    html,
+    Icon,
+    Loader,
+    Marked,
+    revealAsked,
+    revealFile,
+    shortPath,
+    usePresence,
+} from "./ui.js";
 
-const OPEN_KEY = "pocket.files";
-const TAB_KEY = "pocket.filesTab";
 const WIDTH_KEY = "pocket.filesWidth";
 /** Tree and viewer side by side from this width of the tile; one at a time below it. */
-const SIDE_BY_SIDE = 640;
+const SIDE_BY_SIDE = 600;
+/** A workspace URI (`ssh://host/path`), as `workspaceScheme` in `src/server/paths.ts` reads it. */
+const isWorkspaceUri = (cwd) => /^[a-z][a-z0-9+.-]+:\/\//i.test(cwd ?? "");
 
-/** The tile is for people who can steer: the viewer reads files as Pi would. */
-export const filesAvailable = () => canSteer() && store.state.conversationId !== null;
+/** The tile is for people who can steer: the viewer reads local files as Pi would. */
+export const filesAvailable = () =>
+    canSteer() &&
+    store.state.conversationId !== null &&
+    !isWorkspaceUri(store.state.view.agent?.cwd) &&
+    !isWorkspaceUri(store.state.view.conversation?.cwd);
 
 /** Show or hide the tile. It takes the Browser and People panels' place. */
 export function setFilesOpen(open, tab) {
-    if (open) {
-        sessionStorage.setItem(OPEN_KEY, "1");
-        sessionStorage.removeItem("pocket.browser");
-        closePeople();
-    } else {
-        sessionStorage.removeItem(OPEN_KEY);
-
-        if (document.documentElement.dataset.focus === "files-tile") {
-            document.documentElement.dataset.focus = "pane";
-        }
+    if (open && !filesAvailable()) {
+        return;
     }
 
-    if (tab) {
-        sessionStorage.setItem(TAB_KEY, tab);
+    if (open) {
+        closePeople();
+    } else if (document.documentElement.dataset.focus === "files-panel") {
+        document.documentElement.dataset.focus = "pane";
     }
 
     store.set({
@@ -45,6 +53,7 @@ export function setFilesOpen(open, tab) {
         ...(open
             ? {
                   browserOpen: false,
+                  extPanel: null,
                   sheet: null,
                   filesAsk: { tab: tab ?? store.state.filesTab, at: Date.now() },
               }
@@ -65,7 +74,6 @@ export function toggleFiles(tab) {
 }
 
 function setTab(tab) {
-    sessionStorage.setItem(TAB_KEY, tab);
     store.set({ filesTab: tab });
 }
 
@@ -170,16 +178,20 @@ function TreeFolder({ path, depth, ctx }) {
                 style=${`--depth:${depth}`}
                 data-path=${full}
                 title=${entry.name}
-                onClick=${() => (entry.dir ? ctx.toggle(full) : ctx.pick(full))}
+                onClick=${(event) =>
+                    revealAsked(event)
+                        ? revealFile(full)
+                        : entry.dir
+                          ? ctx.toggle(full)
+                          : ctx.pick(full)}
             >
                 ${
                     entry.dir
-                        ? html`<${Icon} name="chevron" size=${12} class=${`chev ${open ? "open" : ""}`} />`
+                        ? html`<${Icon} name="chevron" size=${11} class=${`chev ${open ? "open" : ""}`} />`
                         : html`<span class="ft-spacer"></span>`
                 }
-                <${Icon} name=${entry.dir ? "folder" : "file"} size=${14} />
                 <span class="ft-name">${entry.name}</span>
-                ${inside && html`<span class="ft-dot" title="Has changes"></span>`}
+                ${inside && !open && html`<span class="ft-dot" title="Has changes"></span>`}
                 ${change && html`<span class=${`ft-kind ${change}`}>${KIND_LETTERS[change]}</span>`}
             </button>
             ${open && html`<${TreeFolder} path=${full} depth=${depth + 1} ctx=${ctx} />`}
@@ -212,7 +224,10 @@ function Matches({ query, root, onPick }) {
                 class="ft-row match"
                 role="option"
                 data-path=${`${root}/${entry.path.replace(/\/$/, "")}`}
-                onClick=${(event) => onPick(event.currentTarget.dataset.path, entry.dir)}
+                onClick=${(event) =>
+                    revealAsked(event)
+                        ? revealFile(event.currentTarget.dataset.path)
+                        : onPick(event.currentTarget.dataset.path, entry.dir)}
             >
                 <${Icon} name=${entry.dir ? "folder" : "file"} size=${14} />
                 <span class="ft-name"><${Marked} text=${entry.name} hits=${entry.nameHits} /></span>
@@ -232,31 +247,19 @@ function ResizeEdge() {
         }
 
         event.preventDefault();
-        const root = document.documentElement;
-        const right = event.currentTarget.parentElement.getBoundingClientRect().right;
-        let width = 0;
+        const tile = event.currentTarget.parentElement;
+        const right = tile.getBoundingClientRect().right;
 
-        root.classList.add("resizing");
-
-        const move = (each) => {
-            width = Math.round(Math.min(innerWidth - 420, Math.max(320, right - each.clientX)));
-            root.style.setProperty("--files-w", `${width}px`);
-        };
-
-        const stop = () => {
-            root.classList.remove("resizing");
-            removeEventListener("pointermove", move);
-            removeEventListener("pointerup", stop);
-            removeEventListener("pointercancel", stop);
-
-            if (width > 0) {
+        dragWidth(event, {
+            element: tile,
+            property: "flex-basis",
+            widthAt: (each) =>
+                Math.round(Math.min(innerWidth - 420, Math.max(320, right - each.clientX))),
+            done: (width) => {
+                document.documentElement.style.setProperty("--files-w", `${width}px`);
                 localStorage.setItem(WIDTH_KEY, String(width));
-            }
-        };
-
-        addEventListener("pointermove", move);
-        addEventListener("pointerup", stop);
-        addEventListener("pointercancel", stop);
+            },
+        });
     };
 
     const reset = () => {
@@ -297,6 +300,7 @@ function FilesTab({ changes, covering }) {
     const width = useWidth(ref);
     const side = width >= SIDE_BY_SIDE;
     const handled = useRef(filesTarget?.n ?? 0);
+    const picks = useRef(0);
 
     const setSelected = (next) => {
         if (next) {
@@ -358,7 +362,8 @@ function FilesTab({ changes, covering }) {
 
     /** Open a file; `from`, the tab it was asked for from, for back to go back to. */
     const pick = (path, line, from) => {
-        setSelected({ path, line, from });
+        // `n` differs for each pick, so picking the open file again reads it again.
+        setSelected({ path, line, from, n: ++picks.current });
         reveal(path);
     };
 
@@ -413,7 +418,9 @@ function FilesTab({ changes, covering }) {
         const at = rows.indexOf(document.activeElement);
         const row = rows[at];
 
+        // Alt with an arrow stays the app's: Alt+↑/↓ switches sessions.
         if (
+            event.altKey ||
             !["ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)
         ) {
             return;
@@ -538,7 +545,7 @@ function FilesTab({ changes, covering }) {
                         if (event.key === "Escape" && query !== "") {
                             event.stopPropagation();
                             setQuery("");
-                        } else if (event.key === "ArrowDown") {
+                        } else if (event.key === "ArrowDown" && !event.altKey) {
                             event.preventDefault();
                             ref.current?.querySelector(".ft-tree .ft-row[data-path]")?.focus();
                         }
@@ -554,7 +561,7 @@ function FilesTab({ changes, covering }) {
                     aria-label="Fold every folder"
                     onClick=${() => update(() => new Set())}
                 >
-                    <${Icon} name="down" size=${16} class="ft-fold-all" />
+                    <${Icon} name="down" size=${15} />
                 </button>
                 <button
                     class="icon-button"
@@ -567,10 +574,9 @@ function FilesTab({ changes, covering }) {
                         reloadChanges(id);
                     }}
                 >
-                    <${Icon} name="reload" size=${16} />
+                    <${Icon} name="reload" size=${15} />
                 </button>
             </div>
-            <div class="ft-root mono" title=${root}>${shortPath(root, server?.home)}</div>
             <div class="ft-tree" role="tree" aria-label="Files" onKeyDown=${onTreeKey}>
                 ${
                     query === ""
@@ -593,7 +599,18 @@ function FilesTab({ changes, covering }) {
         </div>
         ${
             shown
-                ? html`<div class=${`ft-view ${selected ? "" : "leaving"}`} inert=${!selected}>
+                ? html`<div
+                      class=${`ft-view ${selected ? "" : "leaving"}`}
+                      inert=${!selected}
+                      tabindex="-1"
+                      onKeyDown=${(event) => {
+                          // Esc goes back to the tree, as back does, where the file covers it.
+                          if (covered && event.key === "Escape" && !event.defaultPrevented) {
+                              event.preventDefault();
+                              closeFile();
+                          }
+                      }}
+                  >
                       <div class="ft-view-head">
                           ${
                               !side &&
@@ -624,6 +641,7 @@ function FilesTab({ changes, covering }) {
                           key=${`${shown.path}:${shown.line ?? ""}:${head}`}
                           path=${shown.path}
                           line=${shown.line}
+                          refresh=${shown.n}
                           onOpen=${(path) => pick(path)}
                       />
                   </div>`
@@ -636,8 +654,13 @@ function FilesTab({ changes, covering }) {
     </div>`;
 }
 
-export function FilesPanel({ leaving = false }) {
-    const { filesTab } = store.state;
+export function FilesPanel(props) {
+    return filesAvailable() ? html`<${FilesPanelContent} ...${props} />` : null;
+}
+
+function FilesPanelContent({ leaving = false }) {
+    const { filesTab, view, server } = store.state;
+    const root = view.agent?.cwd ?? view.conversation?.cwd ?? "";
     const { changes } = useChanges(true);
     // Pi's edits git does not list count too: outside a repository, they are all there is.
     const count = changes ? changes.files.length + changes.piOnly.length : 0;
@@ -649,7 +672,12 @@ export function FilesPanel({ leaving = false }) {
 
     return html`<section
         class=${`files-tile window ${leaving ? "leaving" : ""}`}
+        data-part="files-panel"
+        data-state=${leaving ? "closing" : undefined}
+        role=${beside ? undefined : "dialog"}
+        aria-modal=${beside ? undefined : "true"}
         aria-label="Files"
+        tabindex="-1"
         inert=${leaving}
     >
         <${ResizeEdge} />
@@ -674,7 +702,7 @@ export function FilesPanel({ leaving = false }) {
                     class=${filesTab === "files" ? "on" : ""}
                     onClick=${() => setTab("files")}
                 >
-                    <${Icon} name="folder" size=${15} /> Files
+                    Files
                 </button>
                 <button
                     type="button"
@@ -683,11 +711,11 @@ export function FilesPanel({ leaving = false }) {
                     class=${filesTab === "changes" ? "on" : ""}
                     onClick=${() => setTab("changes")}
                 >
-                    <${Icon} name="diff" size=${15} /> Changes
+                    Changes
                     ${count > 0 && html`<span class="files-count">${count}</span>`}
                 </button>
             </div>
-            <span class="grow"></span>
+            <span class="files-root" title=${root}>${shortPath(root, server?.home)}</span>
             ${
                 beside &&
                 html`<button
@@ -697,7 +725,7 @@ export function FilesPanel({ leaving = false }) {
                     title="Close (Alt+E)"
                     onClick=${() => setFilesOpen(false)}
                 >
-                    <${Icon} name="close" size=${18} />
+                    <${Icon} name="close" size=${17} />
                 </button>`
             }
         </header>
@@ -723,13 +751,14 @@ export function FilesButton() {
         return null;
     }
 
-    // Quiet while closed: the menu's tiles, Alt+E, and a swipe left on a phone open it.
+    // Out of the top bar where its pane is narrow (a phone's): the menu's tiles, Alt+E, and a swipe left open it.
     return html`<button
-        class=${`icon-button ${filesOpen ? "on" : "quiet"}`}
+        class=${`icon-button top-toggle ${filesOpen ? "on" : ""}`}
         aria-label="Files"
+        aria-pressed=${filesOpen}
         title="Files and changes (Alt+E)"
         onClick=${() => toggleFiles()}
     >
-        <${Icon} name="folder" />
+        <${Icon} name="folder" size=${18} />
     </button>`;
 }

@@ -1,7 +1,7 @@
 // What the server tests share: an isolated Pi install and data folder, a scripted model, and small helpers. Import
 // this before anything from src/: it points Pi's config at a temporary folder first.
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { home, root, work } from "./isolate.ts";
+import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
@@ -9,24 +9,14 @@ import { fauxAssistantMessage, fauxProvider, fauxText } from "@earendil-works/pi
 import { type ConversationId, UsageDoc } from "@earendil-works/pi-durable";
 import type { Attachment } from "../src/server/commands.ts";
 import type { User } from "../src/server/config.ts";
+import type { LimitTuning } from "../src/server/limit-gate.ts";
 import { SENT_STAMP } from "../src/server/sent-at.ts";
 import type { Client } from "../src/server/room.ts";
+import { PocketApp } from "../src/server/app.ts";
+
+export { home, root, work };
 
 export const context = BACKGROUND_CONTEXT;
-
-export const root = mkdtempSync(join(tmpdir(), "pi-pocket-test-"));
-// Isolate from the real Pi install: its auth, settings, skills, and Lancet Guard.
-process.env.PI_CODING_AGENT_DIR = join(root, "agent");
-process.env.PI_POCKET_GUARD = "off";
-mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
-/** The folder test sessions work in. */
-export const work = join(root, "work");
-mkdirSync(work);
-/** The home folder the app finds `~/.agents/skills` in, for the same isolation. */
-export const home = join(root, "home");
-mkdirSync(home);
-
-const { PocketApp } = await import("../src/server/app.ts");
 
 export type App = Awaited<ReturnType<typeof PocketApp.open>>;
 
@@ -62,7 +52,13 @@ export function scriptedModel(route: FauxResponseStep = echo) {
             { id: "faux-1" },
             { id: "faux-2" },
             { id: "faux-vision", input: ["text", "image"] },
+            { id: "faux-native" },
         ],
+    });
+
+    // A model whose provider takes tool changes in the messages, as Claude 4.8 and 5 and later do.
+    Object.assign(faux.getModel("faux-native")!, {
+        compat: { supportsMidConvoSystemMessages: true, supportsMidConvoToolChanges: true },
     });
 
     // Plenty: a test file of many subagents (each of whose turns takes one) used 200 up.
@@ -76,6 +72,7 @@ export function openApp(
     model: ReturnType<typeof scriptedModel>,
     dataDir = join(root, "data"),
     now?: () => number,
+    limits?: Partial<LimitTuning>,
 ): Promise<App> {
     return PocketApp.open({
         dataDir,
@@ -85,6 +82,7 @@ export function openApp(
         configureModels: (models) => models.registerNativeProvider(model.provider),
         home,
         ...(now === undefined ? {} : { now }),
+        ...(limits === undefined ? {} : { limits }),
     });
 }
 
@@ -143,6 +141,31 @@ export async function newSession(app: App, cwd = work): Promise<ConversationId> 
     return id;
 }
 
+export async function loadTools(app: App, id: ConversationId, ...names: string[]): Promise<void> {
+    await (
+        await app.conversation(id)
+    ).configure(
+        { modelTools: { remove: [], add: names.map((name) => ({ name })) } } as never,
+        context,
+    );
+}
+
+/**
+ * Offer `subagent` in each session that `app` starts from now on, as if Pi had loaded it: it waits for tool search
+ * (`tool-search.ts`), and the scripted Pi of these tests calls it at once.
+ */
+export function offerSubagents(app: App): void {
+    const create = app.commands.createSession.bind(app.commands);
+
+    app.commands.createSession = async (...args: Parameters<typeof create>) => {
+        const created = await create(...args);
+
+        await loadTools(app, created.id, "subagent");
+
+        return created;
+    };
+}
+
 /** Send a message as the owner and wait for Pi's answer. */
 export async function say(
     app: App,
@@ -167,13 +190,14 @@ export async function modelTexts(app: App, id: ConversationId): Promise<string[]
 }
 
 /** A browser tab as the app sees it, recording every event it is sent. Attach it with `app.attach(tab.client)`. */
-export function fakeTab(id: ConversationId | undefined, user: User) {
+export function fakeTab(id: ConversationId | undefined, user: User, protocol = 2) {
     const events: { event: string; data: Record<string, unknown> }[] = [];
     const client: Client = {
         id: `tab-${crypto.randomUUID()}`,
         connection: `connection-${crypto.randomUUID()}`,
         user,
         conversationId: id,
+        protocol,
         sentEntries: new Set<number>(),
         orderKey: "",
         send: (event: string, data: unknown) =>
@@ -187,11 +211,6 @@ export function fakeTab(id: ConversationId | undefined, user: User) {
     return { client, events, last, field };
 }
 
-/** Block this thread for `ms`: `Atomics.wait` on a buffer nobody else has is the synchronous sleep Node offers. */
-function sleep(ms: number): void {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 /**
  * Remove the temporary folder: call from `after`, once the app is closed. A browser that has just been closed can
  * still be writing its profile, so a sweep can find the folder refilled. Node's own retry stays on the same `rmdir`
@@ -199,17 +218,11 @@ function sleep(ms: number): void {
  * freshly read tree, and the pause between attempts lets the browser finish.
  */
 export function cleanUp(): void {
-    for (let attempt = 0; ; attempt++) {
-        try {
-            rmSync(root, { recursive: true, force: true });
-
-            return;
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY" || attempt === 19) {
-                throw error;
-            }
-        }
-
-        sleep(250);
+    // A browser's helper processes can still write to its profile here for a moment after it closes: retry, and a
+    // folder that stays only warns, so a slow exit does not fail the file.
+    try {
+        rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    } catch (error) {
+        console.warn(`Could not remove ${root}: ${(error as Error).message}`);
     }
 }

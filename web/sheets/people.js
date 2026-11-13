@@ -1,6 +1,6 @@
 // People with access to this server, and invites for more.
 import { useEffect, useRef, useState } from "preact/hooks";
-import { Avatar } from "../avatar.js";
+import { Avatar, avatarBlob } from "../avatar.js";
 import {
     actions,
     api,
@@ -43,8 +43,13 @@ const cancelInvite = (invite) => {
 };
 
 export function InviteSheet({ session = null }) {
-    const { view, me } = store.state;
-    const here = view.conversation?.kind === "session" ? view.conversation : null;
+    const { view, me, sessions } = store.state;
+    const here =
+        session !== null
+            ? (sessions.find((each) => each.id === session) ?? null)
+            : view.conversation?.kind === "session"
+              ? view.conversation
+              : null;
     const [role, setRole] = useState("guest");
     const [only, setOnly] = useState(session !== null);
     // The owner's own other device: it signs in as the owner, not as someone new.
@@ -150,11 +155,16 @@ export function InviteSheet({ session = null }) {
             html`<div class="field">
                 <div class="label">They can</div>
                 <div class="segmented">
-                    <button class=${role === "guest" ? "on" : ""} onClick=${() => setRole("guest")}>
+                    <button
+                        class=${role === "guest" ? "on" : ""}
+                        aria-pressed=${role === "guest"}
+                        onClick=${() => setRole("guest")}
+                    >
                         Steer
                     </button>
                     <button
                         class=${role === "viewer" ? "on" : ""}
+                        aria-pressed=${role === "viewer"}
                         onClick=${() => setRole("viewer")}
                     >
                         View only
@@ -169,10 +179,18 @@ export function InviteSheet({ session = null }) {
                 html`<div class="field">
                     <div class="label">In</div>
                     <div class="segmented">
-                        <button class=${!only ? "on" : ""} onClick=${() => setOnly(false)}>
+                        <button
+                            class=${!only ? "on" : ""}
+                            aria-pressed=${!only}
+                            onClick=${() => setOnly(false)}
+                        >
                             Every session
                         </button>
-                        <button class=${only ? "on" : ""} onClick=${() => setOnly(true)}>
+                        <button
+                            class=${only ? "on" : ""}
+                            aria-pressed=${only}
+                            onClick=${() => setOnly(true)}
+                        >
                             Only this session
                         </button>
                     </div>
@@ -216,6 +234,7 @@ export function InviteSheet({ session = null }) {
                             This link only works on this device. To let other devices in, press <span class="mono">a</span> in the Pi Pocket terminal (or start it with <span class="mono">--access</span>) and pick Local network, Cloudflare Tunnel, or Tailscale. Then make a new invite.
                         </div>`
                     }
+                    <div class="invite-details">
                     <div class="qr" dangerouslySetInnerHTML=${{ __html: invite.svg }}></div>
                     <div class="invite-code">
                         <div class="invite-code-head">
@@ -241,6 +260,7 @@ export function InviteSheet({ session = null }) {
                         <div class="muted small">
                             Or enter it on the other device's sign-in screen.
                         </div>
+                    </div>
                     </div>
                     <div class="row">
                         <input
@@ -290,6 +310,40 @@ function lastSeen(person) {
     return `seen ${timeAgo(person.lastSeen)}${timeAgo(person.lastSeen) === "now" ? "" : " ago"}`;
 }
 
+/** Your own picture: choose one (cropped and shrunk here before it is sent), or take it away. */
+export function MyPhoto() {
+    const { me, users } = store.state;
+    const person = users.find((each) => each.id === me?.id) ?? me;
+    const input = useRef(null);
+
+    const choose = (event) => {
+        const file = event.currentTarget.files?.[0];
+
+        event.currentTarget.value = "";
+
+        if (file) {
+            attempt(async () => api("me/avatar", await avatarBlob(file)));
+        }
+    };
+
+    return html`<div class="my-photo">
+        <${Avatar} person=${person} size=${48} />
+        <input ref=${input} type="file" accept="image/*" hidden onChange=${choose} />
+        <button class="button" onClick=${() => input.current.click()}>
+            ${person.avatar ? "Change photo" : "Add photo"}
+        </button>
+        ${
+            person.avatar &&
+            html`<button
+                class="button ghost"
+                onClick=${() => attempt(() => api("me/avatar", undefined, { method: "DELETE" }))}
+            >
+                Remove photo
+            </button>`
+        }
+    </div>`;
+}
+
 /** Everyone with access: who is online, when the others were last here, and (for the owner) what each may do. */
 function PeopleList() {
     const { me, users, sessions } = store.state;
@@ -305,10 +359,16 @@ function PeopleList() {
 
     return html`<div class="group">
         <div class="group-title">People</div>
+        <div class="sheet-list">
         ${ordered.map(
             (person) => html`<div class="person-row" key=${person.id}>
-                <span class=${`online-dot ${person.online ? "on" : ""}`}></span>
-                <${Avatar} person=${person} size=${26} />
+                <span class="people-here">
+                    <${Avatar} person=${person} size=${32} />
+                    <span
+                        class=${`online-mark ${person.online ? "" : "away"}`}
+                        aria-hidden="true"
+                    ></span>
+                </span>
                 <div class="person-main">
                     <div>
                         ${person.name}
@@ -363,6 +423,7 @@ function PeopleList() {
                 }
             </div>`,
         )}
+        </div>
     </div>`;
 }
 
@@ -377,7 +438,10 @@ export function PeopleSheet() {
             </button>`
         }
         <${PeopleList} />
-        <button class="button wide" onClick=${() => openSheet({ type: "notifications" })}>
+        <button
+            class="button ghost wide sheet-footer"
+            onClick=${() => openSheet({ type: "notifications" })}
+        >
             Notifications on this device…
         </button>
     <//>`;

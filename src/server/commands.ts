@@ -5,9 +5,10 @@
  * command checks who may do it, and changes others should know about become activity lines in the session's chat.
  */
 import { randomUUID } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
-import { basename, extname, join } from "node:path";
-import type { Context } from "@earendil-works/chord";
+import { statSync } from "node:fs";
+import { basename, extname, join, sep } from "node:path";
+import type { Context } from "@earendil-works/chord/context";
+import { copyJson, type JsonValue } from "@earendil-works/chord/json";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
     clampThinkingLevel,
@@ -15,25 +16,35 @@ import {
     type ModelThinkingLevel,
     type TextContent,
 } from "@earendil-works/pi-ai";
-import { resizeImage } from "@earendil-works/pi-coding-agent";
 import {
     type AgentChange,
+    AgentDoc,
     type ConversationCreateOptions,
     type ConversationId,
+    type Cursor,
     defineTask,
     type EntryId,
+    type InputEntry,
+    InboxDoc,
     LiveDoc,
     type ModelRef,
     type SettledSubmissionRecord,
     type SubmissionId,
     type Task,
+    type TaskId,
     type TaskRuntime,
+    type Tx,
+    type UserInput,
 } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
 import {
     AuthorsDoc,
+    BrowserUseDoc,
     ChatDoc,
+    HeldDoc,
+    type HeldMessage,
+    InterruptsDoc,
     NotesDoc,
     PinsDoc,
     PlanDoc,
@@ -45,16 +56,35 @@ import {
     type SubagentRecord,
     SubagentsDoc,
 } from "./docs.ts";
-import { ATTACHMENTS_HEADING, FILE_BLOCK, FROM_PREFIX, NOTE_ENTRY } from "./entry-format.ts";
+import {
+    ATTACHMENTS_HEADING,
+    CONTEXT_BLOCK,
+    FILE_BLOCK,
+    FROM_PREFIX,
+    NOTE_ENTRY,
+    splitAttachments,
+} from "./entry-format.ts";
 import { describe, HttpError, optionalText } from "./errors.ts";
+import { attribute } from "./fence.ts";
 import { homePath } from "./paths.ts";
+import { forModel, MAX_INLINE_IMAGE, modelImage } from "./model-images.ts";
 import { mentionedPaths, viewFile } from "./files.ts";
 import { isThinkingLevel, THINKING_LEVELS } from "./models.ts";
 import { writePiSession } from "./pi-sessions.ts";
 import { snippet } from "./projection.ts";
+import { globalModelSettings, projectModelDefault } from "./project-model.ts";
 import { expandPromptTemplate, expandSkillCommand, unwrapSkill } from "./prompts.ts";
-import { clientKey, ownRequest, requestFor } from "./requests.ts";
-import { type Resend, resendContent, resendRequest, ResendTask, userContent } from "./resend.ts";
+import { clientKey, ownRequest, requestFor, requestPerson } from "./requests.ts";
+import {
+    type Interrupt,
+    interruptTask,
+    type Requeue,
+    type Resend,
+    resendContent,
+    resendRequest,
+    ResendTask,
+    userContent,
+} from "./resend.ts";
 import { SUBAGENT_MODES, type SubagentMode } from "./subagent-policy.ts";
 import { whyUnanswered } from "./subagent-runs.ts";
 import { wantsTitle, writeTitle } from "./titles.ts";
@@ -72,20 +102,49 @@ const context = BACKGROUND_CONTEXT;
 
 export type Attachment = { path: string; name: string; mime: string; size: number };
 
+// A name can hold " (", so the path is the part that ends with "-name".
+function attachedFile(line: string, uploads: string): Attachment[] {
+    const tail = /, ([^,]+), (\d+) bytes\)(?: \[Image: .*)?$/.exec(line);
+
+    if (!line.startsWith("- ") || tail === null) {
+        return [];
+    }
+
+    const head = line.slice(2, tail.index);
+
+    for (let at = head.indexOf(" ("); at !== -1; at = head.indexOf(" (", at + 1)) {
+        const path = head.slice(0, at);
+        const name = head.slice(at + 2);
+
+        if (path.startsWith(uploads + sep) && path.endsWith(`-${name}`)) {
+            const mime = tail[1] === "unknown type" ? "" : tail[1]!;
+
+            return [{ path, name, mime, size: Number(tail[2]) }];
+        }
+    }
+
+    return [];
+}
+
 export interface SubmitRequest {
     text: string;
     attachments?: Attachment[];
-    /** `steer` joins the running work after its current tool round; anything else queues a follow-up while busy. */
-    mode?: "steer" | "followUp";
+    /**
+     * `steer` joins the running work after its current tool round; `interrupt` stops the run at once (as Stop does) and
+     * sends the message to the idle conversation; anything else queues a follow-up while busy.
+     */
+    mode?: "steer" | "followUp" | "interrupt";
     /** Client-generated, so a retried POST does not submit twice. */
     requestId: string;
     /** Send the files the message mentions with `@` along with it, so Pi need not read them first. */
     inlineFiles?: boolean;
+    /**
+     * PiP only: the session a passage quoted in the message came from (Ask PiP by a selection). PiP gets which session
+     * it is, unseen by people (`CONTEXT_BLOCK`).
+     */
+    about?: { session: number };
 }
 
-/** Attached images that also go to the model itself, when it takes images. */
-const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
-const MAX_INLINE_IMAGE = 5 * 1024 * 1024;
 /** How many `@` mentioned files go along with a message, and how much of them. */
 const MAX_MENTIONED = 10;
 const MAX_MENTIONED_FILE = 100_000;
@@ -96,6 +155,8 @@ const IMAGE_MIME: Record<string, string> = {
     ".jpeg": "image/jpeg",
     ".gif": "image/gif",
     ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
 };
 const MAX_TITLE = 120;
 /** A title as stored: one line, so it cannot pass for more lines where it is quoted (PiP's lists, reports). */
@@ -144,20 +205,6 @@ function entryIdOf(value: unknown): number {
     }
 
     return id;
-}
-
-/**
- * An image file for the model, at most 2000 pixels a side as Pi's read tool sends images: models refuse bigger ones once
- * a conversation holds many, and then every request fails until they leave its context.
- */
-async function modelImage(path: string, mimeType: string): Promise<ImageContent> {
-    const image = await resizeImage(readFileSync(path), mimeType);
-
-    if (image === null) {
-        throw new Error("it could not be made small enough for the model");
-    }
-
-    return { type: "image", mimeType: image.mimeType, data: image.data };
 }
 
 /** A request's model, when it names one, must name a provider and a model id. */
@@ -276,7 +323,7 @@ async function followed(
         if (watch !== undefined) {
             // A listener is never called inline, so the value it started on is this one's to look at.
             await look(watch.value);
-            watch.start(look);
+            watch.start((call) => (call.kind === "value" ? look(call.value) : looking));
         }
 
         return await Promise.race([submission.wait(context), left]);
@@ -296,9 +343,23 @@ export class Commands {
      * says who dealt with the failure. A message left in the queue by a run that failed ends it, settling nothing.
      */
     readonly followTask: Task<Followed, { phase: "wait" }, null, object>;
+    /** An Interrupt (`submit`, `moveQueued`): it stops the run it was made for, by that run's id. */
+    readonly interruptTask: Task<Interrupt, { phase: "send" }, null, object>;
 
     constructor(app: PocketApp) {
         this.#app = app;
+        this.interruptTask = interruptTask(async (run, context) => {
+            const harness = this.#app.harness;
+            const task = run as unknown as TaskId;
+            const record = await harness.getTask(task, context);
+
+            if (record === undefined || record.state.status === "terminal") {
+                return;
+            }
+
+            await harness.abortTask(task, context);
+            await harness.waitForTask(task, context);
+        });
         this.followTask = defineTask<Followed, { phase: "wait" }, null>({
             name: "pocket.follow-failure",
             version: 1,
@@ -345,6 +406,19 @@ export class Commands {
     async createSession(
         user: User,
         request: { cwd?: string; title?: string; worktree?: unknown },
+        {
+            projectDefaults = true,
+            model,
+            thinkingLevel,
+            init,
+        }: {
+            projectDefaults?: boolean;
+            /** A model the caller already checked: it replaces the default, in the commit that makes the session. */
+            model?: ModelRef;
+            thinkingLevel?: ModelThinkingLevel;
+            /** Runs in the commit that makes the session, after its entry is written. */
+            init?: (tx: Tx, id: ConversationId) => Promise<void>;
+        } = {},
     ): Promise<{ id: ConversationId }> {
         const app = this.#app;
 
@@ -356,10 +430,16 @@ export class Commands {
 
         const given = optionalText(request.title, "title");
         const title = (given === undefined ? undefined : oneLine(given)) || undefined;
-        const folder = app.workspace.checkDirectory(
-            optionalText(request.cwd, "cwd") ?? app.defaultCwd,
-        );
-        const initial = this.#defaultModel();
+        const requested = optionalText(request.cwd, "cwd") ?? app.defaultCwd;
+
+        app.requireWorkspaceOwner(user, requested);
+        const remote = app.workspaceScheme(requested) !== undefined;
+
+        if (remote && request.worktree === true) {
+            throw new HttpError(400, "Remote workspaces do not support worktrees.");
+        }
+
+        const folder = await app.resolveCwd(requested);
         const now = Date.now();
 
         return this.#inPlace(
@@ -367,15 +447,26 @@ export class Commands {
             request.worktree === true,
             title ?? basename(folder),
             async ({ cwd, worktree }) => {
+                // An internal caller about to apply a person's explicit model keeps its previous starting pair.
+                const initial = this.#defaultModel(
+                    undefined,
+                    projectDefaults && model === undefined && !remote ? cwd : undefined,
+                );
                 const conversation = await app.harness.createConversation(
                     {
                         ownership: { kind: "ownerless" },
                         agent: {
                             cwd,
-                            ...(initial.model === undefined ? {} : { model: initial.model }),
-                            ...(initial.thinkingLevel === undefined
-                                ? {}
-                                : { thinkingLevel: initial.thinkingLevel }),
+                            ...(model !== undefined
+                                ? { model }
+                                : initial.model === undefined
+                                  ? {}
+                                  : { model: initial.model }),
+                            ...(thinkingLevel !== undefined
+                                ? { thinkingLevel }
+                                : initial.thinkingLevel === undefined
+                                  ? {}
+                                  : { thinkingLevel: initial.thinkingLevel }),
                         },
                         init: async (tx, id) => {
                             const sessions = await tx.doc(SessionsDoc);
@@ -388,6 +479,7 @@ export class Commands {
                                 ...(title === undefined ? {} : { title }),
                                 ...(worktree === undefined ? {} : { worktree }),
                             };
+                            await init?.(tx, id);
                         },
                     },
                     context,
@@ -486,6 +578,10 @@ export class Commands {
         await app.requireDriver(id, user);
         const worktree = app.sessionMeta(id)?.worktree;
 
+        if (app.workspaceScheme(app.cwdOf(id)) !== undefined) {
+            throw new HttpError(400, "Remote workspaces do not support worktrees.");
+        }
+
         if (worktree === undefined) {
             throw new HttpError(404, "This session has no worktree");
         }
@@ -554,13 +650,17 @@ export class Commands {
      * The model a new session starts with, always one a person chose: `prefer` (with its thinking level) when it is
      * signed in here, or else the owner's default, even when it is not signed in now: the session then shows that, and
      * its first message fails in sight, where another model would spend on what nobody chose for it. Without an owner's
-     * default, the one last picked, or Pi's default, when signed in. Never the first model there is: with none of
-     * these, the session starts without a model, and someone picks one.
+     * default, ordinary sessions consult trusted project defaults in their final cwd, then the last picked model,
+     * then Pi's global default. A no-cwd caller (imports and PiP itself) keeps the legacy default selection. Never
+     * the first model there is: with none chosen, the session starts without a model, and someone picks one.
      */
-    #defaultModel(prefer?: {
-        model: { provider: string; modelId: string } | null;
-        thinkingLevel: string;
-    }): {
+    #defaultModel(
+        prefer?: {
+            model: { provider: string; modelId: string } | null;
+            thinkingLevel: string;
+        },
+        cwd?: string,
+    ): {
         model?: ModelRef;
         thinkingLevel?: ModelThinkingLevel;
     } {
@@ -575,12 +675,27 @@ export class Commands {
         const chosen = config.defaultModel;
         const owners =
             chosen === undefined ? undefined : models.getModel(chosen.provider, chosen.modelId);
-        const lastPicked = chosen === undefined ? pick(last?.provider, last?.modelId) : undefined;
-        const pis =
-            chosen === undefined && lastPicked === undefined
-                ? pick(settings.getDefaultProvider(), settings.getDefaultModel())
+        const defaults =
+            chosen === undefined && cwd !== undefined ? globalModelSettings(cwd) : settings;
+        const project =
+            chosen === undefined && cwd !== undefined
+                ? projectModelDefault(cwd, defaults, models)
                 : undefined;
-        const model = preferred ?? owners ?? lastPicked ?? pis;
+        const lastPicked =
+            chosen === undefined && project === undefined
+                ? pick(last?.provider, last?.modelId)
+                : undefined;
+        // Ordinary sessions must not inherit a different project's settings from the server's starting folder.
+        // Imported sessions and PiP's own conversation keep their existing selection behavior.
+        const global = cwd === undefined ? undefined : defaults.getGlobalSettings();
+        const pis =
+            chosen === undefined && project === undefined && lastPicked === undefined
+                ? pick(
+                      cwd === undefined ? settings.getDefaultProvider() : global?.defaultProvider,
+                      cwd === undefined ? settings.getDefaultModel() : global?.defaultModel,
+                  )
+                : undefined;
+        const model = preferred ?? owners ?? project?.model ?? lastPicked ?? pis;
 
         if (model === undefined) {
             return {};
@@ -590,9 +705,13 @@ export class Commands {
             ? prefer?.thinkingLevel
             : owners !== undefined
               ? chosen?.thinkingLevel
-              : lastPicked !== undefined
-                ? last?.thinkingLevel
-                : settings.getDefaultThinkingLevel()) ?? "off") as ModelThinkingLevel;
+              : project !== undefined
+                ? project.thinkingLevel
+                : lastPicked !== undefined
+                  ? last?.thinkingLevel
+                  : cwd === undefined
+                    ? settings.getDefaultThinkingLevel()
+                    : global?.defaultThinkingLevel) ?? "off") as ModelThinkingLevel;
 
         return {
             model: { provider: model.provider, modelId: model.id },
@@ -604,7 +723,7 @@ export class Commands {
         id: ConversationId,
         user: User,
         patch: { title?: string; archived?: boolean },
-    ): Promise<void> {
+    ): Promise<{ repeating: number }> {
         const app = this.#app;
 
         app.requireSee(user, id);
@@ -650,6 +769,14 @@ export class Commands {
                     : "brought the session back from the archive",
             );
         }
+
+        // Archiving leaves its repeating schedules running: the person is told how many.
+        const repeating =
+            patch.archived === true
+                ? (await app.schedules.list(id)).filter((item) => item.every !== undefined).length
+                : 0;
+
+        return { repeating };
     }
 
     /**
@@ -661,6 +788,10 @@ export class Commands {
         user: User,
         request: SubmitRequest,
         via?: string,
+        admission?: {
+            beforeSubmit(): Promise<{ user: User; context: Context }>;
+            afterSubmit(): void;
+        },
     ): Promise<{ submissionId: SubmissionId; requestId: string }> {
         const app = this.#app;
 
@@ -676,11 +807,13 @@ export class Commands {
         const conversation = await app.conversation(id);
         const typed = request.text.trim();
         // `/skill:name request` sends the skill with the request; `/name arguments`, Pi's prompt template of that name.
-        const text = typed.startsWith("/skill:")
+        const expanded = typed.startsWith("/skill:")
             ? (expandSkillCommand(typed, app.skillCommands(id)) ?? typed)
             : typed.startsWith("/")
               ? (expandPromptTemplate(typed, app.promptTemplates(id)) ?? typed)
               : typed;
+        // A value an extension hides (`host.hide`), pasted into the message, is never stored nor sent to the model.
+        const text = app.hidden.replace(expanded, id);
         const attachments = request.attachments ?? [];
 
         if (text === "" && attachments.length === 0) {
@@ -699,37 +832,61 @@ export class Commands {
 
         app.spend.check(user, id);
 
-        const lines = attachments.map(
-            (file) =>
-                `- ${file.path} (${file.name}, ${file.mime || "unknown type"}, ${file.size} bytes)`,
+        // Most were made ready as they were uploaded (`model-images.ts`); the rest are made side by
+        // side, in their order.
+        const images = model.input.includes("image")
+            ? attachments.filter((file) => forModel(file.mime, file.size))
+            : [];
+        const made = await Promise.allSettled(
+            images.map((file) => modelImage(file.path, file.mime)),
         );
+        // What differs between a file and the image the model gets goes on the file's line.
+        const notes = new Map<Attachment, string>();
+
+        made.forEach((result, index) => {
+            if (result.status === "fulfilled" && result.value.note !== undefined) {
+                notes.set(images[index]!, result.value.note);
+            }
+        });
+
+        const lines = attachments.map((file) => {
+            const note = notes.get(file);
+            const line = `- ${file.path} (${file.name}, ${file.mime || "unknown type"}, ${file.size} bytes)`;
+
+            return note === undefined ? line : `${line} ${note}`;
+        });
+        // The heading whole, with files alone too: what reads the message splits it there.
         const written =
-            lines.length === 0 ? text : `${text}${ATTACHMENTS_HEADING}${lines.join("\n")}`.trim();
+            lines.length === 0 ? text : `${text}${ATTACHMENTS_HEADING}${lines.join("\n")}`;
         const body = this.messageText(
             user,
             via === undefined ? written : `[via ${via}] ${written}`,
         );
+        const about = this.#aboutSession(id, user, request.about);
         const mentioned =
             request.inlineFiles === true
                 ? await this.#mentionedFiles(id, user, typed, model.input.includes("image"))
                 : [];
-        const parts: (TextContent | ImageContent)[] = [{ type: "text", text: body }, ...mentioned];
+        // A file's text that a message brings along hides what extensions hide (`host.hide`), as the message does.
+        const parts: (TextContent | ImageContent)[] = [
+            { type: "text", text: body },
+            ...mentioned.map((part) =>
+                part.type === "text" ? { ...part, text: app.hidden.replace(part.text, id) } : part,
+            ),
+            ...(about === undefined ? [] : [{ type: "text" as const, text: about }]),
+        ];
 
-        for (const file of attachments) {
-            if (
-                !model.input.includes("image") ||
-                !IMAGE_TYPES.has(file.mime) ||
-                file.size > MAX_INLINE_IMAGE
-            ) {
-                continue;
+        made.forEach((result, index) => {
+            if (result.status === "fulfilled") {
+                parts.push(result.value.image);
+            } else {
+                app.notice(
+                    "warning",
+                    `Could not attach ${images[index]!.name}: ${describe(result.reason)}`,
+                    id,
+                );
             }
-
-            try {
-                parts.push(await modelImage(file.path, file.mime));
-            } catch (error) {
-                app.notice("warning", `Could not attach ${file.name}: ${describe(error)}`, id);
-            }
-        }
+        });
 
         const content = parts.length === 1 ? body : parts;
         const requestId =
@@ -738,25 +895,111 @@ export class Commands {
                 : requestFor(user.id, clientKey(request.requestId));
         // A failed subagent's failure as the person writes to it: what their message comes to settles it.
         const failure = await this.#failureOf(id);
-        const submission = await conversation.submit(
-            {
-                type: "input",
-                content,
-                whenBusy: request.mode === "steer" ? "steer" : "followUp",
-                requestId,
-            },
-            context,
-        );
+
+        let submitContext = context;
+
+        // Human extension starts acquire a short policy lease after preparation. Its context checks policy again
+        // when durable admission reaches the mutation line, not just before it joins the queue.
+        if (admission !== undefined) {
+            const accepted = await admission.beforeSubmit();
+
+            user = accepted.user;
+            submitContext = accepted.context;
+            submitContext.abortSignal?.throwIfAborted();
+        }
+
+        // A retry of a request finds its first submission: it is no new message, and no event goes out for it again.
+        const known =
+            app.pip.ownerOf(id) === undefined &&
+            (await app.harness.commit((tx) => tx.submissionByRequest(id, requestId), context)) !==
+                undefined;
+        // Only a person's own message interrupts, never one sent for them (`via`). The same durable handoff as a
+        // queued message's Interrupt keeps everything waiting, before it stops the run. Admission releases its lease
+        // once that handoff is stored, not while the task stops the run and puts the messages back.
+        const admitted = await (
+            request.mode === "interrupt" && via === undefined
+                ? this.#interrupt(id, { content, requestId }, submitContext)
+                : conversation
+                      .submit(
+                          {
+                              type: "input",
+                              content,
+                              whenBusy: request.mode === "steer" ? "steer" : "followUp",
+                              requestId,
+                          },
+                          submitContext,
+                      )
+                      .then((submission) => ({ submissionId: submission.id }))
+        ).finally(() => admission?.afterSubmit());
+        let submissionId: SubmissionId;
+
+        if ("task" in admitted) {
+            if (admitted.started) {
+                await app.collab.activity(id, user, "interrupted the run");
+            }
+
+            await app.harness.waitForTask(admitted.task, context);
+            const sent = await app.harness.commit(
+                (tx) => tx.submissionByRequest(id, requestId),
+                context,
+            );
+
+            if (sent === undefined) {
+                throw new HttpError(409, "The Interrupt message could not be sent. Try again.");
+            }
+
+            submissionId = sent.id;
+        } else {
+            submissionId = admitted.submissionId;
+        }
+
+        const submission = (await app.harness.submission(submissionId, context))!;
 
         app.collab.setTyping(id, user, null);
-        await this.#touched(id, typed, text === typed ? undefined : text);
+        // The title comes from the message as it was stored: without hidden values.
+        const titled = app.hidden.replace(typed, id);
+
+        await this.#touched(id, titled, text === titled ? undefined : text);
         this.#reportUnanswered(id, submission.wait(context));
 
         if (failure !== undefined) {
             await this.#followFailure(id, user, failure, requestId);
         }
 
+        // For extensions (`host.on`): once for each message (two retries at once, too), never for PiP's conversation,
+        // which is its person's alone.
+        if (app.pip.ownerOf(id) === undefined && !known && this.#announce(submission.id)) {
+            app.events.emit("message.sent", {
+                conversationId: Number(id),
+                by: user.id,
+                submissionId: String(submission.id),
+                text,
+                ...(via === undefined ? {} : { via }),
+            });
+        }
+
         return { submissionId: submission.id, requestId };
+    }
+
+    /** Submissions `message.sent` went out for lately: a retry that raced its first try finds its id here. */
+    readonly #announced = new Set<string>();
+
+    /** Whether to send `message.sent` for a submission: once only, as far as this process knows. */
+    #announce(submissionId: unknown): boolean {
+        const key = String(submissionId);
+
+        if (this.#announced.has(key)) {
+            return false;
+        }
+
+        this.#announced.add(key);
+
+        // The newest few hundred are enough: a retry comes within seconds.
+        if (this.#announced.size > 500) {
+            this.#announced.delete(this.#announced.values().next().value!);
+        }
+
+        return true;
     }
 
     /** When a subagent (`id`, its conversation) failed, if it is failed now (not stopped); undefined otherwise. */
@@ -878,6 +1121,54 @@ export class Commands {
     }
 
     /**
+     * For a message to PiP that asks about a passage: which session it came from, for PiP alone (`CONTEXT_BLOCK`). Only
+     * a session its person may see, and never another PiP; nothing for a message to anyone else.
+     */
+    #aboutSession(
+        id: ConversationId,
+        user: User,
+        about: SubmitRequest["about"],
+    ): string | undefined {
+        const app = this.#app;
+
+        if (about === undefined) {
+            return undefined;
+        }
+
+        const session = typeof about === "object" && about !== null ? about.session : undefined;
+
+        if (app.pip.ownerOf(id) === undefined) {
+            throw new HttpError(400, "Only a message to PiP says which session it is about");
+        }
+
+        if (typeof session !== "number" || !Number.isSafeInteger(session) || session <= 0) {
+            throw new HttpError(400, "about.session must be a session's number");
+        }
+
+        const target = session as unknown as ConversationId;
+        const meta = app.sessionMeta(target);
+
+        if (meta === undefined || meta.pip !== undefined) {
+            throw new HttpError(404, "There is no such session.");
+        }
+
+        app.requireSee(user, target);
+
+        // Anyone in that session can name it: no invisible characters carry words past people to PiP.
+        const plain = (text: string, max: number) =>
+            attribute(snippet(text.replace(/\p{Cf}/gu, "").replace(/\p{Cc}/gu, " "), max));
+        const title = plain(app.hidden.replace(meta.title ?? "untitled", target), 120);
+        const folder = plain(meta.cwd, 300);
+
+        return [
+            `${CONTEXT_BLOCK} session="${session}" title="${title}" folder="${folder}">`,
+            `The quoted passage at the start of this message comes from Pi's reply in session ${session}.`,
+            "Read that session with session_read for more context when the question needs it.",
+            "</pocket-context>",
+        ].join("\n");
+    }
+
+    /**
      * The files a message mentions with `@`, for Pi: text files as `<file>` blocks, as Pi's terminal app sends files
      * given on its command line, and images as images when the model takes them. Only files this person may load
      * through the session; anything else stays a mention, which Pi can read itself.
@@ -917,7 +1208,7 @@ export class Commands {
 
                 if (mime !== undefined) {
                     if (images && statSync(file).size <= MAX_INLINE_IMAGE) {
-                        parts.push(await modelImage(file, mime));
+                        parts.push((await modelImage(file, mime)).image);
                     }
 
                     continue;
@@ -1041,6 +1332,32 @@ export class Commands {
         );
     }
 
+    /**
+     * Send the request of a run that waits for a provider's limit now, rather than at its time (`limit-gate.ts`): of
+     * this conversation, or of its subagents. The request goes whether or not the limit has cleared: the provider
+     * rejects it at no cost, or answers. Who may see and steer the session may. False: nothing there waits.
+     */
+    async retryLimit(id: ConversationId, user: User): Promise<boolean> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+
+        let sent = app.limits.retryNow(Number(id));
+
+        for (const wait of app.limits.waits()) {
+            if (app.rootOf(wait.conversationId as unknown as ConversationId) === id) {
+                sent = app.limits.retryNow(wait.conversationId) || sent;
+            }
+        }
+
+        if (sent) {
+            await app.collab.activity(id, user, "tried again without waiting for the limit");
+        }
+
+        return sent;
+    }
+
     /** Stop the run. Anyone who can steer may, even while someone else drives: stopping is the safe direction. */
     async abort(id: ConversationId, user: User): Promise<void> {
         const app = this.#app;
@@ -1049,15 +1366,251 @@ export class Commands {
         app.requireSteer(user);
         const conversation = await app.conversation(id);
         const busy = app.isBusy(id);
+        // People's waiting messages are held, before the stop can withdraw them: they wait until someone sends them. PiP's
+        // panel has no place to show them, so a Stop there withdraws them, as before.
+        const held = app.pip.ownerOf(id) === undefined ? await this.#hold(id) : 0;
 
-        // Stop withdraws what waits in the queue, subagents' reports too: a person meant them gone.
+        // Subagents' reports go: a person meant the work stopped.
         await this.#discardReports(id);
         void conversation
             .abort(context)
             .catch((error: unknown) => app.notice("error", `Abort failed: ${describe(error)}`, id));
 
-        if (busy) {
-            await app.collab.activity(id, user, "stopped the run");
+        if (busy || held > 0) {
+            await app.collab.activity(
+                id,
+                user,
+                held === 0
+                    ? "stopped the run"
+                    : `stopped the run; ${held} queued ${held === 1 ? "message waits" : "messages wait"} to be sent`,
+            );
+        }
+    }
+
+    /**
+     * Take the queue's messages out of it into `HeldDoc`, in one commit, so the stop that follows cannot withdraw them.
+     * Writes stay queued, and a batch of subagents' reports goes back to its courier. How many were held.
+     */
+    async #hold(id: ConversationId): Promise<number> {
+        const app = this.#app;
+        // Request ids of the queued messages, from Pi Durable's records: a commit cannot read a submission by its id.
+        const requests = new Map<number, string | undefined>();
+
+        for (let attempt = 0; ; attempt++) {
+            const queued = (await app.harness.snapshot(InboxDoc, id, context))?.items ?? [];
+
+            for (const item of queued) {
+                if (item.mode !== "write" && !requests.has(Number(item.id))) {
+                    const record = await (
+                        await app.harness.submission(item.id, context)
+                    )?.status(context);
+
+                    requests.set(Number(item.id), record?.requestId);
+                }
+            }
+
+            const held = await app.harness.commit(async (tx) => {
+                const items = (await tx.doc(InboxDoc, id)).items;
+                // Every table read comes before the commit's first table write.
+                const subagents = await tx.doc(SubagentsDoc, id);
+                const batch =
+                    subagents.sending === undefined
+                        ? undefined
+                        : await tx.submissionByRequest(id, subagents.sending.request);
+                const now = app.now();
+                const taken = new Set<SubmissionId>();
+                const adding: HeldMessage[] = [];
+
+                for (const item of items) {
+                    if (item.mode === "write" || item.id === batch?.id) {
+                        continue;
+                    }
+
+                    if (!requests.has(Number(item.id))) {
+                        // Queued since the requests were read. Stop must not fail: after a few tries, it goes.
+                        if (attempt < 3) {
+                            return "again";
+                        }
+
+                        continue;
+                    }
+
+                    const first = requests.get(Number(item.id));
+                    const person = requestPerson(first);
+
+                    taken.add(item.id);
+                    adding.push({
+                        key: String(item.id),
+                        content: copyJson(item.content) as JsonValue,
+                        mode: item.mode,
+                        // The person is in the request id: the new one keeps it, for who wrote it and whose work it is.
+                        requestId:
+                            first === undefined
+                                ? `held-${String(item.id)}`
+                                : `${first.replace(/(~\d+)+$/, "")}~${String(item.id)}`,
+                        ...(item.entry === undefined
+                            ? {}
+                            : { entry: copyJson(item.entry) as JsonValue }),
+                        ...(person?.wrote === true ? { by: person.userId } : {}),
+                        heldAt: now,
+                    });
+                }
+
+                if (taken.size === 0) {
+                    return 0;
+                }
+
+                for (let at = items.length - 1; at >= 0; at--) {
+                    if (taken.has(items[at]!.id)) {
+                        items.splice(at, 1);
+                    }
+                }
+
+                for (const item of taken) {
+                    tx.settleSubmission(item, { status: "unanswered", reason: "aborted" });
+                }
+
+                (await tx.doc(HeldDoc, id)).items.push(...adding);
+
+                return taken.size;
+            }, context);
+
+            if (held !== "again") {
+                return held;
+            }
+        }
+    }
+
+    /**
+     * Send the messages a Stop held, in their order, each as it was queued: they go to Pi as the people who wrote them.
+     * Sending them is sending to Pi: it takes the wheel and the spend limit, as a message does. Each keeps its request
+     * id, so a retry after a failure sends none twice.
+     */
+    async sendHeld(id: ConversationId, user: User): Promise<number> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+        await app.requireDriver(id, user);
+
+        if (app.pip.ownerOf(id) !== undefined && !app.pip.available(user)) {
+            throw new HttpError(409, "PiP is turned off in Extensions.");
+        }
+
+        app.spend.check(user, id);
+        const conversation = await app.conversation(id);
+        const held = (await app.harness.snapshot(HeldDoc, id, context))?.items ?? [];
+
+        for (const item of held) {
+            await conversation.submit(
+                {
+                    type: "input",
+                    content: item.content as unknown as UserInput,
+                    whenBusy: item.mode,
+                    requestId: item.requestId,
+                    ...(item.entry === undefined
+                        ? {}
+                        : { entry: item.entry as unknown as InputEntry }),
+                },
+                context,
+            );
+        }
+
+        const sent = new Set(held.map((item) => item.key));
+
+        await app.harness.commit(async (tx) => {
+            const doc = await tx.doc(HeldDoc, id);
+
+            doc.items = doc.items.filter((item) => !sent.has(item.key));
+        }, context);
+
+        if (held.length > 0) {
+            await app.collab.activity(
+                id,
+                user,
+                `sent the ${held.length === 1 ? "held message" : `${held.length} held messages`}`,
+            );
+        }
+
+        return held.length;
+    }
+
+    /** Take a held message away for good. Anyone may their own; someone else's needs the right to drive, as in the queue. */
+    async dropHeld(id: ConversationId, user: User, key: string): Promise<void> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+        const item = await this.#heldItem(id, key);
+
+        if (item.by !== user.id) {
+            await app.requireDriver(id, user);
+        }
+
+        await this.#unhold(id, key);
+
+        if (item.by !== undefined && item.by !== user.id) {
+            const author = app.config.userById(item.by)?.name ?? "someone";
+
+            await app.collab.activity(id, user, `withdrew ${author}’s held message`);
+        }
+    }
+
+    /** Take one's own held message back into the message box, as Edit does for a queued one. */
+    async editHeld(
+        id: ConversationId,
+        user: User,
+        key: string,
+    ): Promise<{ text: string; attachments: Attachment[] }> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+        const item = await this.#heldItem(id, key);
+
+        if (item.by !== user.id) {
+            throw new HttpError(403, "Only its sender can edit a held message.");
+        }
+
+        await this.#unhold(id, key);
+        const [written, files] = splitAttachments(
+            userContent({ content: item.content as unknown as UserInput }).text.replace(
+                FROM_PREFIX,
+                "",
+            ),
+        );
+        const uploads = app.workspace.uploadDirectory(id);
+
+        return {
+            text: written,
+            attachments: (files ?? "").split("\n").flatMap((line) => attachedFile(line, uploads)),
+        };
+    }
+
+    async #heldItem(id: ConversationId, key: string): Promise<HeldMessage> {
+        const item = (await this.#app.harness.snapshot(HeldDoc, id, context))?.items.find(
+            (each) => each.key === key,
+        );
+
+        if (item === undefined) {
+            throw new HttpError(409, "That message is no longer held.");
+        }
+
+        return item;
+    }
+
+    async #unhold(id: ConversationId, key: string): Promise<void> {
+        const gone = await this.#app.harness.commit(async (tx) => {
+            const doc = await tx.doc(HeldDoc, id);
+            const before = doc.items.length;
+
+            doc.items = doc.items.filter((item) => item.key !== key);
+
+            return doc.items.length < before;
+        }, context);
+
+        if (!gone) {
+            throw new HttpError(409, "That message is no longer held.");
         }
     }
 
@@ -1093,7 +1646,7 @@ export class Commands {
 
         app.requireSee(user, id);
         app.requireSteer(user);
-        const by = app.attribution.knownSubmitter(submissionId);
+        const by = await app.attribution.submitter(submissionId);
 
         if (by !== user.id) {
             await app.requireDriver(id, user);
@@ -1115,6 +1668,270 @@ export class Commands {
         return result;
     }
 
+    async editQueued(
+        id: ConversationId,
+        user: User,
+        submissionId: number,
+    ): Promise<{ text: string; attachments: Attachment[] }> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+
+        if (!Number.isInteger(submissionId) || submissionId <= 0) {
+            throw new HttpError(400, "Say which queued message to edit.");
+        }
+
+        if ((await app.attribution.submitter(submissionId)) !== user.id) {
+            throw new HttpError(403, "Only its sender can edit a queued message.");
+        }
+
+        const item = (await app.harness.snapshot(InboxDoc, id, context))?.items.find(
+            (entry) => Number(entry.id) === submissionId,
+        );
+        const result =
+            item === undefined || item.mode === "write"
+                ? "not_found"
+                : await app.harness.abortSubmission(
+                      submissionId as unknown as SubmissionId,
+                      context,
+                      id,
+                  );
+
+        if (item === undefined || item.mode === "write" || result !== "aborted") {
+            throw new HttpError(409, "That message has already gone to Pi.");
+        }
+
+        // A `/skill:` or prompt template message comes back as it was sent: expanded.
+        const [written, files] = splitAttachments(
+            userContent({ content: item.content }).text.replace(FROM_PREFIX, ""),
+        );
+        const uploads = app.workspace.uploadDirectory(id);
+
+        return {
+            text: written,
+            attachments: (files ?? "").split("\n").flatMap((line) => attachedFile(line, uploads)),
+        };
+    }
+
+    /**
+     * Move a queued message to Steer or Queue, or send it now as an Interrupt. Only its sender may, as with taking it
+     * back (`withdraw`): who else may move someone's message is left to the maintainers. Interrupt stops the run like
+     * the composer's Interrupt, but only this message goes now: the others in the queue, from everyone, stay queued
+     * in their order, with their senders and modes (Stop withdraws them; the stop here would, so the task queues them
+     * again). Subagents' reports it withdraws wait again for the courier. The message leaves the queue, and the others
+     * are noted in the task, in one commit.
+     */
+    async moveQueued(
+        id: ConversationId,
+        user: User,
+        submissionId: number,
+        mode: string,
+    ): Promise<void> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        app.requireSteer(user);
+
+        if (!Number.isInteger(submissionId) || submissionId <= 0) {
+            throw new HttpError(400, "Say which queued message to move.");
+        }
+
+        if (mode !== "steer" && mode !== "followUp" && mode !== "interrupt") {
+            throw new HttpError(400, "Move a message to steer, followUp, or interrupt.");
+        }
+
+        // Its sender moves it, as with taking it back: after a restart this process may not know the sender yet.
+        if ((await app.attribution.submitter(submissionId)) !== user.id) {
+            throw new HttpError(403, "Only its sender can move a queued message.");
+        }
+
+        // To the queue, it only waits longer. To Steer or Interrupt, it acts on the run now: that is the driver's turn,
+        // as sending is.
+        if (mode !== "followUp") {
+            await app.requireDriver(id, user);
+        }
+
+        if (mode !== "interrupt") {
+            const moved = await app.harness.commit(async (tx) => {
+                const item = (await tx.doc(InboxDoc, id)).items.find(
+                    (entry) => Number(entry.id) === submissionId,
+                );
+
+                if (item === undefined || item.mode === "write") {
+                    return false;
+                }
+
+                item.mode = mode;
+
+                return true;
+            }, context);
+
+            if (!moved) {
+                throw new HttpError(409, "That message has already gone to Pi.");
+            }
+
+            return;
+        }
+
+        await this.#interrupt(id, {
+            submissionId,
+            requestId: ownRequest(user.id, `interrupt-${submissionId}`),
+        });
+        await app.collab.activity(id, user, "interrupted the run");
+    }
+
+    /** Store an Interrupt and every waiting input together, before stopping only the run seen in this commit. */
+    async #interrupt(
+        id: ConversationId,
+        input: { requestId: string } & ({ content: UserInput } | { submissionId: number }),
+        admissionContext: Context = context,
+    ): Promise<{ submissionId: SubmissionId } | { task: TaskId; started: boolean }> {
+        const app = this.#app;
+        const conversation = await app.conversation(id);
+        // Request ids of the queued messages, from Pi Durable's records: a commit cannot read a submission by its id.
+        const requests = new Map<number, string | undefined>();
+
+        for (let attempt = 0; ; attempt++) {
+            const queued = (await app.harness.snapshot(InboxDoc, id, context))?.items ?? [];
+
+            for (const item of queued) {
+                if (item.mode !== "write" && !requests.has(Number(item.id))) {
+                    const record = await (
+                        await app.harness.submission(item.id, context)
+                    )?.status(context);
+
+                    requests.set(Number(item.id), record?.requestId);
+                }
+            }
+
+            const admitted = await app.harness.commit(async (tx) => {
+                const known = await tx.submissionByRequest(id, input.requestId);
+                const interrupts = await tx.doc(InterruptsDoc, id);
+                const pending = interrupts.pending[input.requestId];
+
+                // The task is the receipt until the actual submission exists. Two concurrent POSTs, and a retry after
+                // a restart between stop and send, find that same handoff rather than stopping a newer run.
+                if (known !== undefined) {
+                    return { submissionId: known.id };
+                }
+
+                if (pending !== undefined) {
+                    return { task: pending as unknown as TaskId, started: false };
+                }
+
+                const items = (await tx.doc(InboxDoc, id)).items;
+                const item =
+                    "submissionId" in input
+                        ? items.find((entry) => Number(entry.id) === input.submissionId)
+                        : undefined;
+
+                if (item?.mode === "write" || ("submissionId" in input && item === undefined)) {
+                    throw new HttpError(409, "That message has already gone to Pi.");
+                }
+
+                // Every table read comes before the commit's first table write.
+                const subagents = await tx.doc(SubagentsDoc, id);
+                const batch =
+                    subagents.sending === undefined
+                        ? undefined
+                        : await tx.submissionByRequest(id, subagents.sending.request);
+                const live = await tx.doc(LiveDoc, id);
+
+                if (live.run === undefined && "content" in input) {
+                    return {
+                        submissionId: await conversation.submit(tx, {
+                            type: "input",
+                            content: input.content,
+                            requestId: input.requestId,
+                        }),
+                    };
+                }
+
+                const others: Requeue[] = [];
+                const stay = new Set<SubmissionId>();
+
+                for (const other of items) {
+                    // Writes stay in the queue by themselves; the reports go back to their courier when withdrawn.
+                    if (other.id === item?.id || other.mode === "write" || other.id === batch?.id) {
+                        continue;
+                    }
+
+                    if (!requests.has(Number(other.id))) {
+                        // Queued since the requests were read.
+                        if (attempt >= 3) {
+                            throw new HttpError(409, "The queue is changing; try again.");
+                        }
+
+                        return "again";
+                    }
+
+                    const first = requests.get(Number(other.id));
+
+                    stay.add(other.id);
+                    others.push({
+                        content: copyJson(other.content) as UserInput,
+                        mode: other.mode,
+                        // The person is in the request id: the new one keeps it, for who wrote it and whose work it is.
+                        requestId:
+                            first === undefined
+                                ? `interrupt-${input.requestId}-${others.length}`
+                                : `${first.replace(/(~\d+)+$/, "")}~${other.id}`,
+                        ...(other.entry === undefined
+                            ? {}
+                            : { entry: copyJson(other.entry) as InputEntry }),
+                    });
+                }
+
+                const content =
+                    "content" in input ? input.content : (copyJson(item!.content) as UserInput);
+                const run = live.run === undefined ? undefined : Number(live.run.taskId);
+
+                // Taken out of the queue here, so the stop's withdrawal cannot reach them: the task puts them back.
+                for (let at = items.length - 1; at >= 0; at--) {
+                    const queued = items[at]!.id;
+
+                    if (queued === item?.id || stay.has(queued)) {
+                        items.splice(at, 1);
+                    }
+                }
+
+                if (item !== undefined) {
+                    tx.settleSubmission(item.id, { status: "unanswered", reason: "aborted" });
+                }
+
+                for (const taken of stay) {
+                    tx.settleSubmission(taken, {
+                        status: "unanswered",
+                        reason: "aborted",
+                    });
+                }
+
+                const task = await tx.createTask(
+                    this.interruptTask,
+                    {
+                        content,
+                        requestId: input.requestId,
+                        ...(item?.entry === undefined
+                            ? {}
+                            : { entry: copyJson(item.entry) as InputEntry }),
+                        ...(run === undefined ? {} : { run }),
+                        others,
+                    },
+                    { ownership: { kind: "conversation" }, background: true, conversationId: id },
+                );
+
+                interrupts.pending[input.requestId] = Number(task);
+
+                return { task, started: true };
+            }, admissionContext);
+
+            if (admitted !== "again") {
+                return admitted;
+            }
+        }
+    }
+
     async configure(
         id: ConversationId,
         user: User,
@@ -1122,12 +1939,18 @@ export class Commands {
             model?: { provider: string; modelId: string };
             thinkingLevel?: string;
             cwd?: string;
+            pipPanel?: boolean;
         },
     ): Promise<void> {
         const app = this.#app;
 
         app.requireSee(user, id);
         await app.requireDriver(id, user);
+
+        if (request.pipPanel === true && app.pip.ownerOf(id) !== user.id) {
+            throw new HttpError(403, "Only your own PiP can use this control.");
+        }
+
         const asked = request.model as { provider?: unknown; modelId?: unknown } | undefined;
 
         checkModel(asked);
@@ -1149,6 +1972,10 @@ export class Commands {
             );
         }
 
+        if (request.cwd !== undefined) {
+            app.requireWorkspaceOwner(user, request.cwd);
+        }
+
         const conversation = await app.conversation(id);
         const current = await app.agentState(id);
         const ref = request.model ?? current?.model;
@@ -1166,24 +1993,30 @@ export class Commands {
             current?.thinkingLevel ??
             "off") as ModelThinkingLevel;
         const thinkingLevel = model === undefined ? wanted : clampThinkingLevel(model, wanted);
-        const cwd =
-            request.cwd === undefined ? undefined : app.workspace.checkDirectory(request.cwd);
+        const cwd = request.cwd === undefined ? undefined : await app.resolveCwd(request.cwd);
 
-        await conversation.configure(
-            {
-                ...(request.model === undefined
-                    ? {}
-                    : {
-                          model: {
-                              provider: request.model.provider,
-                              modelId: request.model.modelId,
-                          },
-                      }),
-                thinkingLevel,
-                ...(cwd === undefined ? {} : { cwd }),
-            },
-            context,
-        );
+        const change = {
+            ...(request.model === undefined
+                ? {}
+                : { model: { provider: request.model.provider, modelId: request.model.modelId } }),
+            thinkingLevel,
+            ...(cwd === undefined ? {} : { cwd }),
+        };
+
+        if (request.pipPanel === true) {
+            // Check and save together: a turn may have started while the picker was open.
+            await app.harness.commit(async (tx) => {
+                const live = await tx.doc(LiveDoc, id);
+
+                if (live.run !== undefined || (live.compactions?.length ?? 0) > 0) {
+                    throw new HttpError(409, "PiP is working. Change its model when it is idle.");
+                }
+
+                Object.assign(await tx.doc(AgentDoc, id), change);
+            }, context);
+        } else {
+            await conversation.configure(change, context);
+        }
 
         if (cwd !== undefined && app.sessionMeta(id) !== undefined) {
             await app.harness.commit(async (tx) => {
@@ -1195,7 +2028,7 @@ export class Commands {
             }, context);
         }
 
-        if (ref !== undefined) {
+        if (ref !== undefined && request.pipPanel !== true) {
             app.config.lastModel = { provider: ref.provider, modelId: ref.modelId, thinkingLevel };
         }
 
@@ -1460,6 +2293,17 @@ export class Commands {
             return true;
         }, context);
 
+        // A router spawns its stages at once: its session has the subagent tool, which other sessions load by a
+        // search (`tool-search.ts`).
+        if (chosen !== undefined) {
+            await (
+                await app.conversation(id)
+            ).configure(
+                { modelTools: { remove: [], add: [{ name: "subagent" }] } } as never,
+                context,
+            );
+        }
+
         if (changed) {
             await app.collab.activity(
                 id,
@@ -1495,6 +2339,94 @@ export class Commands {
                 on ? "turned on plan mode" : "turned off plan mode",
             );
         }
+    }
+
+    /**
+     * Let Pi use the browser in this session, or stop it. The browser tool is offered to the model only while this is
+     * on (it is deferred: `extensions/browser.ts`), so a session that does not browse carries none of its schema or
+     * guide. People use the Browser panel either way.
+     */
+    async setBrowserUse(id: ConversationId, user: User, on: unknown): Promise<void> {
+        const app = this.#app;
+
+        app.requireSee(user, id);
+        await app.requireDriver(id, user);
+
+        if (typeof on !== "boolean") {
+            throw new HttpError(400, "on must be true or false");
+        }
+
+        if (on && !app.browserOn()) {
+            throw new HttpError(409, "The browser is turned off in Extensions.");
+        }
+
+        const changed = await app.harness.commit(async (tx) => {
+            const use = await tx.doc(BrowserUseDoc, id);
+
+            if (use.on === on) {
+                return false;
+            }
+
+            use.on = on;
+            use.by = user.id;
+            use.at = Date.now();
+
+            return true;
+        }, context);
+
+        await this.#offerBrowser(id, on);
+
+        if (changed) {
+            await app.collab.activity(
+                id,
+                user,
+                on ? "let Pi use the browser" : "stopped Pi from using the browser",
+            );
+        }
+    }
+
+    /**
+     * Add the browser tool to the tools this conversation offers its model, or take it out, keeping the rest of the
+     * conversation's tool filter as it is (`AgentState.modelTools` holds names; a change takes registrations).
+     */
+    async #offerBrowser(id: ConversationId, on: boolean): Promise<void> {
+        const app = this.#app;
+        const browser = app.toolNamed("browser");
+
+        if (browser === undefined) {
+            return;
+        }
+
+        const current = (await app.agentState(id))?.modelTools;
+        const tools = (names: readonly string[]) =>
+            names.flatMap((name) => {
+                const tool = name === "browser" ? browser : app.toolNamed(name);
+
+                return tool === undefined ? [] : [tool];
+            });
+        const toggled = (names: readonly string[]) =>
+            on
+                ? [...names.filter((name) => name !== "browser"), "browser"]
+                : names.filter((name) => name !== "browser");
+
+        let change: AgentChange["modelTools"];
+
+        if (Array.isArray(current)) {
+            change = tools(toggled(current));
+        } else {
+            const add = toggled(current?.add ?? []);
+            const remove = (current?.remove ?? []).filter((name) => name !== "browser");
+
+            change =
+                add.length === 0 && remove.length === 0
+                    ? null
+                    : {
+                          ...(add.length === 0 ? {} : { add: tools(add) }),
+                          ...(remove.length === 0 ? {} : { remove: tools(remove) }),
+                      };
+        }
+
+        await (await app.conversation(id)).configure({ modelTools: change }, context);
     }
 
     /** Approve Pi's plan: plan mode goes off, and Pi is told to carry the plan out. */
@@ -1773,13 +2705,23 @@ export class Commands {
         }
     }
 
-    /** A new session with this session's history through `entryId`, which then goes its own way. */
     async fork(
         id: ConversationId,
         user: User,
         request: { entryId?: unknown; worktree?: unknown },
     ): Promise<{ id: ConversationId }> {
         this.#requireForkable(id, user);
+
+        if (request.entryId === undefined) {
+            return {
+                id: await this.#branch(id, user, {
+                    at: await this.#latestReply(id),
+                    label: "fork",
+                    worktree: request.worktree === true,
+                }),
+            };
+        }
+
         const entryId = entryIdOf(request.entryId);
         const entry = await this.#app.transcripts.visibleEntry(id, entryId);
 
@@ -1849,11 +2791,12 @@ export class Commands {
         }
 
         const original = userContent(entry.model?.[0]);
-        const [written = "", files] = original.text.split(ATTACHMENTS_HEADING);
+        // Who sent it comes first, then the heading, whole or (from before 0.14.0) without its blank line.
+        const [written, files] = splitAttachments(original.text.replace(FROM_PREFIX, ""));
         // An edit that changes nothing is the same as sending the message again.
         const edit =
-            edited !== undefined && edited !== written.replace(FROM_PREFIX, "").trim()
-                ? edited
+            edited !== undefined && edited !== written.trim()
+                ? app.hidden.replace(edited, id)
                 : undefined;
 
         if (edit === "" && files === undefined) {
@@ -1862,10 +2805,10 @@ export class Commands {
 
         // Sent again, edited or not, the message is from whoever sent it again, with the original's files attached: what
         // Pi does next is on them.
-        const body = edit ?? written.replace(FROM_PREFIX, "").trim();
+        const body = edit ?? written.trim();
         const text = this.messageText(
             user,
-            files === undefined ? body : `${body}${ATTACHMENTS_HEADING}${files}`.trim(),
+            files === undefined ? body : `${body}${ATTACHMENTS_HEADING}${files}`,
         );
         const author =
             (await app.harness.snapshot(AuthorsDoc, id, context))?.entries[String(entryId)] ??
@@ -1882,16 +2825,13 @@ export class Commands {
                 await app.conversation(id)
             ).entries({ maxEntryId: (entryId - 1) as unknown as EntryId }, 1, undefined, context)
         ).items[0];
-        const agent: AgentChange =
-            asked === undefined
-                ? {}
-                : {
-                      model: ref,
-                      thinkingLevel: clampThinkingLevel(
-                          model,
-                          (source?.thinkingLevel ?? "off") as ModelThinkingLevel,
-                      ),
-                  };
+        const agent: AgentChange = {
+            model: ref,
+            thinkingLevel: clampThinkingLevel(
+                model,
+                (source?.thinkingLevel ?? "off") as ModelThinkingLevel,
+            ),
+        };
         const label = edit !== undefined ? "edit" : asked !== undefined ? model.name : "retry";
         const forked = await this.#branch(id, user, {
             at: previous?.id as unknown as number | undefined,
@@ -1927,6 +2867,31 @@ export class Commands {
         return { id: forked };
     }
 
+    /** A reply that called tools is not finished: a fork from it would wait for their results. */
+    async #latestReply(id: ConversationId): Promise<number | undefined> {
+        const conversation = await this.#app.conversation(id);
+        let cursor: Cursor | undefined;
+
+        do {
+            const page = await conversation.entries({}, 64, cursor, context);
+
+            for (const entry of page.items) {
+                const reply = entry.model?.[0];
+
+                if (
+                    entry.kind === "pi.assistant" &&
+                    !(reply?.role === "assistant" && reply.stopReason === "toolUse")
+                ) {
+                    return Number(entry.id);
+                }
+            }
+
+            cursor = page.next;
+        } while (cursor !== undefined);
+
+        return undefined;
+    }
+
     /** Forks are new sessions: who may start one may fork, from a session they can see. */
     #requireForkable(id: ConversationId, user: User): void {
         const app = this.#app;
@@ -1941,6 +2906,9 @@ export class Commands {
         if (app.sessionMeta(id) === undefined) {
             throw new HttpError(400, "Only sessions can be forked");
         }
+
+        // The fork works in this session's folder: a remote one is the owner's to start sessions in.
+        app.requireWorkspaceOwner(user, app.cwdOf(id));
 
         // A fork would carry PiP's tools and none of PiP: they act as PiP's person, which a fork is not.
         if (app.sessionMeta(id)?.pip !== undefined) {

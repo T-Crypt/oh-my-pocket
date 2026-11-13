@@ -1,44 +1,57 @@
-// What this browser sent from the message box, oldest first, as a shell keeps it: ↑ in the box goes back through it,
-// and Ctrl+R searches it. Kept in this browser only, across sessions.
+// What this person sent from this browser in one session, oldest first: ↑ recalls it and Ctrl+R searches it.
+import { HISTORY as KEY, HISTORY_MAX as MAX, personStorage } from "./person-storage.js";
 
-const KEY = "pocket.history";
-const MAX = 200;
-
-/** Everything remembered, oldest first. */
-export function sentHistory() {
+/** All of this person's scoped records, bounded together across sessions. */
+function readHistory(person) {
     try {
-        const list = JSON.parse(localStorage.getItem(KEY) ?? "[]");
+        const list = JSON.parse(personStorage.get(KEY, person) ?? "[]");
 
-        return Array.isArray(list) ? list.filter((each) => typeof each === "string") : [];
+        return Array.isArray(list)
+            ? list.filter(
+                  (each) =>
+                      each &&
+                      typeof each.person === "string" &&
+                      Number.isSafeInteger(each.conversation) &&
+                      typeof each.text === "string",
+              )
+            : [];
     } catch {
         return [];
     }
 }
 
-/** Remember a sent message, as the newest; the same text sent before moves up instead of showing twice. */
-export function remember(text) {
+const inScope = (each, scope) =>
+    each.person === scope.person && each.conversation === scope.conversation;
+
+/** This person's remembered text in this session, oldest first. */
+export function sentHistory(scope) {
+    return readHistory(scope.person)
+        .filter((each) => inScope(each, scope))
+        .map((each) => each.text);
+}
+
+/** Remember as newest; identical text moves up only within this person's session. */
+export function remember(text, scope) {
     const value = text.trim();
 
-    if (value === "") {
+    if (value === "" || !scope.person || !Number.isSafeInteger(scope.conversation)) {
         return;
     }
 
-    const list = sentHistory().filter((each) => each !== value);
+    const list = readHistory(scope.person).filter(
+        (each) => !inScope(each, scope) || each.text !== value,
+    );
 
-    list.push(value);
+    list.push({ person: scope.person, conversation: scope.conversation, text: value });
 
-    try {
-        localStorage.setItem(KEY, JSON.stringify(list.slice(-MAX)));
-    } catch {
-        // Storage is full: the history only stays as it was.
-    }
+    personStorage.set(KEY, JSON.stringify(list.slice(-MAX)), scope.person);
 }
 
-/** Sent messages with every word of `query` in them, newest first. */
-export function searchHistory(query, limit = 30) {
+/** Scoped text with every word of `query` in it, newest first. */
+export function searchHistory(query, scope, limit = 30) {
     const words = query.toLowerCase().split(/\s+/).filter(Boolean);
     const found = [];
-    const list = sentHistory();
+    const list = sentHistory(scope);
 
     for (let index = list.length - 1; index >= 0 && found.length < limit; index--) {
         const lower = list[index].toLowerCase();

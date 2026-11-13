@@ -14,7 +14,7 @@
  * (`extensions/pip.ts`).
  */
 import { randomUUID } from "node:crypto";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
     type ConversationId,
@@ -202,11 +202,7 @@ export class RepoWatches {
                         return runtime.commit(() => finished, context);
                     }
 
-                    await runtime.sleep(watch.next, context);
-                    await runtime.commit(
-                        () => ({ status: "running", checkpoint: { phase: "look" } }),
-                        context,
-                    );
+                    return runtime.sleepUntil(watch.next, { phase: "look" }, context);
                 },
                 look: (task, runtime, context) => this.#look(task.input.watchId, runtime, context),
                 send: (task, runtime, context) => {

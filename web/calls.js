@@ -8,7 +8,28 @@ const short = (text, max = 90) => {
     return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 };
 
-/** A tool call in one line: an icon, a label, and what it acts on. Peek tiles describe calls this way too. */
+/**
+ * How extensions' browser modules show their own tools' calls (`pocket.toolCall`): `extension-ui.js` sets it, and it
+ * gives `{ label, subject, iconPath? }` in text, or undefined for the default display.
+ */
+let ownDescription = () => undefined;
+/** Goes up when what extensions describe changes, so that calls drawn before draw again. */
+let ownRevision = 0;
+
+export function setCallDescriber(describe) {
+    ownDescription = describe;
+}
+
+export function describersChanged() {
+    ownRevision++;
+}
+
+export const describersRevision = () => ownRevision;
+
+/**
+ * A tool call in one line: an icon, a label, and what it acts on. Peek tiles describe calls this way too. `own` marks a
+ * call an extension described.
+ */
 export function describeCall(call) {
     const described = describeOne(call);
     const host = call.args?.host;
@@ -41,6 +62,7 @@ function describeOne(call) {
         case "bash":
             return { icon: ">_", label: "", subject: short(args.command, 140), mono: true };
         case "artifact":
+        case "artifact_inline":
             return {
                 icon: "✦",
                 label: "Artifact",
@@ -84,6 +106,26 @@ function describeOne(call) {
             };
         }
 
+        case "ask": {
+            const questions = Array.isArray(args.questions) ? args.questions : [];
+
+            return {
+                icon: "?",
+                label: "Ask",
+                // A peek line's call carries only short scalar arguments (`peekArgs`): no questions, no subject.
+                subject:
+                    questions.length === 0
+                        ? ""
+                        : questions.length === 1
+                          ? short(String(questions[0]?.question ?? ""), 120)
+                          : questions
+                                .map((each) => each?.header)
+                                .filter(Boolean)
+                                .join(" · "),
+                mono: false,
+            };
+        }
+
         case "subagent":
             return {
                 icon: "⧉",
@@ -93,12 +135,20 @@ function describeOne(call) {
                     .join(" · "),
                 mono: true,
             };
-        default:
+
+        default: {
+            const own = ownDescription(call.name, args);
+
+            if (own !== undefined) {
+                return { icon: "⚙", mono: false, own: true, ...own };
+            }
+
             return {
                 icon: "⚙",
                 label: call.name,
                 subject: short(JSON.stringify(args), 100),
                 mono: true,
             };
+        }
     }
 }

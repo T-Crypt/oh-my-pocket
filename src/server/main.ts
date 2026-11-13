@@ -15,6 +15,10 @@ import { join, resolve } from "node:path";
 import type { AccessInfo, PocketApp } from "./app.ts";
 import { APP_ROOT, dataDir } from "./config.ts";
 import type { createHandler } from "./http.ts";
+import { restoreMissingNpmPackage } from "./update-state.ts";
+
+// A resident process can reach recovery even when a stopped package switch left no live folder.
+restoreMissingNpmPackage(APP_ROOT);
 
 const RESTART_CODE = 75;
 /**
@@ -31,6 +35,7 @@ function parseArgs(argv: string[]) {
         cwd: process.cwd(),
         data: dataDir(),
         rotateToken: false,
+        keepAliveSeconds: Number(process.env.PI_POCKET_KEEPALIVE_SECONDS?.trim() || 5),
     };
 
     for (let index = 0; index < argv.length; index++) {
@@ -68,6 +73,16 @@ function parseArgs(argv: string[]) {
 
     if (!Number.isInteger(options.port) || options.port <= 0) {
         throw new Error("--port must be a number");
+    }
+
+    if (
+        !Number.isInteger(options.keepAliveSeconds) ||
+        options.keepAliveSeconds < 1 ||
+        options.keepAliveSeconds > 3600
+    ) {
+        throw new Error(
+            "PI_POCKET_KEEPALIVE_SECONDS must be a whole number of seconds from 1 to 3600",
+        );
     }
 
     return options;
@@ -110,7 +125,8 @@ const stop = async (code: number) => {
 
     try {
         // A tool or model stream that ignores its abort must not hold a restart (and the phone's only way in) forever.
-        const limit = new Promise<void>((resolve) => setTimeout(resolve, STOP_LIMIT_MS).unref());
+        // The timer holds the process: if nothing else did, Node would end it before `process.exit` gave the code.
+        const limit = new Promise<void>((resolve) => setTimeout(resolve, STOP_LIMIT_MS));
 
         await Promise.race([app.close(), limit]);
     } catch (error) {
@@ -158,6 +174,10 @@ const server = createServer((request, response) => {
 // and long polls are GET requests without a body, so their time on the connection does not count.
 server.requestTimeout = 15 * 60_000;
 server.headersTimeout = 60_000;
+// How long an idle connection stays open for its next request: Node's 5 seconds by default. A reverse proxy
+// that keeps idle connections longer can send a request on one as it closes here, and answers with a 502.
+// The timeouts above count from a request's first byte, not from the idle time before it.
+server.keepAliveTimeout = options.keepAliveSeconds * 1000;
 
 // Take the port before opening the database: opening resumes interrupted work, which must not start in a process
 // that then exits because it cannot serve.
@@ -191,6 +211,8 @@ const opened = await App.open({
     dataDir: options.data,
     defaultCwd: options.cwd,
     supervised: process.env.PI_POCKET_SUPERVISED === "1",
+    // For updates of Pi Pocket itself, which restart the server once the new version is in place.
+    restart: () => void stop(RESTART_CODE),
 });
 
 app = opened;
@@ -206,9 +228,15 @@ handle = makeHandler({
     restart: () => void stop(RESTART_CODE),
 });
 stopWatching = (() => {
-    const stops = [watchTree(join(APP_ROOT, "web"), (file) => opened.reloadClients(file))];
+    const stops = [
+        watchTree(
+            join(APP_ROOT, "web"),
+            (file) => !opened.reloadsPaused && opened.reloadClients(file),
+        ),
+    ];
 
     opened.loader.watch();
+    opened.themes.watch();
 
     return () => {
         for (const each of stops) {
@@ -218,6 +246,12 @@ stopWatching = (() => {
 })();
 
 const token = encodeURIComponent(opened.config.ownerToken);
+
+// An update this process started for is done only now: a start that fails before here, the launcher undoes. One that
+// stopped part way is put back, and the server restarts on the files before.
+await opened.updates.recover().catch((error: unknown) => {
+    console.error(`Pi Pocket could not finish its update: ${(error as Error).message}`);
+});
 
 if (launcher) {
     process.send?.({

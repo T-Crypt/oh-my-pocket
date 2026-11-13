@@ -3,10 +3,22 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { toggleRouters } from "../routers.js";
 import { actions, api, attempt, closeSheet, openSheet, store } from "../store.js";
-import { anchorStyle, formatTokens, html, Icon, popAnchor } from "../ui.js";
+import { useDragToClose } from "../gestures.js";
+import { favoriteModels } from "../model-favorites.js";
+import {
+    anchorStyle,
+    BOTTOM_SHEETS,
+    formatTokens,
+    html,
+    Icon,
+    MODEL_SEARCH_AT,
+    popAnchor,
+    scrimPress,
+} from "../ui.js";
 
-/** Models past this many get a search box in the picker. */
-const MODEL_SEARCH_AT = 8;
+/** Over the message box the picker is 330px wide; on a phone, the width `popAnchor` gives. */
+const widthOf = (anchor) =>
+    matchMedia("(min-width: 700px)").matches ? Math.min(anchor.width, 330) : anchor.width;
 
 const coarsePointer = matchMedia("(pointer: coarse)").matches;
 
@@ -35,21 +47,55 @@ export function defaultLabel(chosen, models) {
     return `${model.name}${model.reasoning ? ` · ${chosen.thinkingLevel ?? "off"}` : ""}${model.signIn ? " (needs sign-in)" : ""}`;
 }
 
+/** Whether a model is one the picker's search finds: each word in its id or name, as `/model` finds them. */
+const matches = (model, query) => {
+    const haystack = `${model.provider}/${model.id} ${model.name}`.toLowerCase();
+
+    return query
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .every((word) => haystack.includes(word));
+};
+
 /**
  * The model picker: a menu that opens up from the message box's model chip, with the current model first and checked,
- * and how hard Pi thinks below, then what new sessions start with. Arrows and Enter pick; a search box shows when there
- * are many models, or when `/model son` opened it already searching. Opened for the default (`forDefault`, from the
- * menu), it picks the model and thinking level new sessions start with instead, and stays open for both.
+ * and how hard Pi thinks below, then, for the owner, Make default. Arrows and Enter pick, and Tab switches between the
+ * scoped models (Pi's `enabledModels`) and all of them; a search box shows when there are many models, or when
+ * `/model son` opened it already searching. Opened for the default (`forDefault`, from the menu), it picks the model
+ * and thinking level new sessions start with instead, and stays open for both.
  */
 export function ModelPicker() {
-    const { models, view, server, me } = store.state;
+    const { models, server, me } = store.state;
+    const [pipId] = useState(() => store.state.sheet?.pipId);
+    const view = pipId === undefined ? store.state.view : store.state.pipView;
+    const locked =
+        pipId !== undefined &&
+        (view.conversation?.id !== pipId ||
+            view.live?.busy === true ||
+            (view.live?.compactions?.length ?? 0) > 0);
+    const configure = (change) =>
+        pipId === undefined
+            ? actions.configure(change)
+            : api(`c/${pipId}/configure`, { ...change, pipPanel: true });
     // While the picker animates out, the store has no sheet any more.
     const [query, setQuery] = useState(store.state.sheet?.query ?? "");
     const [forDefault] = useState(() => store.state.sheet?.forDefault === true);
+    const scopedModels = models.filter((model) => model.scoped);
+    // Opened already searching (`/model gem`) for models only outside the scope: it starts with all of them.
+    const [showAll, setShowAll] = useState(
+        () => query.trim() !== "" && !scopedModels.some((model) => matches(model, query)),
+    );
+    const choices = showAll || scopedModels.length === 0 ? models : scopedModels;
+    const favorites = new Set(favoriteModels());
+    const [favoritesOnly, setFavoritesOnly] = useState(false);
+    const isFavorite = (model) => favorites.has(`${model.provider}/${model.id}`);
     // Decided once: a search box that went away when emptied would take the caret with it.
     const [searchable] = useState(() => models.length > MODEL_SEARCH_AT || query !== "");
     const [picked, setPicked] = useState(0);
-    const [anchor, setAnchor] = useState(() => (forDefault ? null : modelAnchor()));
+    const [anchor, setAnchor] = useState(() =>
+        forDefault || pipId !== undefined ? null : modelAnchor(),
+    );
     const box = useRef(null);
     const search = useRef(null);
     const list = useRef(null);
@@ -58,6 +104,13 @@ export function ModelPicker() {
     // The Routers group: a session runs as one, its model and stage models with it. Not for the default's picker.
     const [routers, setRouters] = useState([]);
     const agent = view.agent;
+
+    // On a phone, a swipe away from where it opens closes it, as a sheet's does.
+    useDragToClose(box, {
+        dir: anchor?.down ? "up" : "down",
+        onClose: closeSheet,
+        enabled: BOTTOM_SHEETS.matches,
+    });
     const owner = me?.role === "owner";
     const chosen = server?.defaultModel ?? null;
     const isDefault = (model) =>
@@ -76,14 +129,13 @@ export function ModelPicker() {
         ? (chosen?.thinkingLevel ?? agent?.thinkingLevel ?? "off")
         : agent?.thinkingLevel;
     const reasoning = forDefault ? defaultModel?.reasoning : agent?.reasoning;
-    const needle = query.trim().toLowerCase();
-    const shown = models
-        .filter(
-            (model) =>
-                needle === "" ||
-                `${model.provider}/${model.id} ${model.name}`.toLowerCase().includes(needle),
-        )
-        .sort((a, b) => Number(isCurrent(b)) - Number(isCurrent(a)));
+    const shown = choices
+        .filter((model) => (!favoritesOnly || isFavorite(model)) && matches(model, query))
+        .sort(
+            (a, b) =>
+                Number(isCurrent(b)) - Number(isCurrent(a)) ||
+                Number(isFavorite(b)) - Number(isFavorite(a)),
+        );
     // The list can change while the picker is open.
     const active = Math.max(0, Math.min(picked, shown.length - 1));
     // The session's model and level are the default already.
@@ -102,7 +154,7 @@ export function ModelPicker() {
 
     useEffect(() => {
         // The default's picker has no chip to open from: it stays in the middle.
-        const place = () => setAnchor(forDefault ? null : modelAnchor());
+        const place = () => setAnchor(forDefault || pipId !== undefined ? null : modelAnchor());
         const onKey = (event) => event.key === "Escape" && closeSheet();
 
         addEventListener("resize", place);
@@ -136,6 +188,10 @@ export function ModelPicker() {
     }, [active]);
 
     const pick = (model) => {
+        if (locked) {
+            return;
+        }
+
         // The default's picker stays open, for its thinking level.
         if (forDefault) {
             return isCurrent(model) ? undefined : setDefault(model, level);
@@ -143,7 +199,7 @@ export function ModelPicker() {
 
         attempt(async () => {
             if (!isCurrent(model)) {
-                await actions.configure({ model: { provider: model.provider, modelId: model.id } });
+                await configure({ model: { provider: model.provider, modelId: model.id } });
             } else if (routed) {
                 // The router's own model, picked as a plain model: the session stops running as the router.
                 await actions.setRouter(null);
@@ -156,19 +212,43 @@ export function ModelPicker() {
     const think = (each) =>
         forDefault
             ? setDefault(defaultModel, each)
-            : attempt(() => actions.configure({ thinkingLevel: each }));
+            : attempt(() => configure({ thinkingLevel: each }));
 
-    // Arrows and Enter move through the models from the search box or the picker itself, not from its other buttons.
+    // Arrows and Enter move through the models, and Tab switches scoped and all, from the search box or the picker
+    // itself, not from its other buttons: there Tab and Shift+Tab move the focus as anywhere else.
     const onKeyDown = (event) => {
         if (
             event.isComposing ||
-            shown.length === 0 ||
             (event.target !== search.current && event.target !== box.current)
         ) {
             return;
         }
 
-        const step = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
+        if (
+            event.key === "Tab" &&
+            scopedModels.length > 0 &&
+            !(event.shiftKey || event.altKey || event.ctrlKey || event.metaKey)
+        ) {
+            event.preventDefault();
+            setShowAll((all) => !all);
+            setPicked(0);
+            list.current?.scrollTo({ top: 0 });
+
+            return;
+        }
+
+        if (shown.length === 0) {
+            return;
+        }
+
+        // Alt+↑/↓ stays the app's: it switches sessions.
+        const step = event.altKey
+            ? 0
+            : event.key === "ArrowDown"
+              ? 1
+              : event.key === "ArrowUp"
+                ? -1
+                : 0;
 
         if (step !== 0) {
             event.preventDefault();
@@ -182,21 +262,59 @@ export function ModelPicker() {
 
     return html`<div
         class="overlay pop-overlay"
-        onClick=${(event) => event.target === event.currentTarget && closeSheet()}
+        onMouseDown=${scrimPress(closeSheet)}
     >
         <section
-            class=${`pop-menu ${anchor ? (anchor.down ? "down" : "") : "free"}`}
-            style=${anchorStyle(anchor)}
+            class=${`pop-menu model-menu ${anchor ? (anchor.down ? "down" : "") : "free"}`}
+            style=${anchorStyle(anchor && { ...anchor, width: widthOf(anchor) })}
             ref=${box}
             role="dialog"
+            aria-modal="true"
             aria-label=${forDefault ? "Default model" : "Model"}
+            aria-keyshortcuts=${scopedModels.length > 0 ? "Tab" : undefined}
             tabindex="-1"
             onKeyDown=${onKeyDown}
         >
+            <div class="grip" aria-hidden="true"></div>
             <header class="pop-menu-head">
                 <span>
                     ${forDefault ? "Default model" : "Model"}
                     ${forDefault && html`<span class="pop-menu-head-sub">for new sessions</span>`}
+                    ${
+                        scopedModels.length > 0 &&
+                        html`<span
+                            class="model-scope"
+                            role="group"
+                            aria-label="Model scope"
+                            title="Tab switches between scoped and all models"
+                        >
+                            <span aria-hidden="true">[</span>
+                            <button
+                                class=${!showAll ? "on" : ""}
+                                aria-pressed=${!showAll}
+                                title="Models from Pi’s enabledModels setting"
+                                onClick=${() => {
+                                    setShowAll(false);
+                                    setPicked(0);
+                                }}
+                            >
+                                scoped
+                            </button>
+                            <span aria-hidden="true">|</span>
+                            <button
+                                class=${showAll ? "on" : ""}
+                                aria-pressed=${showAll}
+                                title="All models with a configured sign-in"
+                                onClick=${() => {
+                                    setShowAll(true);
+                                    setPicked(0);
+                                }}
+                            >
+                                all
+                            </button>
+                            <span aria-hidden="true">]</span>
+                        </span>`
+                    }
                 </span>
                 <button class="pop-menu-link" onClick=${() => openSheet({ type: "providers" })}>
                     <${Icon} name="key" size=${13} /> Providers
@@ -209,6 +327,7 @@ export function ModelPicker() {
                     <input
                         ref=${search}
                         placeholder="Search models"
+                        aria-keyshortcuts=${scopedModels.length > 0 ? "Tab" : undefined}
                         value=${query}
                         onInput=${(event) => {
                             setQuery(event.currentTarget.value);
@@ -216,6 +335,31 @@ export function ModelPicker() {
                         }}
                     />
                 </label>`
+            }
+            ${
+                favorites.size > 0 &&
+                html`<div class="segmented model-filters" role="group" aria-label="Filter models">
+                    <button
+                        class=${favoritesOnly ? "" : "on"}
+                        aria-pressed=${!favoritesOnly}
+                        onClick=${() => {
+                            setFavoritesOnly(false);
+                            setPicked(0);
+                        }}
+                    >
+                        All models
+                    </button>
+                    <button
+                        class=${favoritesOnly ? "on" : ""}
+                        aria-pressed=${favoritesOnly}
+                        onClick=${() => {
+                            setFavoritesOnly(true);
+                            setPicked(0);
+                        }}
+                    >
+                        <${Icon} name="star" size=${14} /> Favorites
+                    </button>
+                </div>`
             }
             <div class="pop-menu-list" ref=${list} role="listbox" aria-label="Models">
                 ${
@@ -227,11 +371,13 @@ export function ModelPicker() {
                 ${
                     models.length > 0 &&
                     shown.length === 0 &&
-                    html`<p class="muted pop-menu-note">No model matches “${query.trim()}”.</p>`
+                    html`<p class="muted pop-menu-note">
+                        ${favoritesOnly && query.trim() === "" ? "No favorites in this model scope." : `No model matches “${query.trim()}”.`}
+                    </p>`
                 }
                 ${
                     routers.length > 0 &&
-                    needle === "" &&
+                    query.trim() === "" &&
                     html`<div class="pop-menu-group" role="group" aria-label="Routers">
                         <div class="pop-menu-group-head">
                             <span>Routers</span>
@@ -274,9 +420,10 @@ export function ModelPicker() {
                 ${shown.map(
                     (model, index) => html`<button
                         key=${`${model.provider}/${model.id}`}
-                        class=${`pop-menu-row ${index === active ? "on" : ""}`}
+                        class=${`pop-menu-row ${index === active ? "on" : ""} ${isCurrent(model) ? "current" : ""}`}
                         role="option"
                         aria-selected=${isPicked(model)}
+                        disabled=${locked}
                         title=${`${model.provider}/${model.id} · ${formatTokens(model.contextWindow)} context${model.images ? " · images" : ""}`}
                         onMouseMove=${() => index !== active && setPicked(index)}
                         onClick=${() => pick(model)}
@@ -287,6 +434,7 @@ export function ModelPicker() {
                                 ${model.provider}${!forDefault && isDefault(model) ? " · default" : ""}${model.signIn ? " · needs sign-in" : ""}
                             </span>
                         </span>
+                        ${isFavorite(model) && html`<${Icon} name="star" size=${14} />`}
                         ${isPicked(model) && html`<${Icon} name="check" size=${14} />`}
                     </button>`,
                 )}
@@ -301,6 +449,7 @@ export function ModelPicker() {
                                 html`<button
                                     role="radio"
                                     aria-checked=${level === each}
+                                    disabled=${locked}
                                     class=${level === each ? "on" : ""}
                                     onClick=${() => think(each)}
                                 >
@@ -311,44 +460,44 @@ export function ModelPicker() {
                 </div>`
             }
             ${
-                !defaultsKept()
+                pipId !== undefined || !defaultsKept()
                     ? null
                     : forDefault
                       ? html`<div class="pop-menu-foot pop-menu-default">
+                          <span class="muted">
+                              The owner default wins over project settings. Clear it to use a trusted project's model and thinking defaults for later new sessions. Existing sessions do not change.
+                          </span>
                           ${
                               chosen
                                   ? html`<button
                                         class="pop-menu-link"
                                         onClick=${() => attempt(() => actions.setDefaultModel(null))}
                                     >
-                                        Start with the last model picked instead
+                                        Clear owner default: use project defaults, then last picked
                                     </button>`
                                   : html`<span class="muted">
-                                        None chosen: new sessions start with the last model picked.
+                                        No owner default: new sessions use trusted project defaults, then the last model picked, then Pi's global default.
                                     </span>`
                           }
                       </div>`
-                      : html`<div class="pop-menu-foot pop-menu-default">
-                          <span class="pop-menu-default-text">
-                              <span class="muted">New sessions:</span>
-                              ${" "}${chosen ? defaultLabel(chosen, models) : "the last model picked"}
-                          </span>
-                          ${
-                              owner &&
-                              models.some((model) => isCurrent(model)) &&
-                              (sessionIsDefault
-                                  ? html`<span class="pop-menu-default-mark">
-                                        <${Icon} name="check" size=${13} /> Default
-                                    </span>`
-                                  : html`<button
-                                        class="pop-menu-link"
-                                        title="New sessions start with this model and thinking level"
-                                        onClick=${() => setDefault(agent.model, agent.thinkingLevel ?? "off")}
-                                    >
-                                        Make default
-                                    </button>`)
-                          }
-                      </div>`
+                      : // Only the owner makes a default: no one else gets an empty footer.
+                        owner &&
+                        models.some((model) => isCurrent(model)) &&
+                        html`<div class="pop-menu-foot pop-menu-default">
+                            ${
+                                sessionIsDefault
+                                    ? html`<span class="pop-menu-default-mark">
+                                          <${Icon} name="check" size=${13} /> Default
+                                      </span>`
+                                    : html`<button
+                                          class="pop-menu-link"
+                                          title="New sessions start with this model and thinking level"
+                                          onClick=${() => setDefault(agent.model, agent.thinkingLevel ?? "off")}
+                                      >
+                                          Make default
+                                      </button>`
+                            }
+                        </div>`
             }
         </section>
     </div>`;

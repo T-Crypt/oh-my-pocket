@@ -3,10 +3,11 @@
 // are done, and what the newest one does. Unfolded, a row each: what it was asked, what it does this moment (its peek,
 // as tiles have), for how long, whether its report is on its way, Stop, and a tap to open it.
 import { useEffect, useRef, useState } from "preact/hooks";
-import { describeCall } from "./calls.js";
-import { fromServer, useOnScreen } from "./peeks.js";
+import { nowDoing } from "./agent-now.js";
+import { useOnScreen } from "./peeks.js";
+import { fromServer } from "./seen.js";
 import { api, attempt, canSteer, navigate, openSheet, store } from "./store.js";
-import { html, Icon, Spinner, timeAgo } from "./ui.js";
+import { html, Icon, shortModelName, Spinner, timeAgo } from "./ui.js";
 
 /**
  * When each session's bar was put away, in this browser, as the newest thing its subagents did then (the server's clock,
@@ -88,35 +89,6 @@ export function elapsed(ms) {
     return `${Math.floor(seconds / 3600)}h ${String(Math.floor(seconds / 60) % 60).padStart(2, "0")}m`;
 }
 
-/** What a working subagent does this moment, from its peek: a call waiting for someone, the one it runs, or its words. */
-export function nowDoing(agent) {
-    const peek = store.state.peeks?.[agent.conversationId];
-    const waiting = peek?.approvals?.[0];
-
-    if (waiting) {
-        return `Waiting for approval: ${waiting.tool} ${waiting.subject}`.trim();
-    }
-
-    const last = (peek?.lines ?? []).at(-1);
-
-    if (last?.kind === "tool" && last.status === "running") {
-        const call = describeCall({ name: last.name, args: last.args });
-
-        return [call.icon, call.label, call.subject].filter(Boolean).join(" ");
-    }
-
-    if (last?.kind === "shell") {
-        return `$ ${last.command}`;
-    }
-
-    if (last?.kind === "text") {
-        return last.text;
-    }
-
-    // Before its peek arrives, nothing is known but that it works.
-    return peek === undefined ? "Working…" : "Thinking…";
-}
-
 /** The order of the states, in the dots and the rows: working, then trouble, then done. */
 const RANK = { working: 0, failed: 1, stopped: 2, done: 3 };
 
@@ -129,6 +101,29 @@ export function ordered(agents) {
                 ? (b.askedAt ?? 0) - (a.askedAt ?? 0)
                 : (b.answeredAt ?? 0) - (a.answeredAt ?? 0)),
     );
+}
+
+/** The model a subagent runs on, and its thinking level but "off", in words: "↗ gpt-6.1-sol · max". */
+export function modelText(agent, { thinking = true } = {}) {
+    const model = agent.runsOn;
+
+    if (!model) {
+        return "";
+    }
+
+    const level = thinking && model.thinking !== "off" ? model.thinking : undefined;
+
+    return `${model.other ? "↗ " : ""}${shortModelName(model.name)}${level ? ` · ${level}` : ""}`;
+}
+
+/**
+ * The model a subagent runs on, in a small pill: "↗" before it when it is not its session's model. Nothing before the
+ * server knows it.
+ */
+export function SubagentModel({ agent, thinking = true }) {
+    const text = modelText(agent, { thinking });
+
+    return text && html`<span class="agent-model">${text}</span>`;
 }
 
 function AgentRow({ agent }) {
@@ -149,6 +144,7 @@ function AgentRow({ agent }) {
                 <span class="agent-head">
                     <span class="agent-name">${agent.name}</span>
                     ${when && html`<span class="agent-when">${when}</span>`}
+                    <${SubagentModel} agent=${agent} />
                     ${agent.reporting && html`<span class="agent-chip">report on its way to Pi</span>`}
                 </span>
                 ${agent.busy && html`<span class="agent-now">${nowDoing(agent)}</span>`}
@@ -223,6 +219,7 @@ function Bar({ agents, active, open, held }) {
 
     return html`<div
         class=${`agents-bar ${open ? "open" : ""} ${working.length > 0 ? "busy" : ""}`}
+        data-part="subagents-bar"
         ref=${box}
     >
         <div class="agents-top">

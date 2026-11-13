@@ -8,6 +8,7 @@ import { HtmlPreview } from "../rich.js";
 import { RunFrame } from "../run-frame.js";
 import { actions, canSteer, closeSheet, insertIntoComposer, notify, store } from "../store.js";
 import {
+    APPLE,
     copyText,
     fileUrl,
     formatBytes,
@@ -17,6 +18,7 @@ import {
     Loader,
     Markdown,
     openFile,
+    revealFile,
     Sheet,
 } from "../ui.js";
 
@@ -47,9 +49,9 @@ function useLines(file, path) {
 /**
  * A file of the session, read-only: text with line numbers and colors (Markdown shows rendered too), an image, or a
  * folder to browse, under a bar with its path and the viewer's buttons (copy, mention, preview). `line` scrolls to and
- * marks that line. `onOpen` opens an entry of a folder.
+ * marks that line. `onOpen` opens an entry of a folder. `refresh` changes when the same file is asked for again.
  */
-export function FileView({ path, line, onOpen = openFile, onLoad }) {
+export function FileView({ path, line, refresh, onOpen = openFile, onLoad }) {
     const [file, setFile] = useState(null);
     const [error, setError] = useState(null);
     const markdown = isMarkdown(path);
@@ -58,6 +60,7 @@ export function FileView({ path, line, onOpen = openFile, onLoad }) {
     const [running, setRunning] = useState(false);
     const [all, setAll] = useState(line !== undefined && line > FILE_LINES);
     const body = useRef(null);
+    const shownPath = useRef(path);
     const { lines, colored } = useLines(file, file?.path ?? path);
     // The same element while the file and the marked line stay the same: Preact then skips its rows on every update of
     // the app, instead of comparing thousands of them.
@@ -69,7 +72,12 @@ export function FileView({ path, line, onOpen = openFile, onLoad }) {
     useEffect(() => {
         let live = true;
 
-        setFile(null);
+        // The same file asked for again keeps its text until the new text arrives; another file shows the loader.
+        if (shownPath.current !== path) {
+            shownPath.current = path;
+            setFile(null);
+        }
+
         setError(null);
         actions.view(path).then(
             (each) => {
@@ -78,13 +86,18 @@ export function FileView({ path, line, onOpen = openFile, onLoad }) {
                     onLoad?.(each);
                 }
             },
-            (failure) => live && setError(failure.message),
+            (failure) => {
+                if (live) {
+                    setFile(null);
+                    setError(failure.message);
+                }
+            },
         );
 
         return () => {
             live = false;
         };
-    }, [path]);
+    }, [path, refresh]);
     useEffect(() => {
         setPreview(markdown && line === undefined);
         setRunning(false);
@@ -167,7 +180,11 @@ export function FileView({ path, line, onOpen = openFile, onLoad }) {
             page &&
             html`${
                 running
-                    ? html`<${RunFrame} source=${file.text} title=${name} />`
+                    ? html`<${RunFrame}
+                          source=${file.text}
+                          title=${name}
+                          from=${`the file “${name}”`}
+                      />`
                     : html`<${HtmlPreview} source=${file.text} title=${name} />`
             }
             <p class="muted small file-note">
@@ -255,7 +272,7 @@ function FileActions({ file, shown, previewable, preview, onPreview, running, on
             aria-label="Copy"
             onClick=${() => copyText(file.text).then(() => notify("info", "Copied."))}
         >
-            ⧉
+            <${Icon} name="copy" size=${16} />
         </button>`
     }
     ${
@@ -268,17 +285,33 @@ function FileActions({ file, shown, previewable, preview, onPreview, running, on
         >
             @ Mention
         </button>`
+    }
+    ${
+        // For the owner at the server's machine, with a mouse: show it in that machine's file manager.
+        // Ctrl+click (⌘+click) on a path does the same.
+        file &&
+        store.state.me?.role === "owner" &&
+        matchMedia("(pointer: fine)").matches &&
+        html`<button
+            class="icon-button"
+            title=${`Show in the file manager (${APPLE ? "⌘" : "Ctrl"}+click a path)`}
+            aria-label="Show in the file manager"
+            onClick=${() => revealFile(file.path)}
+        >
+            <${Icon} name="folder" size=${16} />
+        </button>`
     }`;
 }
 
 /** The viewer as a sheet: opened from a path in a reply, a tool card, a mention, or Changes. */
-export function FileSheet({ path, line }) {
+export function FileSheet({ path, line, refresh }) {
     const [name, setName] = useState(path.replace(/\/$/, "").split("/").pop() || path);
 
     return html`<${Sheet} title=${name} onClose=${closeSheet} wide=${true}>
         <${FileView}
             path=${path}
             line=${line}
+            refresh=${refresh}
             onLoad=${(file) => setName((file.display ?? path).replace(/\/$/, "").split("/").pop() || path)}
         />
     <//>`;

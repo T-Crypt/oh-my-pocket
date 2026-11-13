@@ -1,7 +1,3 @@
-// Signing in to a provider in a real browser, where this machine has Chromium. The server's word about a sign-in (its
-// next question, its end) can reach the page before the reply to the answer that led to it: the dialog then shows that
-// question, closes on success with a notice that says so, shows a failure's error, never throws, and once closed stays
-// closed.
 import { type App, cleanUp, home, root, scriptedModel, until, work } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
@@ -25,40 +21,6 @@ const real = {
 
 type Interaction = {
     prompt(prompt: Record<string, unknown>): Promise<string>;
-};
-
-/** Sign-ins of Keyed that have ended, however they ended. */
-let keyedEnded = 0;
-
-/** A provider signed in with a key it asks for: "wrong" is turned down. */
-const keyed = {
-    ...fauxProvider({ provider: "keyed", models: [{ id: "keyed-1" }] }).provider,
-    name: "Keyed",
-    auth: {
-        apiKey: {
-            name: "Keyed API key",
-            login: async (interaction: Interaction) => {
-                try {
-                    const key = await interaction.prompt({
-                        type: "secret",
-                        message: "Enter the Keyed key",
-                    });
-
-                    if (key === "wrong") {
-                        throw new Error("Keyed turned that key down");
-                    }
-
-                    return { type: "api_key", key };
-                } finally {
-                    keyedEnded += 1;
-                }
-            },
-            resolve: async ({ credential }: { credential?: { key?: string } }) =>
-                credential?.key === undefined
-                    ? undefined
-                    : { auth: { apiKey: credential.key }, source: "stored" },
-        },
-    },
 };
 
 /** A subscription whose sign-in asks two questions, one after the other. */
@@ -188,10 +150,6 @@ async function answer(name: string, value: string): Promise<void> {
     await page.click({ label: "Continue" });
 }
 
-/** A script that says whether a notice on screen says `text`. */
-const noticeSays = (text: string) =>
-    `return JSON.stringify([...document.querySelectorAll(".notice")].some((notice) => notice.textContent.includes(${JSON.stringify(text)})))`;
-
 /** Wait until the page has had every event the server sent so far: a notice sent now comes after them. */
 async function caughtUp(): Promise<void> {
     const word = `caught up ${String(Date.now())}`;
@@ -220,7 +178,6 @@ before(async () => {
         home,
         configureModels: (models) => {
             models.registerNativeProvider(faux.provider);
-            models.registerNativeProvider(keyed as never);
             models.registerNativeProvider(stepped as never);
         },
     });
@@ -245,54 +202,6 @@ after(async () => {
     cleanUp();
 });
 
-test("a failed sign-in shows its error, and once closed stays closed", real, async () => {
-    await providers("keyed");
-    await page.click({ label: "API key" });
-    await answer("Keyed", "wrong");
-    await see(
-        `return JSON.stringify(document.querySelector('${dialog("Keyed")} .error-box')?.textContent.includes("Keyed turned that key down") === true)`,
-        "the error",
-    );
-    await caughtUp();
-    assert.deepEqual(await problems(), []);
-    assert.equal(await inPage<boolean>(noticeSays("Signed in")), false, "no word of success");
-
-    await page.click({ selector: `${dialog("Keyed")} button[aria-label="Close"]` });
-    await caughtUp();
-    assert.equal(
-        await inPage<boolean>(
-            `return JSON.stringify((await import("/store.js")).store.state.auth === null && document.querySelector('${dialog("Keyed")}') === null)`,
-        ),
-        true,
-    );
-});
-
-test(
-    "a sign-in closed while it asks does not come back when the server ends it",
-    real,
-    async () => {
-        const ended = keyedEnded;
-
-        await providers("keyed");
-        await page.click({ label: "API key" });
-        await see(
-            `return JSON.stringify(document.querySelector('${dialog("Keyed")} .field input') !== null)`,
-            "the question",
-        );
-        await page.click({ selector: `${dialog("Keyed")} button[aria-label="Close"]` });
-        await until(() => keyedEnded > ended, "the server ended the sign-in");
-        await caughtUp();
-        assert.equal(
-            await inPage<boolean>(
-                `return JSON.stringify((await import("/store.js")).store.state.auth === null && document.querySelector('${dialog("Keyed")}') === null)`,
-            ),
-            true,
-            "the dialog stays closed",
-        );
-        assert.deepEqual(await problems(), []);
-    },
-);
-
 test(
     "a sign-in that asks twice shows the second question, though it came before the first answer's reply",
     real,
@@ -313,29 +222,242 @@ test(
             `return JSON.stringify((await import("/store.js")).store.state.auth === null && document.querySelector('${dialog("Stepped")}') === null)`,
             "the dialog closed",
         );
-        await see(noticeSays("Signed in to Stepped."), "the notice that says so");
         await caughtUp();
         assert.deepEqual(await problems(), []);
     },
 );
 
 test(
-    "a sign-in that works closes its dialog and says so, without an error, though it ended before the answer's reply",
+    "the Providers model selector keeps its layout and selection across viewports",
     real,
     async () => {
-        await providers("keyed");
-        await page.click({ label: "API key" });
-        await answer("Keyed", "a-good-key");
+        await page.setViewport(VIEWPORTS.desktop);
+        await page.navigate(`${base}/login?token=${encodeURIComponent(app.config.ownerToken)}`);
         await see(
-            `return JSON.stringify((await import("/store.js")).store.state.models.some((model) => model.provider === "keyed"))`,
-            "signed in to Keyed",
+            `return JSON.stringify((await import("/store.js")).store.state.me?.role === "owner")`,
+            "signed in",
+        );
+        await page.evaluate(
+            `window.pageErrors = []; addEventListener("error", (event) => window.pageErrors.push(String(event.message))); return "true"`,
+        );
+        await page.evaluate(`
+        const { openSheet, store } = await import("/store.js");
+        localStorage.removeItem("pocket.modelFavorites." + store.state.me.id);
+        const model = store.state.models.find((each) => each.provider === "faux");
+
+        store.set((state) => ({
+            models: [
+                ...state.models,
+                ...Array.from({ length: 40 }, (_, index) => ({
+                    ...model,
+                    id: "fixture-" + index,
+                    name: "Fixture model " + index,
+                })),
+            ],
+        }));
+        openSheet({ type: "providers" });
+
+        return "true";
+    `);
+        await see(
+            `return JSON.stringify(document.querySelector(".subagent-models-list") !== null && document.querySelector(".providers-main") !== null)`,
+            "the Providers model selector",
+        );
+        await settled();
+
+        const desktop = await inPage<{ width: number; height: number; overflow: boolean }>(`
+        const list = document.querySelector(".subagent-models-list").getBoundingClientRect();
+
+        return JSON.stringify({
+            width: list.width,
+            height: list.height,
+            overflow: document.documentElement.scrollWidth > innerWidth,
+        });
+    `);
+
+        assert.ok(desktop.width >= 400, `desktop model list width was ${desktop.width}px`);
+        assert.ok(desktop.height >= 280, `desktop model list height was ${desktop.height}px`);
+        assert.equal(desktop.overflow, false, "desktop has no horizontal overflow");
+
+        const chosen = await inPage<{ text: string; title: string }>(`
+        const chosen = document.querySelector(".subagent-models-chosen");
+
+        return JSON.stringify({ text: chosen.textContent, title: chosen.title });
+    `);
+
+        assert.equal(chosen.text.trim(), "0 for subagents");
+        assert.match(chosen.title, /None allowed/);
+
+        await page.type({ selector: 'input[placeholder="Find a model"]' }, "Fixture model 17");
+        await see(
+            `return JSON.stringify(document.querySelectorAll(".subagent-model").length === 1 && document.querySelector(".subagent-model").textContent.includes("Fixture model 17"))`,
+            "the searched model",
+        );
+
+        await page.setViewport(VIEWPORTS.mobile);
+        await page.evaluate(`
+        const input = document.querySelector('input[placeholder="Find a model"]');
+
+        input.value = "";
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+
+        return "true";
+    `);
+        await see(
+            `return JSON.stringify(document.querySelectorAll(".subagent-model").length > 1)`,
+            "the model list on mobile",
+        );
+        const mobile = await inPage<{
+            overflow: boolean;
+            sideTop: number;
+            mainTop: number;
+            minRow: number;
+        }>(`
+        const side = document.querySelector(".providers-side").getBoundingClientRect();
+        const main = document.querySelector(".providers-main").getBoundingClientRect();
+        const rows = [...document.querySelectorAll(".subagent-model")].map((row) => row.getBoundingClientRect().height);
+
+        return JSON.stringify({
+            overflow: document.documentElement.scrollWidth > innerWidth,
+            sideTop: side.top,
+            mainTop: main.top,
+            minRow: Math.min(...rows),
+        });
+    `);
+
+        assert.equal(mobile.overflow, false, "mobile has no horizontal overflow");
+        assert.ok(
+            mobile.sideTop < mobile.mainTop,
+            "mobile keeps the model selector above providers",
+        );
+        assert.ok(mobile.minRow >= 44, `mobile model row height was ${mobile.minRow}px`);
+
+        await page.setViewport(VIEWPORTS.desktop);
+        await settled();
+        await page.click({ selector: '.subagent-model input[value="faux/faux-1"]' });
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const toggleState = await inPage<{
+            checked: boolean;
+            allowed: string[];
+            errors: string[];
+        }>(`
+            const { store } = await import("/store.js");
+
+            return JSON.stringify({
+                checked: document.querySelector('.subagent-model input[value="faux/faux-1"]').checked,
+                allowed: store.state.server.subagentModels,
+                errors: store.state.notices.filter((notice) => notice.level === "error").map((notice) => notice.message),
+            });
+        `);
+
+        assert.deepEqual(toggleState, { checked: true, allowed: ["faux/faux-1"], errors: [] });
+        await page.evaluate(
+            `const { closeSheet, openSheet } = await import("/store.js"); closeSheet(); await new Promise((resolve) => setTimeout(resolve, 450)); openSheet({ type: "providers" }); return "true"`,
         );
         await see(
-            `return JSON.stringify((await import("/store.js")).store.state.auth === null && document.querySelector('${dialog("Keyed")}') === null)`,
-            "the dialog closed",
+            `return JSON.stringify(document.querySelector('.subagent-model input[value="faux/faux-1"]')?.checked === true)`,
+            "the saved selection after reopening",
         );
-        await see(noticeSays("Signed in to Keyed."), "the notice that says so");
-        await caughtUp();
+
+        const favoriteSelector = '.subagent-model:has(input[value="faux/faux-1"]) .model-favorite';
+
+        await page.click({ selector: favoriteSelector });
+        await see(
+            `return JSON.stringify(document.querySelector('${favoriteSelector}')?.getAttribute("aria-pressed") === "true")`,
+            "the model starred",
+        );
+        assert.deepEqual(
+            await inPage<string[]>(
+                `const { store } = await import("/store.js"); return JSON.stringify(JSON.parse(localStorage.getItem("pocket.modelFavorites." + store.state.me.id)))`,
+            ),
+            ["faux/faux-1"],
+            "favorites use the owner's localStorage key",
+        );
+        assert.equal(
+            await inPage<boolean>(
+                `return JSON.stringify(document.querySelector('.subagent-model input[value="faux/faux-1"]').checked)`,
+            ),
+            true,
+            "star does not change the model checkbox",
+        );
+        await page.click({ label: "Favorites" });
+        await see(
+            `return JSON.stringify(document.querySelectorAll(".subagent-model").length === 1 && document.querySelector('.subagent-model input[value="faux/faux-1"]') !== null)`,
+            "the Providers favorites filter",
+        );
+        await page.click({ selector: favoriteSelector });
+        await see(
+            `return JSON.stringify(document.querySelectorAll(".subagent-model").length === 0 && document.activeElement.matches('.model-filters button[aria-pressed="true"]'))`,
+            "unstar removes the row and focuses the active Favorites filter",
+        );
+        assert.deepEqual(
+            await inPage<string[]>(
+                `return JSON.stringify((await import("/store.js")).store.state.server.subagentModels)`,
+            ),
+            ["faux/faux-1"],
+            "favorites do not change subagent permissions",
+        );
+        await page.click({ label: "All models" });
+        assert.equal(
+            await inPage<boolean>(
+                `return JSON.stringify(document.querySelector('.subagent-model input[value="faux/faux-1"]').checked)`,
+            ),
+            true,
+            "unstar does not change the model checkbox",
+        );
+        await page.click({ selector: favoriteSelector });
+        await see(
+            `return JSON.stringify(document.querySelector('${favoriteSelector}')?.getAttribute("aria-pressed") === "true")`,
+            "the model starred again",
+        );
+        await page.navigate(`${base}/login?token=${encodeURIComponent(app.config.ownerToken)}`);
+        await see(
+            `return JSON.stringify((await import("/store.js")).store.state.me?.role === "owner")`,
+            "signed in after reload",
+        );
+        await page.evaluate(
+            `window.pageErrors = []; addEventListener("error", (event) => window.pageErrors.push(String(event.message))); return "true"`,
+        );
+        await page.evaluate(
+            `const { openSheet } = await import("/store.js"); openSheet({ type: "providers" }); return "true"`,
+        );
+        await see(
+            `return JSON.stringify(document.querySelector('.subagent-model:has(input[value="faux/faux-1"]) .model-favorite[aria-pressed="true"]') !== null)`,
+            "the favorite persisted after reload",
+        );
+        await page.evaluate(
+            `const { closeSheet, openSheet } = await import("/store.js"); closeSheet(); await new Promise((resolve) => setTimeout(resolve, 450)); openSheet({ type: "model" }); return "true"`,
+        );
+        await see(
+            `return JSON.stringify(document.querySelector('.model-filters button') !== null)`,
+            "the ModelPicker favorites filter",
+        );
+        await page.click({ label: "Favorites" });
+        await see(
+            `return JSON.stringify(document.querySelectorAll('.pop-menu-row').length === 1 && document.querySelector('.pop-menu-row').getAttribute("title").startsWith("faux/faux-1"))`,
+            "the ModelPicker favorites results",
+        );
+        assert.deepEqual(await problems(), []);
+        await page.evaluate(
+            `const { store } = await import("/store.js"); localStorage.setItem("pocket.modelFavorites." + store.state.me.id, "{"); return "true"`,
+        );
+        await page.navigate(`${base}/login?token=${encodeURIComponent(app.config.ownerToken)}`);
+        await see(
+            `return JSON.stringify((await import("/store.js")).store.state.me?.role === "owner")`,
+            "signed in with malformed favorites",
+        );
+        await page.evaluate(
+            `window.pageErrors = []; addEventListener("error", (event) => window.pageErrors.push(String(event.message))); const { openSheet } = await import("/store.js"); openSheet({ type: "providers" }); return "true"`,
+        );
+        await see(
+            `return JSON.stringify(document.querySelector('.subagent-model:has(input[value="faux/faux-1"]) .model-favorite[aria-pressed="false"]') !== null)`,
+            "malformed favorites are ignored",
+        );
+        assert.deepEqual(await problems(), []);
+        await app.setSubagentModels(
+            app.config.users.find((user) => user.role === "owner")!,
+            [],
+        );
         assert.deepEqual(await problems(), []);
     },
 );

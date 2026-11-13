@@ -20,6 +20,7 @@ import {
     say,
     scriptedModel,
     work,
+    offerSubagents,
 } from "./helpers.ts";
 
 let app: App;
@@ -76,6 +77,7 @@ const resultsOf = async (id: ConversationId) => {
 before(async () => {
     process.env.PI_POCKET_BASH_TIMEOUT = "1";
     app = await openApp(scriptedModel(route));
+    offerSubagents(app);
 });
 
 after(async () => {

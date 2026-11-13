@@ -4,7 +4,8 @@
  * plan, and the list survives compaction and restarts because it is stored with the session, not only in the
  * transcript. Each update sends the whole list. After DSH's todo tool.
  */
-import { Type } from "@earendil-works/pi-ai";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { arr, obj, opt, str } from "@earendil-works/pi-schema";
 import { defineExtension, defineTool } from "@earendil-works/pi-durable";
 import { type TodoItem, TodoDoc } from "../docs.ts";
 import type { PocketHost } from "../host.ts";
@@ -36,21 +37,23 @@ export default function createTodo(_host: PocketHost) {
             "Your task list for this session. For work of three steps or more, write the steps first, set one to doing " +
             "before you start it, and set it to done as soon as it is finished. Send the whole list each time; call " +
             "without items to see it.",
-        parameters: Type.Object({
-            items: Type.Optional(
-                Type.Array(
-                    Type.Object({
-                        text: Type.String(),
-                        status: Type.Union([
-                            Type.Literal("pending"),
-                            Type.Literal("doing"),
-                            Type.Literal("done"),
-                        ]),
-                    }),
-                    { description: "The whole list, in order." },
+        parameters: obj(
+            {
+                items: opt(
+                    arr(
+                        obj(
+                            {
+                                text: str(),
+                                status: StringEnum(["pending", "doing", "done"] as const),
+                            },
+                            { open: true },
+                        ),
+                        { description: "The whole list, in order." },
+                    ),
                 ),
-            ),
-        }),
+            },
+            { open: true },
+        ),
         // Replacing the list with the same list again changes nothing.
         replay: "safe",
         execute: async (args, api, context) => {
@@ -79,7 +82,7 @@ export default function createTodo(_host: PocketHost) {
                 return state.items.map((item) => ({ ...item }));
             }, context);
 
-            return { content: [{ type: "text" as const, text: renderTodo(list) }] };
+            return { output: [{ type: "text" as const, text: renderTodo(list) }] };
         },
     });
 

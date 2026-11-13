@@ -1,5 +1,6 @@
 /** `/api/push`: phone notifications. */
 import { describe, HttpError } from "../errors.ts";
+import { DEFAULT_PREFS } from "../push.ts";
 import { type ApiRequest, json, readJson } from "./io.ts";
 
 /** Phone notifications: this device's subscription, what to notify about, and a test. */
@@ -62,7 +63,8 @@ export async function pushRoutes(api: ApiRequest, action: string | undefined): P
         const body = await readJson<Record<string, unknown>>(request);
         const patch: Record<string, boolean> = {};
 
-        for (const key of ["done", "approval", "chat", "mention"]) {
+        // Every kind there is: a new one (limit) must not need a second list here.
+        for (const key of Object.keys(DEFAULT_PREFS)) {
             if (typeof body[key] === "boolean") {
                 patch[key] = body[key] as boolean;
             }
@@ -72,12 +74,15 @@ export async function pushRoutes(api: ApiRequest, action: string | undefined): P
     }
 
     if (action === "test") {
-        const sent = await store.notify(user.id, {
+        const test = {
             title: "Pi Pocket",
             body: `Notifications work on this device, ${user.name}.`,
             url: "/",
             tag: "test",
-        });
+        };
+        const sent =
+            (await store.notify(user.id, test)) +
+            app.notifyEmbedders(user.id, { ...test, urgency: "normal" });
 
         if (sent === 0) {
             throw new HttpError(

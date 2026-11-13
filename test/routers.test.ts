@@ -13,6 +13,7 @@ import {
     owner,
     root,
     until,
+    loadTools,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -327,6 +328,30 @@ test("a detected router runs its prompt, its roles on their models; one with no 
     assert.match(lastPrompt, /You are MAINROUTER\./);
 });
 
+test("a session that runs a router has the subagent tool at once; a plain one finds it by a search", async () => {
+    app.saveRouter(owner(app), { id: "spawner", pipeline: [stage("fix", "fix")] });
+    const plain = await newSession(app);
+    const routed = await newSession(app);
+
+    await app.commands.setRouter(routed, owner(app), "spawner");
+
+    const tools = async (id: ConversationId) => {
+        const agent = await (await app.conversation(id)).agent(context);
+
+        return {
+            offered: agent.tools.map((tool) => tool.name),
+            waiting: agent.deferred.map((tool) => tool.name),
+        };
+    };
+
+    assert.ok(
+        (await tools(routed)).offered.includes("subagent"),
+        "the router session is offered subagent",
+    );
+    assert.ok(!(await tools(plain)).offered.includes("subagent"), "a plain session is not");
+    assert.ok((await tools(plain)).waiting.includes("subagent"), "it waits for a search there");
+});
+
 test("a dispatcher router may not run commands itself", async () => {
     app.saveRouter(owner(app), {
         id: "dispatch",
@@ -347,6 +372,9 @@ test("a dispatcher router may not run commands itself", async () => {
 test("a spawn's skills go into the subagent's prompt after its definition's words; a wrong list starts nothing", async () => {
     const id = await newSession(app);
 
+    // A plain session loads subagent by a search (`tool-search.ts`); here it is loaded as that search would.
+    await loadTools(app, id, "subagent");
+
     await go(id, "subagent", {
         action: "spawn",
         name: "s1",
@@ -359,7 +387,12 @@ test("a spawn's skills go into the subagent's prompt after its definition's word
         seen.s1!.prompt,
         /Build\.[\s\S]*read each of these skills in full[\s\S]*- checklist: .*checklist[\\/]+SKILL\.md/,
     );
-    assert.equal(seen.s1!.prompt.match(/- checklist: /g)?.length, 1, "named twice, read once");
+    // The system prompt's compact skills list names it too; the list to read in full gives its file, once.
+    assert.equal(
+        seen.s1!.prompt.match(/- checklist: .*checklist[\\/]+SKILL\.md/g)?.length,
+        1,
+        "named twice, read once",
+    );
 
     assert.match(
         await go(id, "subagent", { action: "spawn", name: "s2", message: "x", skills: ["nope"] }),

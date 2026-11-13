@@ -11,6 +11,7 @@ import {
     root,
     scriptedModel,
     until,
+    offerSubagents,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -116,6 +117,7 @@ before(async () => {
     writeFileSync(join(folder, "plain.md"), "Just a role, no front matter.\n");
     writeFileSync(join(folder, "odd.md"), "---\nthinking: enormous\n---\nOdd.\n");
     app = await openApp(scriptedModel(route), dataDir);
+    offerSubagents(app);
 });
 
 after(async () => {

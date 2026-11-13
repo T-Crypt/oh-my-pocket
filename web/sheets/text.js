@@ -12,6 +12,8 @@ export function TextSheet({
     submit,
     multiline = false,
     button = "Save",
+    header = null,
+    footer = null,
 }) {
     const [value, setValue] = useState(initial);
     const save = () =>
@@ -21,6 +23,7 @@ export function TextSheet({
         });
 
     return html`<${Sheet} title=${title} onClose=${closeSheet}>
+        ${header}
         ${hint && html`<p class="muted small">${hint}</p>`}
         <div class="field">
             <div class="label">${label}</div>
@@ -28,12 +31,14 @@ export function TextSheet({
                 multiline
                     ? html`<textarea
                         rows="4"
+                        aria-label=${label}
                         value=${value}
                         placeholder=${placeholder}
                         onInput=${(event) => setValue(event.currentTarget.value)}
                     ></textarea>`
                     : html`<input
                         autofocus
+                        aria-label=${label}
                         value=${value}
                         placeholder=${placeholder}
                         onInput=${(event) => setValue(event.currentTarget.value)}
@@ -41,6 +46,10 @@ export function TextSheet({
                     />`
             }
         </div>
-        <button class="button primary wide" onClick=${save}>${button}</button>
+        <div class="sheet-actions">
+            <button class="button" onClick=${closeSheet}>Cancel</button>
+            <button class="button primary" onClick=${save}>${button}</button>
+        </div>
+        ${footer}
     <//>`;
 }

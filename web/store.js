@@ -1,5 +1,24 @@
 // App state, the server connection, and API calls. Components read `store.state` and re-render on `store.subscribe`.
-import { onRoute, pushRoute } from "./back.js";
+import { onRoute, popRoute, pushRoute, routeState } from "./back.js";
+import { hostCan, onPageVisibility, pageVisible } from "./host.js";
+import { sessionForest, unfolded } from "./session-tree.js";
+import { liveMessage } from "./live.js";
+import { fitClock, moment } from "./clock.js";
+import { fingerprint } from "./text-hash.js";
+import * as disk from "./session-cache.js";
+import { personStorage } from "./person-storage.js";
+import { notesDrafts } from "./notes-drafts.js";
+import {
+    keptLayout,
+    layoutOf,
+    layoutPairs,
+    layoutPatch,
+    legacyLayout,
+    LEGACY_KEYS,
+    NO_LAYOUT,
+    remember,
+    sameLayout,
+} from "./panel-layout.js";
 
 /** A random id. crypto.randomUUID only exists on https and localhost pages; plain-http network addresses lack it. */
 export function uid() {
@@ -33,6 +52,30 @@ function unreadOf() {
     }
 }
 
+/** How far this browser has read a session's chat: the time of the newest message seen, in `pocket.chatRead.<id>`. */
+const CHAT_READ_PREFIX = "pocket.chatRead.";
+
+/**
+ * Every session's read time, by id, from local storage. Read once at load and kept in the store (`chatReads`): the list
+ * asks for each row as it draws, and storage is slow to ask.
+ */
+function readChatReads() {
+    const reads = {};
+
+    for (let index = 0; index < localStorage.length; index++) {
+        const key = localStorage.key(index);
+        const at = key?.startsWith(CHAT_READ_PREFIX) ? Number(localStorage.getItem(key)) : 0;
+
+        if (at > 0) {
+            reads[key.slice(CHAT_READ_PREFIX.length)] = at;
+        }
+    }
+
+    return reads;
+}
+
+const firstReads = readChatReads();
+
 const TAB = sessionStorage.getItem(TAB_KEY) ?? uid();
 
 sessionStorage.setItem(TAB_KEY, TAB);
@@ -51,11 +94,13 @@ const emptyView = () => ({
     artifacts: [],
     subagents: [],
     authors: {},
+    linkedPeers: {},
     reactions: {},
     pins: [],
     turns: { on: false, asks: [] },
     decisions: {},
     plan: { on: false },
+    browserUse: false,
     subagentPolicy: null,
     router: null,
     schedules: [],
@@ -63,16 +108,180 @@ const emptyView = () => ({
     watch: null,
     branch: null,
     subagentsHeld: null,
+    held: [],
 });
+
+// ─── Each session's panel ──────────────────────────────────────────────────────────
+
+/**
+ * Where the panel each session shows is kept (`panel-layout.js`), as `[id, layout]` pairs, the one shown longest ago
+ * first: the tab's in `sessionStorage`, with whose they are, and the device's in `personStorage`, for a tab that never
+ * showed the session. Another account in this browser sees neither. They are small: ids and panel names.
+ */
+const TAB_LAYOUTS = "pocket.layouts";
+const DEVICE_LAYOUTS = "layouts";
+
+const layoutPerson = () => store.state.me?.id ?? null;
+
+function tabLayouts() {
+    try {
+        const kept = JSON.parse(sessionStorage.getItem(TAB_LAYOUTS));
+
+        return kept?.person === layoutPerson() ? layoutPairs(kept.pairs) : [];
+    } catch {
+        return [];
+    }
+}
+
+function deviceLayouts() {
+    try {
+        return layoutPairs(JSON.parse(personStorage.get(DEVICE_LAYOUTS)));
+    } catch {
+        return [];
+    }
+}
+
+/** Set at sign-out, in this tab or another: the device keeps no more layouts (`pocket:signedOut`). */
+let layoutsStopped = false;
+
+/** Whether `id` keeps a layout: a session does; home and PiP's conversation, open as a board, do not. */
+const keepsLayout = (id, state = store.state) => id !== null && id !== state.pip?.id;
+
+/**
+ * The panel `id` showed when it was left: in this tab, else on this device, else none. An extension's panel shows only
+ * while the server lists its module: one turned off since is kept for when it comes back.
+ */
+function layoutFor(id) {
+    if (!keepsLayout(id) || layoutPerson() === null) {
+        return NO_LAYOUT;
+    }
+
+    const kept =
+        keptLayout(tabLayouts(), id) ?? (layoutsStopped ? null : keptLayout(deviceLayouts(), id));
+    const listed = store.state.server?.ui;
+
+    if (
+        kept === null ||
+        (kept.panel === "ext" &&
+            Array.isArray(listed) &&
+            !listed.some((each) => each.module === kept.ext.module))
+    ) {
+        return NO_LAYOUT;
+    }
+
+    return kept;
+}
+
+/** Keep the panel `id` shows now, for this tab and the device: the device keeps only a panel, not "none". */
+function keepLayout(id, layout) {
+    const person = layoutPerson();
+
+    if (person === null) {
+        return;
+    }
+
+    const pairs = remember(tabLayouts(), id, layout);
+
+    try {
+        sessionStorage.setItem(TAB_LAYOUTS, JSON.stringify({ person, pairs }));
+    } catch {
+        // Storage full or refused: the session shows no panel next time.
+    }
+
+    if (!layoutsStopped) {
+        const device = remember(deviceLayouts(), id, layout, { keepNone: false });
+
+        personStorage.set(DEVICE_LAYOUTS, device.length === 0 ? null : JSON.stringify(device));
+    }
+}
+
+/**
+ * The panel the page shows once it knows who is signed in. A tab that kept one panel for every session (before layouts
+ * were a session's) gives it to the session it shows, once.
+ */
+function firstLayout() {
+    const id = store.state.conversationId;
+    const legacy = legacyLayout((key) => sessionStorage.getItem(key));
+
+    for (const key of LEGACY_KEYS) {
+        sessionStorage.removeItem(key);
+    }
+
+    if (legacy !== null && id !== null && keptLayout(tabLayouts(), id) === null) {
+        keepLayout(id, legacy);
+    }
+
+    return layoutFor(id);
+}
+
+/**
+ * PiP's id comes with the connection, after the first layout: a panel kept for its conversation before then (the old
+ * global panel handed over on a PiP board) is dropped, and does not show on it.
+ */
+function pipLayout(pip) {
+    const id = pip?.id;
+
+    if (id === undefined || id === store.state.pip?.id || layoutPerson() === null) {
+        return {};
+    }
+
+    keepLayout(id, NO_LAYOUT);
+
+    return id === store.state.conversationId ? layoutPatch(NO_LAYOUT) : {};
+}
+
+/** The session and layout last kept: a change to either keeps the layout again. */
+let layoutShown = { id: null, layout: NO_LAYOUT };
+
+// A panel opened or closed is kept for the session at once, so a reload or a visit later shows it again. Going to another
+// session shows the layout kept for it; one opened on the way there (a chat docked as People) is kept too. PiP's
+// conversation keeps none: opened again (as a board), it shows PiP, not a panel left over it.
+function followLayout(state) {
+    const id = state.conversationId;
+    const layout = layoutOf(state);
+
+    if (id === layoutShown.id && sameLayout(layout, layoutShown.layout)) {
+        return;
+    }
+
+    const moved = id !== layoutShown.id;
+
+    layoutShown = { id, layout };
+
+    if (keepsLayout(id, state) && !state.missing && !(moved && sameLayout(layout, layoutFor(id)))) {
+        keepLayout(id, layout);
+    }
+}
+
+addEventListener("pocket:signedOut", () => {
+    layoutsStopped = true;
+
+    personStorage.set(DEVICE_LAYOUTS, null);
+
+    try {
+        sessionStorage.removeItem(TAB_LAYOUTS);
+    } catch {
+        // Refused: it is another person's to read no more.
+    }
+});
+
+/** Where this browser keeps the sessions whose linked sessions are folded away (`toggleFoldedLinked`). */
+const FOLDED_LINKED_KEY = "pocket.foldedLinked";
 
 export const store = {
     state: {
         me: undefined, // undefined: unknown, null: signed out
         users: [],
         models: [],
+        /** What the llama-swap card does for this server, while something waits for it (`src/server/gpu.ts`). */
+        gpu: { waiting: [], loading: [] },
+        /** This tab's shared model refresh state and last result (`model-refresh.js`). */
+        modelRefresh: { loading: false, result: null, error: null },
         guard: null,
         server: null,
         sessions: [],
+        /** This person's favorite folders, in shortcut order, sent by the server to every signed-in device. */
+        folderFavorites: [],
         /** False until the server's first session list arrives: an empty list until then means "not here yet". */
         sessionsLoaded: false,
         /** Sessions on their way into the archive (true) or out of it (false), by id, until the list catches up (`sessions.js`). */
@@ -80,11 +289,27 @@ export const store = {
         /** Sessions marked unread in this browser: an id each, until opened again. */
         unread: unreadOf(),
         conversationId: routeConversation(),
+        /** The route this one was opened over, as a board is (`navigate`'s `over`): `{ id }`, null for home; else null. */
+        over: routeOver(),
+        /** Sessions whose linked sessions are folded away in the list: this browser's choice (`toggleFoldedLinked`). */
+        foldedLinked: readFoldedLinked(),
         view: emptyView(),
-        ...peopleFor(routeConversation()),
+        /** How far this browser has read each session's chat, by id: what `pocket.chatRead.<id>` keeps. */
+        chatReads: firstReads,
+        ...peopleFor(routeConversation(), firstReads),
         history: null,
         /** The id of the oldest transcript entry shown, or null for the newest `TRANSCRIPT_ROWS` rows. */
         transcriptFrom: null,
+        /**
+         * Where the reader of the transcript is, when not at the bottom: `{ keep }`, its distance from the bottom (scroll
+         * height less scroll top). Kept with a session's view as the tab leaves it (`keepView`), to open there again.
+         */
+        transcriptPlace: null,
+        /**
+         * A kept session this tab goes back to, which changed while it was away, held behind the loading screen until the
+         * server's view of it comes (Appearance's Wait for updates, `holdsFor`): its id, or null.
+         */
+        holding: null,
         missing: null,
         connection: "connecting",
         notices: [],
@@ -93,6 +318,13 @@ export const store = {
         auth: null,
         /** A transcript message the next chat message discusses: `{ entryId, text }`. */
         chatQuote: null,
+        /** A passage the session's next message quotes (Reply): `{ text }`. Leaving the session drops it. */
+        replyQuote: null,
+        /**
+         * A passage PiP's next message quotes (Ask PiP, or Reply on PiP's own board): `{ text, session? }`, with the
+         * session it came from. One for PiP wherever it shows, so moving PiP between its places keeps it as it is.
+         */
+        pipQuote: null,
         /** Text to put into the message box to Pi: `{ text, n }`, picked up by the composer. */
         composerInsert: null,
         /** Pi's prompt templates for a conversation's folder: `{ conversationId, at, list }`. */
@@ -101,30 +333,42 @@ export const store = {
         trust: null,
         /** The conversation whose subagents bar shows a row for each subagent (`subagents.js`); null for none. */
         subagentsOpen: null,
-        /** The subagents board shows in the conversation's place (`subagents-board.js`). */
+        /**
+         * What shows in the conversation's place: `"subagents"`, the subagents board (`subagents-board.js`), or
+         * `"running"`, the Running now board (`running-board.js`); false for neither.
+         */
         board: false,
         /** The router editor, in the conversation's place (`routers.js`). */
         routersOpen: false,
         /** Every subagent in every session, while the board shows; null until the server's first list arrives. */
         boardAgents: null,
+        /** An extension's page in the conversation's place, as the board shows (`extension-ui.js`): `{ module, id }`. */
+        page: null,
+        /**
+         * An extension's panel beside the conversation, where the Browser and Files panels dock (`extension-ui.js`):
+         * `{ module, id }`. Kept for each session, like the browser's.
+         */
+        extPanel: null,
+        /** Counts changes to what extensions' browser modules add (`extension-ui.js`), so what shows them draws again. */
+        extensionsRev: 0,
         /** Counts the lists of files for @ mentions that arrived; the lists themselves are kept in `files.js`. */
         filesLoaded: 0,
         /** `!` commands this tab started that have no entry yet: `{ taskId, command, conversationId, at }`. */
         pendingShells: [],
         /** The session's browser page as the server last told: address, title, loading, size (`browser.js`). */
         browser: null,
-        /** The Browser panel shows; kept per tab, so the reload after a live edit keeps it. */
-        browserOpen: sessionStorage.getItem("pocket.browser") === "1",
-        /** The Files tile shows (`files-panel.js`); kept per tab, like the browser's. */
-        filesOpen: sessionStorage.getItem("pocket.files") === "1",
+        /** The Browser panel shows. Kept for each session, like the other panels' (`panel-layout.js`). */
+        browserOpen: false,
+        /** The Files tile shows (`files-panel.js`); kept for each session, like the browser's. */
+        filesOpen: false,
         /** The Files tile's tab: `files` or `changes`. */
-        filesTab: sessionStorage.getItem("pocket.filesTab") === "changes" ? "changes" : "files",
+        filesTab: "files",
         /** The last file asked to open in the Files tile: `{ path, line, n }`, `n` telling requests apart. */
         filesTarget: null,
         /** When someone last asked for the Files tile, and for which tab: `{ tab, at }`. */
         filesAsk: null,
-        /** The People panel shows beside the conversation on wide screens; kept per tab, like the browser's. */
-        peopleOpen: sessionStorage.getItem("pocket.people") === "1",
+        /** The People panel shows beside the conversation on wide screens; kept for each session, like the browser's. */
+        peopleOpen: false,
         /** The last request to show the People panel: which tab and chat message, and a count that tells requests apart. */
         peopleAsk: { tab: null, highlight: null, n: 0 },
         /** This person's PiP, as the server last told (`{ id, busy, endedAt }`); null when they have none yet. */
@@ -148,6 +392,14 @@ export const store = {
             listener(this.state);
         }
     },
+    /**
+     * Change the state without drawing anything again: for what the last draw already showed, so a draw for it would
+     * change nothing on screen. Kept in the same state object, which `apartFromViews` compares, so the next change draws
+     * as if this one was always there.
+     */
+    note(patch) {
+        Object.assign(this.state, patch);
+    },
     subscribe(listener) {
         this.listeners.add(listener);
 
@@ -157,7 +409,18 @@ export const store = {
 
 // ─── Marked-unread sessions (this browser) ──────────────────────────────────────
 
-export const isUnread = (id) => store.state.unread.includes(id);
+/** The marked-unread ids as a set, made again only when the list changes: rows ask for each session as they draw. */
+let unreadSet = { list: null, set: new Set() };
+
+export function isUnread(id) {
+    const list = store.state.unread;
+
+    if (unreadSet.list !== list) {
+        unreadSet = { list, set: new Set(list) };
+    }
+
+    return unreadSet.set.has(id);
+}
 
 /** Mark a session unread, or clear it again, in this browser only. Opening the session clears it (`opened`). */
 export function setUnread(id, unread) {
@@ -184,56 +447,251 @@ function routeConversation() {
     return match ? Number(match[1]) : null;
 }
 
+/** What the route's history entry keeps of the route it was opened over (`navigate`'s `over`), or null. */
+function routeOver() {
+    return routeState("over") ?? null;
+}
+
+/**
+ * The session the list, the rail, and the tabs mark as open: the one in the session's place, or, for a route opened over
+ * another as a board is (PiP's conversation), the one under it, as under Running now. Null for none (home).
+ */
+export const openId = (state = store.state) =>
+    state.over === null ? state.conversationId : state.over.id;
+
+/**
+ * The session's Reply quote stays while that session stays open (`openId`): under a route opened over it (PiP's board,
+ * whose box has PiP's quote) and back from there. Going to another session drops it.
+ */
+const keptReply = (state, id, over) =>
+    (over === null ? id : over.id) === openId(state) ? { replyQuote: state.replyQuote } : {};
+
 // ─── People: presence, typing, and the side chat ───────────────────────────────────
 
 const CHAT_LIMIT = 500;
 
-// A function declaration, not a const: the store's initial state calls it before this line runs.
-function readKey(id) {
-    return `pocket.chatRead.${id}`;
-}
-
-/** Fresh people state for a conversation: no one known yet, and how far this browser has read its chat. */
-function peopleFor(id) {
+/**
+ * Fresh people state for a conversation: no one known yet, and how far this browser has read its chat. A function
+ * declaration, not a const: the store's initial state calls it before this line runs, with `reads` given.
+ */
+function peopleFor(id, reads = store.state.chatReads) {
     return {
         chat: [],
         presence: [],
         notes: null,
         chatQuote: null,
-        chatRead: id === null ? 0 : chatReadOf(id),
+        replyQuote: null,
+        chatRead: id === null ? 0 : (reads[id] ?? 0),
     };
 }
 
-/** How far this browser has read a conversation's chat: the time of the newest message seen. */
-function chatReadOf(id) {
-    return Number(localStorage.getItem(readKey(id)) ?? 0);
-}
+// Another tab of this browser read a chat (or the storage was cleared): the list's marks follow.
+addEventListener("storage", (event) => {
+    if (event.key === null || event.key.startsWith(CHAT_READ_PREFIX)) {
+        setChanged({ chatReads: kept(store.state.chatReads, readChatReads()) });
+    }
+});
 
 /** Someone else chatted in a session after this browser last read its chat. */
 export function sessionUnread(session, state = store.state) {
-    const read = session.id === state.conversationId ? state.chatRead : chatReadOf(session.id);
+    const read =
+        session.id === state.conversationId ? state.chatRead : (state.chatReads[session.id] ?? 0);
 
     return session.chatAt !== undefined && session.chatBy !== state.me?.id && session.chatAt > read;
 }
+
+/**
+ * Sessions in "workspace" order, as Alt+1…9 and the rail number them: pinned ones first (in the order they were
+ * pinned), then the rest, newest first, each followed by the linked sessions under it, as the list shows them
+ * (`session-tree.js`). Archived sessions are left out.
+ */
+export function workspaceOrder(state = store.state) {
+    const { sessions, pinned: pins, foldedLinked } = state;
+    const open = openId(state);
+
+    // The list, the rail, the home screen, and peek tiles all ask as they draw: the order is made once for each list.
+    if (
+        ordered.sessions === sessions &&
+        ordered.pinned === pins &&
+        ordered.folded === foldedLinked &&
+        ordered.open === open
+    ) {
+        return ordered.order;
+    }
+
+    // Linked sessions folded away are out of the order too: the numbers and Alt+arrows follow what shows.
+    const order = orderOf(state, foldsNow(state));
+
+    ordered = { sessions, pinned: pins, folded: foldedLinked, open, order };
+
+    return order;
+}
+
+/**
+ * Every session that is not archived, in workspace order, folded ones too: for finding a session (the launcher), where a
+ * fold must not hide one that waits.
+ */
+export function sessionOrder(state = store.state) {
+    const { sessions, pinned: pins } = state;
+
+    if (orderedAll.sessions !== sessions || orderedAll.pinned !== pins) {
+        orderedAll = { sessions, pinned: pins, order: orderOf(state, new Set()) };
+    }
+
+    return orderedAll.order;
+}
+
+/** Sessions in workspace order, with the linked sessions under `folds` left out. */
+function orderOf(state, folds) {
+    const { sessions, pinned: pins } = state;
+    const active = sessions.filter((session) => !session.archived);
+    const { roots, rows } = sessionForest(active, { pinned: pins });
+    const family = (root) => unfolded(rows.get(root.id), folds).map((row) => row.session);
+    const byId = new Map(roots.map((root) => [root.id, root]));
+    const pinned = pins.map((id) => byId.get(id)).filter(Boolean);
+    const first = new Set(pinned);
+
+    // Shared by every caller until the next list: frozen, so none changes it for the others.
+    return Object.freeze([
+        ...pinned.flatMap(family),
+        ...roots.filter((root) => !first.has(root)).flatMap(family),
+    ]);
+}
+
+/** The last workspace order, and the lists it was made from. */
+let ordered = { sessions: null, pinned: null, folded: null, open: null, order: [] };
+/** The last order of every session, folded ones too. */
+let orderedAll = { sessions: null, pinned: null, order: [] };
+
+function readFoldedLinked() {
+    try {
+        const kept = JSON.parse(localStorage.getItem(FOLDED_LINKED_KEY) ?? "[]");
+
+        return Array.isArray(kept) ? kept.filter((id) => Number.isSafeInteger(id)) : [];
+    } catch {
+        return [];
+    }
+}
+
+/**
+ * The folds that apply now: a session whose linked sessions are folded, but not one above the open session, which
+ * always shows.
+ */
+export function foldsNow(state = store.state) {
+    const folds = new Set(state.foldedLinked);
+    const byId = new Map(state.sessions.map((session) => [session.id, session]));
+    const seen = new Set();
+
+    for (
+        let at = byId.get(openId(state))?.linkedFrom?.id;
+        at !== undefined && !seen.has(at);
+        at = byId.get(at)?.linkedFrom?.id
+    ) {
+        seen.add(at);
+        folds.delete(at);
+    }
+
+    return folds;
+}
+
+/** Fold a session's linked sessions away in the list, or show them again; kept for this browser, its other tabs too. */
+export function toggleFoldedLinked(id) {
+    const known = new Set(store.state.sessions.map((session) => session.id));
+    // Sessions that are gone are let go of as the choice is saved.
+    const next = store.state.foldedLinked.filter((each) => each !== id && known.has(each));
+
+    if (!store.state.foldedLinked.includes(id)) {
+        next.push(id);
+    }
+
+    try {
+        localStorage.setItem(FOLDED_LINKED_KEY, JSON.stringify(next));
+    } catch {
+        // Storage refused: the fold holds until the page reloads.
+    }
+
+    store.set({ foldedLinked: next });
+}
+
+// Another tab of this browser folded or unfolded: this one follows.
+addEventListener("storage", (event) => {
+    if (event.key === FOLDED_LINKED_KEY) {
+        store.set({ foldedLinked: readFoldedLinked() });
+    }
+});
 
 /** Server features the web app may use. `collab` 2 adds roles, take turns, reactions, pins, notes, mentions, push. */
 export const collab = () => (store.state.server?.collab ?? 0) >= 2;
 /** Viewers read and chat; they never steer Pi. */
 export const canSteer = () => store.state.me?.role !== "viewer";
+
+/**
+ * Whether this person may turn take turns on or off here, as the server decides: anyone who steers while it is off; the
+ * driver, the owner, or anyone when nobody drives or the driver has left, while it is on.
+ */
+export function canToggleTurns() {
+    const { me, presence, view } = store.state;
+    const turns = view.turns;
+
+    return (
+        canSteer() &&
+        (!turns?.on ||
+            turns.driver === me?.id ||
+            me?.role === "owner" ||
+            !turns.driver ||
+            !presence.some((person) => person.id === turns.driver))
+    );
+}
+
 /** People invited to one session cannot start sessions or invite others. */
 export const scoped = () => Array.isArray(store.state.me?.sessions);
+
+/** The notices that announce chat messages, here or a mention elsewhere, by id: their session's. Reading its chat takes them down. */
+const chatNotices = new Map();
+
+// Read from storage: another tab's read counts before its event arrives.
+export function chatReadStored(id) {
+    return Number(localStorage.getItem(CHAT_READ_PREFIX + id)) || 0;
+}
+
+export function setChatReadAt(id, at) {
+    if (at > 0) {
+        localStorage.setItem(CHAT_READ_PREFIX + id, String(at));
+    } else {
+        localStorage.removeItem(CHAT_READ_PREFIX + id);
+    }
+
+    store.set((state) => {
+        const chatReads = { ...state.chatReads };
+
+        if (at > 0) {
+            chatReads[id] = at;
+        } else {
+            delete chatReads[id];
+        }
+
+        return { chatReads, ...(id === state.conversationId ? { chatRead: at } : {}) };
+    });
+}
 
 /** Everything in the chat counts as read: called while the chat is open. */
 export function markChatRead() {
     const { chat, chatRead, conversationId } = store.state;
+
+    for (const [id, conversation] of chatNotices) {
+        if (conversation === conversationId) {
+            dismiss(id);
+            chatNotices.delete(id);
+        }
+    }
+
     const last = chat.at(-1)?.at ?? 0;
 
     if (last <= chatRead || conversationId === null) {
         return;
     }
 
-    localStorage.setItem(readKey(conversationId), String(last));
-    store.set({ chatRead: last });
+    setChatReadAt(conversationId, last);
 }
 
 function applyChat(data) {
@@ -249,7 +707,7 @@ function applyChat(data) {
     store.set({ chat: (data.full ? data.messages : [...state.chat, ...added]).slice(-CHAT_LIMIT) });
 
     // The People panel stays open for long: on its Pinned or Notes tab, new messages still count and show a notice.
-    if (state.sheet?.type === "chat" || chatLogs > 0) {
+    if (chatLogs > 0) {
         markChatRead();
 
         return;
@@ -265,9 +723,11 @@ function applyChat(data) {
     }
 
     const open = () => openSheet({ type: "chat" });
+    const announce = (message) =>
+        chatNotices.set(notify("info", message, open), store.state.conversationId);
 
     if (fresh.length > 1) {
-        return notify("info", `${fresh.length} new chat messages`, open);
+        return announce(`${fresh.length} new chat messages`);
     }
 
     const [message] = fresh;
@@ -275,10 +735,8 @@ function applyChat(data) {
     const text = message.text.replace(/\s+/g, " ");
     const mentioned = message.mentions?.includes(state.me?.id);
 
-    notify(
-        "info",
+    announce(
         `${name}${mentioned ? " mentioned you" : ""}: ${text.length > 120 ? `${text.slice(0, 119)}…` : text}`,
-        open,
     );
 }
 
@@ -310,10 +768,16 @@ class ApiError extends Error {
     }
 }
 
+/** Call the server's API: a GET without `body`, a POST with one, or `options.method`; `options.signal` stops it. */
 export async function api(path, body, options = {}) {
+    if (changingAccount) {
+        throw new ApiError(401, "The account changed. Reload Pi Pocket.");
+    }
+
     const init = {
         method: body === undefined && !options.method ? "GET" : (options.method ?? "POST"),
         headers: { "X-Pocket": "1" },
+        ...(options.signal ? { signal: options.signal } : {}),
     };
 
     if (body !== undefined) {
@@ -344,18 +808,51 @@ export async function api(path, body, options = {}) {
 }
 
 let nextNotice = 1;
+/** Each notice's countdown, by id: what is left of it, and its timer while it runs. */
+const countdowns = new Map();
 
-/** Show a short notice. With `action`, tapping it runs the action as well as dismissing it. */
+/**
+ * Show a short notice, and return its id. With `action`, tapping it runs the action as well as dismissing it. It stays longer when it
+ * offers something (an Undo) or says what went wrong, and its countdown holds while a pointer or the focus is on it.
+ */
 export function notify(level, message, action) {
     const id = nextNotice++;
+    const life = level === "error" ? 9000 : action ? 7000 : 4500;
 
     store.set((state) => ({
-        notices: [...state.notices, { id, level, message, action }].slice(-4),
+        notices: [...state.notices, { id, level, message, action, life }].slice(-4),
     }));
-    setTimeout(() => dismiss(id), level === "error" ? 9000 : 4500);
+    countdowns.set(id, {
+        left: life,
+        since: Date.now(),
+        timer: setTimeout(() => dismiss(id), life),
+    });
+
+    return id;
+}
+
+/** Hold a notice's countdown (`held`), or let it go on with what was left. */
+export function holdNotice(id, held) {
+    const countdown = countdowns.get(id);
+
+    if (!countdown || held === (countdown.timer === null)) {
+        return;
+    }
+
+    if (held) {
+        clearTimeout(countdown.timer);
+        countdown.timer = null;
+        countdown.left -= Date.now() - countdown.since;
+    } else {
+        countdown.since = Date.now();
+        countdown.timer = setTimeout(() => dismiss(id), Math.max(countdown.left, 1000));
+    }
 }
 
 export function dismiss(id) {
+    clearTimeout(countdowns.get(id)?.timer);
+    countdowns.delete(id);
+    chatNotices.delete(id);
     store.set((state) => ({ notices: state.notices.filter((notice) => notice.id !== id) }));
 }
 
@@ -370,31 +867,790 @@ export async function attempt(action) {
     }
 }
 
+const PERSON_KEY = "pocket.person";
+const SIGNED_OUT_KEY = "pocket.signedOut";
+// Also works when this browser blocks localStorage. No saved content travels on this channel.
+const accountChannel =
+    typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel("pocket.account");
+let changingAccount = false;
+let signingOut = false;
+let accountGeneration = 0;
 let source;
 
-function applyView(data) {
-    store.set((state) => ({ view: mergeView(state.view, data), missing: null }));
+/**
+ * Drop the old document's in-memory composers and requests before loading the cookie's current account: this page
+ * again, or `to` (sign-out goes to the app's start).
+ */
+function reloadAccount(to) {
+    // A late answer must not reload the still-valid cookie while sign-out is under way.
+    if (changingAccount || signingOut) {
+        return;
+    }
+
+    changingAccount = true;
+    personStorage.identify(null);
+    notesDrafts.clear();
+    waitingInserts = [];
+    source?.close();
+    store.set({ me: null, composerInsert: null, auth: null, pip: null, pipOpen: false });
+
+    if (to === undefined) {
+        location.reload();
+    } else {
+        location.href = to;
+    }
 }
 
-/** PiP's conversation, for its panel (`pip.js`): the same view, from a view of its own beside the session's. */
+function accountChanged(person, signedOut = false) {
+    const known = store.state.me !== undefined;
+
+    // A new tab announcing the same person does not invalidate this tab's requests or stream reconnect.
+    // During startup, every signal still invalidates answers already on their way.
+    if (!signedOut && known && (store.state.me?.id ?? null) === person) {
+        return;
+    }
+
+    accountGeneration++;
+
+    if (signedOut || known) {
+        reloadAccount();
+    }
+}
+
+// The early sign-out signal only stops the device cache (below): a reload then would still find the old cookie.
+// The person key changes once the server ends the sign-in.
+addEventListener("storage", (event) => {
+    if (event.key === PERSON_KEY) {
+        accountChanged(event.newValue || null);
+    }
+});
+accountChannel?.addEventListener("message", (event) => {
+    accountChanged(event.data.person, event.data.signedOut);
+});
+
+/** Authenticate storage before any component can read a draft. A changed identity needs a fresh document. */
+function acceptPerson(user, generation) {
+    if (generation !== accountGeneration) {
+        reloadAccount();
+
+        return false;
+    }
+
+    if (changingAccount) {
+        return false;
+    }
+
+    const person = user?.id ?? null;
+
+    if (store.state.me !== undefined && (store.state.me?.id ?? null) !== person) {
+        reloadAccount();
+
+        return false;
+    }
+
+    personStorage.identify(person);
+
+    try {
+        localStorage.setItem(PERSON_KEY, person ?? "");
+    } catch {
+        // Blocked storage sends no storage event, so the channel resets the other open tabs. A storage event comes only
+        // for a new person: a tab of the same person must not make the others that are still starting reload.
+        if (store.state.me === undefined) {
+            accountChannel?.postMessage({ person });
+        }
+    }
+
+    return true;
+}
+
+/** End this browser's sign-in, erase saved local content, and tell the other open tabs. */
+export function signOut() {
+    return attempt(async () => {
+        signingOut = true;
+        accountGeneration++;
+        // What this browser kept of this person's sessions goes with their sign-in, and nothing saves it again: not a save
+        // of this tab still to come, nor one of the other tabs, which hear of it through the storage event.
+        deviceCacheStopped = true;
+        dispatchEvent(new Event("pocket:signedOut"));
+
+        try {
+            localStorage.setItem(SIGNED_OUT_KEY, String(Date.now()));
+        } catch {
+            // Storage refused: the other tabs find out at their next request.
+        }
+
+        try {
+            await disk.clear().catch(() => {});
+            await api("logout", {});
+        } finally {
+            signingOut = false;
+        }
+
+        personStorage.clear();
+
+        try {
+            localStorage.setItem(PERSON_KEY, "");
+        } catch {
+            // Clearing storage and changing the cookie must not depend on a successful storage write.
+        }
+
+        accountChannel?.postMessage({ person: null, signedOut: true });
+        reloadAccount("/");
+    });
+}
+
+// ─── Sessions this tab keeps, to show again at once ─────────────────────────────────────────────────────────────────
+
+/**
+ * What the sessions this tab keeps in its memory may take in all, as the length of their JSON: once parsed they take
+ * about 1.6 times that (measured on real sessions), so about 25 MB. However many sessions that is: 26 real ones took
+ * 7.5 MB. The device keeps more (`DEVICE_CHARS`): a session that went from memory loads from there in a moment.
+ */
+const KEPT_CHARS = 16_000_000;
+/**
+ * What the sessions this browser keeps on the device (`session-cache.js`, IndexedDB) may take in all, as the length of
+ * their JSON: about 100 MB. Shared by every tab of the browser; the sessions used longest ago go first.
+ */
+const DEVICE_CHARS = 100_000_000;
+
+/**
+ * The views of sessions this tab left, by conversation id, least recently shown first: `{ view, size, place, seen }`,
+ * with `size` as `keptSize` measures it (undefined until the next `trimKept`), `place` where the reader was
+ * (`transcriptPlace`), and `seen` the session as the list showed it then (`seenOf`).
+ */
+const keptViews = new Map();
+/** Each entry's JSON length, measured once: an entry does not change (a new one replaces it). */
+const entrySizes = new WeakMap();
+let trimming;
+/** Sessions kept in memory since the last `settleKept`, to save on the device too. */
+const unsaved = new Set();
+/** The session whose view the server sent since the tab showed it: what the tab keeps of it then is up to date. */
+let synced = null;
+/** What the list showed of the session the tab shows, when the tab kept its view (`seen`): still so until it is synced. */
+let shownSeen = null;
+
+/**
+ * Whether a view can be kept: one the code that runs on the server now sent whole. A light entry (`partial`) would have
+ * to come again, and one another build of the server sent may differ from what this one sends (`build`).
+ */
+function keepable(view) {
+    return (
+        view.conversation != null &&
+        view.build != null &&
+        view.build === store.state.server?.build &&
+        loadedFrom(view) < view.order.length &&
+        ![...view.entries.values()].some((entry) => entry.partial)
+    );
+}
+
+/**
+ * A view as it is kept: its newest entries (one whose earlier messages were all loaded, as Find does, keeps the ones it
+ * opens with), where the reader was in it, as far up as its rows are kept, and the session as the list shows it.
+ */
+function keptRecord(view) {
+    const id = view.conversation.id;
+    const { transcriptFrom, transcriptPlace } = store.state;
+    const kept = newestOf(view);
+
+    return {
+        view: kept,
+        size: undefined,
+        place:
+            transcriptPlace === null ||
+            (transcriptFrom !== null && !kept.entries.has(transcriptFrom))
+                ? null
+                : { ...transcriptPlace, from: transcriptFrom },
+        // As the list shows it now, if the view is up to date; else as it was when the tab kept what it shows.
+        seen: synced === id ? seenOf(id) : shownSeen,
+    };
+}
+
+/** Whether the session `id` shows with a view the server sent since: not one this tab kept, which may be old. */
+export const viewSynced = (id) => synced === id && store.state.view.conversation?.id === id;
+
+/** Keep the view of the session this tab leaves, to show it again at once (`keptView`), here and on the device. */
+function keepView(view) {
+    const id = view.conversation?.id;
+
+    if (id === undefined) {
+        return;
+    }
+
+    keptViews.delete(id);
+
+    if (!keepable(view)) {
+        return;
+    }
+
+    keptViews.set(id, keptRecord(view));
+    unsaved.add(id);
+    // Measured and saved after the switch has drawn: not in the tap's time. A switch does not put off one already
+    // planned, so quick switches one after another still trim what is kept.
+    trimming ??= setTimeout(() => {
+        trimming = undefined;
+        settleKept();
+    }, 500);
+}
+
+function settleKept() {
+    // Saved first: what goes from memory may stay on the device, which has more room.
+    for (const id of unsaved) {
+        const kept = keptViews.get(id);
+
+        if (kept !== undefined) {
+            void saveToDevice(kept);
+        }
+    }
+
+    unsaved.clear();
+    trimKept();
+}
+
+/** Drop the views kept longest without a visit until what is kept fits in `KEPT_CHARS`. */
+function trimKept() {
+    let total = 0;
+
+    for (const kept of keptViews.values()) {
+        kept.size ??= keptSize(kept.view);
+        total += kept.size;
+    }
+
+    for (const [oldest, kept] of keptViews) {
+        if (total <= KEPT_CHARS) {
+            break;
+        }
+
+        keptViews.delete(oldest);
+        total -= kept.size;
+    }
+}
+
+/** What a kept view takes, as JSON: its entries, its order's ids, and the rest of the view (authors grows with it). */
+function keptSize(view) {
+    const { entries, order, ...rest } = view;
+    let size = order.length * 8 + JSON.stringify(rest).length;
+
+    for (const entry of entries.values()) {
+        let each = entrySizes.get(entry);
+
+        if (each === undefined) {
+            each = JSON.stringify(entry).length;
+            entrySizes.set(entry, each);
+        }
+
+        size += each;
+    }
+
+    return size;
+}
+
+/** Entries a view keeps when it is left: at most this many of the newest, which is still more than it opens with. */
+const KEPT_PER_SESSION = 1500;
+
+/** The view with only its newest entries (`KEPT_PER_SESSION`), or as it is when it has no more. */
+function newestOf(view) {
+    if (view.entries.size <= KEPT_PER_SESSION) {
+        return view;
+    }
+
+    const entries = new Map();
+
+    for (const id of view.order.slice(-KEPT_PER_SESSION)) {
+        const entry = view.entries.get(id);
+
+        if (entry !== undefined) {
+            entries.set(id, entry);
+        }
+    }
+
+    return { ...view, entries };
+}
+
+/**
+ * Forget every view this tab kept, here and on the device, and keep the one it shows from being kept or named (`build`
+ * null, as for a view mixed from two builds): this person's access changed (a role, the sessions shared with them),
+ * another person signed in, the server runs other code, or a session left the list. Until the server answers again, a
+ * kept view could show what they may no longer see.
+ */
+function forgetKept() {
+    keptViews.clear();
+    unsaved.clear();
+    lastSaved = null;
+    // A read ahead from the device that is under way keeps nothing it read before this.
+    warmedFor = null;
+    void disk.clear().catch(() => {});
+
+    const { view } = store.state;
+
+    if (view.build != null) {
+        store.set({ view: { ...view, build: null } });
+    }
+}
+
+// ─── Sessions kept on the device ───────────────────────────────────────────────────────────────────────────────────
+
+/** Whether this browser keeps sessions on the device: the server allows it (`PI_POCKET_SESSION_CACHE`), and it can. */
+const onDevice = () =>
+    !deviceCacheStopped &&
+    store.state.server?.deviceCache === true &&
+    typeof indexedDB !== "undefined";
+
+/** Set at sign-out, in this tab or another: the device keeps nothing more. */
+let deviceCacheStopped = false;
+
+addEventListener("storage", (event) => {
+    if (event.key === SIGNED_OUT_KEY) {
+        deviceCacheStopped = true;
+        dispatchEvent(new Event("pocket:signedOut"));
+    }
+});
+
+/**
+ * Whose sessions these are, and what they may see: a person's id, role, and shared sessions. What the device kept for
+ * another, or before this person's rights changed, is not shown.
+ */
+const ownerOf = (me) => fingerprint(JSON.stringify([me.id, me.role, me.sessions ?? null]));
+
+/** The view the device last saved for the session shown, and where the reader was then: not saved again unchanged. */
+let lastSaved = null;
+
+/** Save a kept session on the device: `kept` as `keptRecord` makes it. A failure keeps nothing there, which is fine. */
+async function saveToDevice(kept) {
+    const me = store.state.me;
+
+    if (!onDevice() || !me) {
+        return;
+    }
+
+    kept.size ??= keptSize(kept.view);
+
+    try {
+        await disk.save(
+            kept.view.conversation.id,
+            { view: kept.view, place: kept.place, seen: kept.seen },
+            { owner: ownerOf(me), build: kept.view.build, size: kept.size },
+            DEVICE_CHARS,
+        );
+    } catch {
+        // Storage full, refused, or closed: the next save tries again.
+    }
+}
+
+/**
+ * Save the session shown, once it settles: a reload, or a tab the system closed in the background, then opens it at once.
+ * Only a whole view the server's build sent, and only when it or where the reader is changed since the last save.
+ */
+function saveShown() {
+    const { view, transcriptPlace, conversationId } = store.state;
+
+    if (
+        !onDevice() ||
+        view.conversation?.id !== conversationId ||
+        !keepable(view) ||
+        (lastSaved?.view === view && lastSaved.place === transcriptPlace)
+    ) {
+        return;
+    }
+
+    lastSaved = { view, place: transcriptPlace };
+    void saveToDevice(keptRecord(view));
+}
+
+layoutShown = { id: store.state.conversationId, layout: layoutOf(store.state) };
+store.subscribe(followLayout);
+
+let savingShown;
+let savedFor = null;
+
+// A few seconds after the shown session last changed, and as the page goes to the background, where a phone may close it.
+store.subscribe((state) => {
+    if (state.view !== savedFor) {
+        savedFor = state.view;
+        clearTimeout(savingShown);
+        savingShown = setTimeout(
+            () =>
+                typeof requestIdleCallback === "function"
+                    ? requestIdleCallback(saveShown, { timeout: 2000 })
+                    : saveShown(),
+            3000,
+        );
+    }
+});
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+        saveShown();
+    }
+});
+
+/**
+ * A session the device kept, as `keptView` gives one from memory, if it is this person's, from a server of this build,
+ * and the session still shown: undefined otherwise. Only what the person may see now: one no longer shared with them is
+ * not in their list, and the server says it is missing.
+ */
+async function deviceView(id) {
+    return onDevice() && store.state.me ? adopt(id, await readDevice(id)) : undefined;
+}
+
+/** What the device kept of a session, unchecked (`adopt` checks it): undefined if nothing, or it cannot be read. */
+function readDevice(id) {
+    return typeof indexedDB === "undefined"
+        ? Promise.resolve(undefined)
+        : disk.read(id).catch(() => undefined);
+}
+
+/** Whether what the device kept of session `id` may be used: this person's, with the same rights, of this build. */
+function usable(found, id) {
+    const { me, server } = store.state;
+
+    return (
+        found !== undefined &&
+        onDevice() &&
+        me != null &&
+        found.info.owner === ownerOf(me) &&
+        found.info.build === server?.build &&
+        found.record.view?.build === server.build &&
+        found.record.view.conversation?.id === id
+    );
+}
+
+/** A session the device kept (`readDevice`), as `deviceView` gives it, once it is checked. */
+function adopt(id, found) {
+    if (
+        !usable(found, id) ||
+        store.state.conversationId !== id ||
+        store.state.view.conversation != null
+    ) {
+        return undefined;
+    }
+
+    keptViews.set(id, { ...found.record, size: found.info.size });
+
+    return keptView(id);
+}
+
+/** Whose and which build's sessions `warmFromDevice` last read ahead, so it does so once for each. */
+let warmedFor = null;
+
+/**
+ * Read ahead into memory the sessions the device kept that were used last, as many as memory keeps (`KEPT_CHARS`), one
+ * at a time while the page is idle: after a reload, going to one of them shows it at once, as before the reload.
+ */
+async function warmFromDevice() {
+    const { me, server } = store.state;
+
+    if (!onDevice() || !me || !server?.build) {
+        return;
+    }
+
+    const key = `${server.build}:${ownerOf(me)}`;
+
+    if (warmedFor === key) {
+        return;
+    }
+
+    warmedFor = key;
+
+    let infos;
+
+    try {
+        infos = await disk.list();
+    } catch {
+        return;
+    }
+
+    // The ones used last that fit, then read oldest first: memory drops the one first in its order first.
+    const chosen = [];
+    let total = 0;
+
+    for (const kept of keptViews.values()) {
+        total += kept.size ?? 0;
+    }
+
+    // Only sessions the list has: one it no longer has is not this person's to see.
+    const listed = new Set(store.state.sessions.map((session) => session.id));
+
+    for (const info of infos
+        .filter((each) => listed.has(each.id))
+        .sort((a, b) => b.usedAt - a.usedAt)) {
+        if (total + info.size > KEPT_CHARS) {
+            break;
+        }
+
+        chosen.push(info);
+        total += info.size;
+    }
+
+    const read = [];
+
+    for (const info of chosen.reverse()) {
+        await new Promise((resolve) =>
+            typeof requestIdleCallback === "function"
+                ? requestIdleCallback(resolve, { timeout: 1000 })
+                : setTimeout(resolve, 50),
+        );
+
+        if (warmedFor !== key) {
+            return;
+        }
+
+        let found;
+
+        try {
+            found = await disk.read(info.id, false);
+        } catch {
+            return;
+        }
+
+        if (usable(found, info.id)) {
+            read.push([info.id, { ...found.record, size: found.info.size }]);
+        }
+    }
+
+    // Forgotten meanwhile (`forgetKept`: a session no longer shared, another person): what was read stays out.
+    if (warmedFor !== key || read.length === 0) {
+        return;
+    }
+
+    // Before what the tab kept itself meanwhile, which is newer; never the one it shows.
+    const own = [...keptViews];
+
+    keptViews.clear();
+
+    for (const [id, kept] of read) {
+        if (id !== store.state.conversationId) {
+            keptViews.set(id, kept);
+        }
+    }
+
+    for (const [id, kept] of own) {
+        keptViews.delete(id);
+        keptViews.set(id, kept);
+    }
+
+    trimKept();
+}
+
+/** Drop what the device kept of one session (the server says it is missing, or it did not go on from what it had). */
+function dropFromDevice(id) {
+    if (typeof indexedDB !== "undefined") {
+        void disk.drop((info) => info.id === id).catch(() => {});
+    }
+}
+
+/** Drop what the device kept that this server cannot use: another person's, older rights, or another build's. */
+function tidyDevice(me, server) {
+    if (typeof indexedDB === "undefined") {
+        return;
+    }
+
+    if (server?.deviceCache !== true || !me) {
+        void disk.clear().catch(() => {});
+
+        return;
+    }
+
+    const owner = ownerOf(me);
+
+    void disk.drop((info) => info.owner !== owner || info.build !== server.build).catch(() => {});
+}
+
+/**
+ * The session as the list shows it, as far as what its transcript shows goes: when it last moved up (a message, Pi
+ * starting work), when its last run ended, and whether Pi works there now. Null when it is not in the list.
+ */
+function seenOf(id) {
+    const session = store.state.sessions.find((each) => each.id === id);
+
+    return session === undefined
+        ? null
+        : {
+              updatedAt: session.updatedAt,
+              endedAt: session.endedAt ?? null,
+              busy: session.busy === true,
+          };
+}
+
+/**
+ * Whether a kept session waits behind the loading screen until the server's view of it comes: with Appearance's Wait
+ * for updates, when the list says it changed since the tab left it (or Pi works there), and only on a connection that
+ * is open, which brings that view soon. Otherwise the kept view shows at once, and what came since slides in.
+ */
+function holdsFor(kept) {
+    if (kept?.seen == null || store.state.appearance?.waitForUpdates !== true) {
+        return false;
+    }
+
+    const now = seenOf(kept.view.conversation.id);
+
+    return (
+        store.state.connection === "open" &&
+        (now === null ||
+            now.busy ||
+            kept.seen.busy ||
+            now.updatedAt !== kept.seen.updatedAt ||
+            now.endedAt !== kept.seen.endedAt)
+    );
+}
+
+/**
+ * What the store shows for a session the tab goes to: the view it kept, taken out (it is kept again when the tab leaves),
+ * and where the reader was in it; or an empty view. One held for its changes (`holdsFor`) opens at the bottom once they
+ * come, as a session does that was not kept.
+ */
+function keptView(id) {
+    const kept = keptViews.get(id);
+
+    keptViews.delete(id);
+    synced = null;
+    shownSeen = kept?.seen ?? null;
+
+    if (kept === undefined) {
+        return { view: emptyView(), transcriptFrom: null, transcriptPlace: null, holding: null };
+    }
+
+    const hold = holdsFor(kept);
+    const place = hold ? null : kept.place;
+
+    return {
+        view: kept.view,
+        transcriptFrom: place?.from ?? null,
+        transcriptPlace: place === null ? null : { keep: place.keep },
+        holding: hold ? id : null,
+    };
+}
+
+/**
+ * What this tab has of the session it shows, for the server (`have` in `/api/events`): the order's ids up to the last
+ * one it has, as a fingerprint, and from where on it has their entries. The server checks it (`Room.push`), and then
+ * leaves those out of the view it sends. Null with nothing to name.
+ */
+function haveOf(view) {
+    // A light entry (`partial`) is not had: the server sends it whole after it, and would not if it were named.
+    if (
+        view.conversation?.id !== store.state.conversationId ||
+        view.build == null ||
+        [...view.entries.values()].some((entry) => entry.partial)
+    ) {
+        return null;
+    }
+
+    const from = loadedFrom(view);
+    const count = view.order.length;
+
+    return from >= count
+        ? null
+        : `${from}.${count}.${fingerprint(view.order.join(","))}.${view.build}`;
+}
+
+/**
+ * Whether a view that goes on from `orderFrom` goes on from what this tab has: the same session, with that much order.
+ * A full one goes on from what this tab kept (`have`); an update from the order the tab has, all of it.
+ */
+function goesOn(view, data) {
+    return (
+        view.conversation?.id === data.conversation.id &&
+        (data.full ? view.order.length >= data.orderFrom : view.order.length === data.orderFrom)
+    );
+}
+
+function applyView(data) {
+    // One of a session this tab has left, sent before the server heard of the switch (`show`): not the one it shows.
+    if (data.conversation.id !== store.state.conversationId) {
+        return;
+    }
+
+    // A view that goes on from what this tab kept must go on from what it has. If it does not, which should not happen,
+    // the session opens again from the start.
+    if (data.orderFrom !== undefined && !goesOn(store.state.view, data)) {
+        keptViews.delete(data.conversation.id);
+        dropFromDevice(data.conversation.id);
+        store.set({ view: emptyView() });
+        connect();
+
+        return;
+    }
+
+    if (data.full) {
+        synced = data.conversation.id;
+    }
+
+    // A session held for its changes (`holdsFor`) shows with them.
+    store.set((state) => ({ view: mergeView(state.view, data), missing: null, holding: null }));
+}
+
+/**
+ * PiP's conversation, for its panel (`pip.js`): the same view, from a view of its own beside the session's. It names
+ * nothing kept, so only an update goes on from its order; one that does not fit opens the panel's view again.
+ */
 function applyPipView(data) {
+    // A new connection opens the panel's view again (`pip.js`), with all of its order.
+    if (data.orderFrom !== undefined && !goesOn(store.state.pipView, data)) {
+        store.set({ pipView: emptyView() });
+        connect();
+
+        return;
+    }
+
     store.set((state) => ({ pipView: mergeView(state.pipView, data) }));
 }
 
-/** A view after an update from the server: the full view, or what changed since the last one. */
+/**
+ * A view after an update from the server: the full view, or what changed since the last one. A full view of the same
+ * conversation, as after a reconnect, keeps the entries loaded before (`loadEarlier`): it brings only the newest.
+ */
 function mergeView(current, data) {
-    const base =
-        data.full || current.conversation?.id !== data.conversation.id ? emptyView() : current;
-    const entries = new Map(base.entries);
+    const same = current.conversation?.id === data.conversation.id;
+    const base = data.full || !same ? emptyView() : current;
+    const build = store.state.server?.build;
+
+    // Nothing came after what this tab kept (`have`): the same order and Map, as for an update that brings none.
+    const nothingNew =
+        data.full &&
+        same &&
+        data.orderFrom === current.order.length &&
+        data.order.length === 0 &&
+        data.entries.length === 0;
+    // Most updates while Pi writes bring no entries: the same Map then, so what is built from it (the transcript's rows)
+    // is not built again for each of them.
+    const unchanged =
+        nothingNew || (!data.full && same && data.entries.length === 0 && !data.order);
+    const entries = unchanged
+        ? current.entries
+        : new Map(data.full && same ? current.entries : base.entries);
+
+    // A light one held from before (the tab left before the whole one came) goes: past the newest rows, the server
+    // counts it as sent, so only `loadEarlier` brings it whole, and it asks for what is missing.
+    if (data.full && same && !unchanged) {
+        for (const [id, entry] of entries) {
+            if (entry.partial) {
+                entries.delete(id);
+            }
+        }
+    }
 
     for (const entry of data.entries) {
+        // A light one (`partial`) does not replace the whole one this tab has, as after a reconnect: it is sent whole
+        // again right after.
+        const had = entries.get(entry.id);
+
+        if (entry.partial && had !== undefined && !had.partial) {
+            continue;
+        }
+
         entries.set(entry.id, entry);
     }
 
-    const order = data.order ?? base.order;
+    // Only the end of the order comes after what this tab kept (`have`): it goes on from `orderFrom`.
+    const order = nothingNew
+        ? current.order
+        : data.order === undefined
+          ? base.order
+          : data.orderFrom === undefined
+            ? data.order
+            : current.order.slice(0, data.orderFrom).concat(data.order);
 
-    if (data.order) {
-        const keep = new Set(data.order);
+    if (data.order && !nothingNew) {
+        const keep = new Set(order);
 
         for (const id of entries.keys()) {
             if (!keep.has(id)) {
@@ -408,26 +1664,38 @@ function mergeView(current, data) {
         conversation: data.conversation,
         entries,
         order,
-        live: data.live,
-        inbox: data.inbox,
+        // The build of the server that made these entries (an entry is as its code projects it), for what this tab tells
+        // the next one it has (`have`). A full view from another build, after a restart with new code, over entries the
+        // tab kept, mixes the two: null, and such a view is neither kept nor named.
+        build: !data.full
+            ? base.build
+            : !same || current.build === build || data.orderFrom !== undefined
+              ? build
+              : null,
+        live: mergeLive(base.live, data.live),
         agent: data.agent,
         stats: data.stats,
         clients: data.clients,
         viewers: data.viewers,
         approvals: data.approvals,
         // The server sends these again only when they change: a missing one keeps its last value.
+        inbox: data.inbox ?? base.inbox,
         artifacts: data.artifacts ?? base.artifacts,
         subagents: data.subagents ?? base.subagents,
         authors: data.authors ?? base.authors,
+        linkedPeers: data.linkedPeers ?? base.linkedPeers,
         reactions: data.reactions ?? base.reactions,
         pins: data.pins ?? base.pins,
         turns: data.turns ?? base.turns,
         decisions: data.decisions ?? base.decisions,
         plan: data.plan ?? base.plan,
+        browserUse: data.browserUse ?? base.browserUse,
         subagentPolicy: data.subagentPolicy ?? base.subagentPolicy,
         // No router is null, which the server sends too: only a missing field keeps the last value.
         router: data.router === undefined ? base.router : data.router,
         schedules: data.schedules ?? base.schedules,
+        // What a Stop held out of the queue: it waits until someone sends it.
+        held: data.held ?? base.held,
         // No goal is null, which the server sends too: only a missing field keeps the last value.
         goal: data.goal === undefined ? base.goal : data.goal,
         // The session's PR watch, or null: the same.
@@ -437,6 +1705,36 @@ function mergeView(current, data) {
         // What the folder has checked out: `{ branch }` or `{ detached }`, and null outside a repository.
         branch: data.branch === undefined ? base.branch : data.branch,
     };
+}
+
+let reconnecting = false;
+
+/**
+ * The live run from an update, whose message may come as what changed (`liveMessage`). One that does not fit what this
+ * tab has, which should not happen, keeps the message as it was and connects again for a full view.
+ */
+function mergeLive(current, live) {
+    if (live.generation?.message?.keep === undefined) {
+        return live;
+    }
+
+    const had = current.generation?.message;
+    let message = liveMessage(had, live.generation.message);
+
+    if (message === null) {
+        message = had;
+
+        // One batch of events may hold several such updates: connect once.
+        if (!reconnecting) {
+            reconnecting = true;
+            setTimeout(() => {
+                reconnecting = false;
+                connect();
+            });
+        }
+    }
+
+    return { ...live, generation: { ...live.generation, message } };
 }
 
 /** The `moving` marks that a session list has not caught up with yet: it still shows those sessions where they were. */
@@ -452,30 +1750,182 @@ export function stillMoving(moving, sessions) {
     return next;
 }
 
+/** Whether two values the server sent as JSON are the same: the same plain values, arrays, and objects, all the way down. */
+function sameJson(a, b) {
+    if (a === b) {
+        return true;
+    }
+
+    if (
+        typeof a !== "object" ||
+        typeof b !== "object" ||
+        a === null ||
+        b === null ||
+        Array.isArray(a) !== Array.isArray(b)
+    ) {
+        return false;
+    }
+
+    const keys = Object.keys(a);
+
+    return (
+        keys.length === Object.keys(b).length &&
+        keys.every((key) => Object.hasOwn(b, key) && sameJson(a[key], b[key]))
+    );
+}
+
+/**
+ * What the server sent, or what the store has when it is the same. Each connect sends hello and the lists again, mostly
+ * as they were: what did not change keeps its identity, so memos hold and identity checks (`theme.js`) see no change.
+ */
+const kept = (had, next) => (sameJson(had, next) ? had : next);
+
+/** A list of items with ids, each item kept where it is the same, and the list itself when all are: one session changed draws one row again. */
+function keptEach(had, next) {
+    if (!Array.isArray(had) || !Array.isArray(next)) {
+        return next;
+    }
+
+    const byId = new Map(had.map((item) => [item?.id, item]));
+    const items = next.map((item) => kept(byId.get(item?.id), item));
+
+    return items.length === had.length && items.every((item, index) => item === had[index])
+        ? had
+        : items;
+}
+
+/** How far the server's clock is ahead of this browser's, from its hellos (`seen.js`); undefined before the first. */
+let clockOffset;
+
+export const serverClockOffset = () => clockOffset ?? 0;
+
+/**
+ * When this tab asked for the hello its new connection brings first (`fitClock`): the server reads its clock after
+ * that. Undefined for a hello the server sends of itself, or after a stream reconnects by itself.
+ */
+let helloAsked;
+
+/**
+ * The server's facts from a hello. Its clock (`now`) is new in each one and is no change to them: the clock goes to
+ * `clockOffset`, and the facts keep the clock of the hello that brought them. `asked`: when this tab asked for it.
+ */
+function keptServer(had, next, asked) {
+    if (typeof next?.now === "number") {
+        clockOffset = fitClock(clockOffset, next.now, moment(), asked);
+    }
+
+    return had && next && sameJson({ ...had, now: 0 }, { ...next, now: 0 }) ? had : next;
+}
+
+/** Set only what changed, and nothing when nothing did: data sent again as it was draws nothing again. */
+function setChanged(change) {
+    const changed = Object.entries(change).filter(([key, value]) => store.state[key] !== value);
+
+    if (changed.length > 0) {
+        store.set(Object.fromEntries(changed));
+    }
+}
+
+/** Who hears extensions' events: `extension-ui.js`, which imports this module and so cannot be imported here. */
+const extensionListeners = new Set();
+
+/** Who hears the notifications for an embedder: `embedder.js`, which imports this module. */
+const embedderListeners = new Set();
+
+/** Hear the notifications the server sends this page's embedder (`embedder-notify`). */
+export function onEmbedderNotify(listener) {
+    embedderListeners.add(listener);
+
+    return () => embedderListeners.delete(listener);
+}
+
+/** Hear the events extension modules send their browser modules: `{ module, event, data }`. */
+export function onExtensionEvent(listener) {
+    extensionListeners.add(listener);
+
+    return () => extensionListeners.delete(listener);
+}
+
 /** What the server sends, by event name. Both transports deliver the same events. */
 const handlers = {
-    hello: (data) =>
-        store.set({
-            me: data.user,
-            users: data.users,
-            models: data.models,
-            guard: data.guard,
-            server: data.server,
+    // Sent again on each connect, mostly as it was: what is the same keeps its identity (`kept`).
+    hello: (data, generation) => {
+        if (!acceptPerson(data.user, generation)) {
+            return;
+        }
+
+        const state = store.state;
+        // Only a new connection's first hello answers this tab's asking; any later one, the server sent of itself.
+        const asked = helloAsked;
+
+        helloAsked = undefined;
+
+        // A server that runs other code sends entries otherwise; and this person's rights may have changed (a role, the
+        // sessions shared with them), or another person signed in: what this tab kept goes, and the view it shows is not
+        // kept when it leaves. A restart with the same code keeps it all.
+        if (
+            (state.server != null && data.server?.build !== state.server.build) ||
+            (state.me && !sameJson(state.me, data.user))
+        ) {
+            forgetKept();
+        }
+
+        tidyDevice(data.user, data.server);
+
+        setChanged({
+            me: kept(state.me, data.user),
+            users: keptEach(state.users, data.users),
+            folderFavorites: kept(state.folderFavorites, data.folderFavorites ?? []),
+            models: kept(state.models, data.models),
+            guard: kept(state.guard, data.guard),
+            server: keptServer(state.server, data.server, asked),
+            // Every theme folder (`theme.js`): an older server lists none.
+            themeList: kept(state.themeList, Array.isArray(data.themes) ? data.themes : []),
             // This connection's id, which peek lists name (`peeks.js`). `GET /api/me` answers without one.
             ...(data.connection === undefined ? {} : { streamId: data.connection }),
-        }),
-    sessions: (sessions) =>
-        store.set((state) => ({
+        });
+        // The sessions used last, from the device into memory, once the page settles: after a reload they open at once.
+        setTimeout(() => void warmFromDevice(), 1500);
+    },
+    sessions: (list) => {
+        const state = store.state;
+        const sessions = keptEach(state.sessions, list);
+
+        // A session gone from the list (no longer shared with this person): nothing kept stays, its subagents' views
+        // included, and the view shown is not kept when the tab leaves it, though the list may come before the server
+        // says it is missing (a reconnect). Rare: only a person's access takes a session out of their list.
+        if (sessions !== state.sessions) {
+            const listed = new Set(sessions.map((session) => session.id));
+
+            if (state.sessions.some((each) => !listed.has(each.id))) {
+                forgetKept();
+            }
+        }
+
+        setChanged({
             sessions,
             sessionsLoaded: true,
-            moving: stillMoving(state.moving, sessions),
-        })),
-    models: (models) => store.set({ models }),
+            moving: kept(state.moving, stillMoving(state.moving, sessions)),
+        });
+    },
+    "folder-favorites": (folderFavorites) =>
+        setChanged({ folderFavorites: kept(store.state.folderFavorites, folderFavorites) }),
+    models: (models) => setChanged({ models: kept(store.state.models, models) }),
+    gpu: (gpu) => store.set({ gpu }),
+    // A theme folder came, went, or changed (`theme.js` loads its new version).
+    themes: (themeList) => setChanged({ themeList: kept(store.state.themeList, themeList) }),
     // Every subagent in every session, while this tab shows the subagents board (`subagents-board.js`).
-    subagents: (agents) => store.state.board && store.set({ boardAgents: agents }),
+    subagents: (agents) => store.state.board === "subagents" && store.set({ boardAgents: agents }),
     view: applyView,
+    // A switch on this connection went through (`switchTo`): what comes of a session after it is the new one's.
+    switched: (data) => {
+        if (data.seq === switchSeq) {
+            switching = null;
+        }
+    },
     // This person's PiP: its conversation, whether it works, and when it last answered (`pip.js`); null for none.
-    pip: (pip) => store.set({ pip }),
+    // Sent again on each connect, mostly as it was.
+    pip: (pip) => setChanged({ ...pipLayout(pip), pip: kept(store.state.pip, pip) }),
     // PiP's conversation, while this tab's PiP panel is open.
     pipview: applyPipView,
     chat: applyChat,
@@ -489,13 +1939,30 @@ const handlers = {
     // Another session as its peek tile shows it (`peeks.js`): kept after it scrolls away, as the tile's last look.
     peek: (data) =>
         store.set((state) => ({ peeks: { ...state.peeks, [data.conversationId]: data } })),
-    users: (users) => store.set({ users }),
+    users: (users) => setChanged({ users: keptEach(store.state.users, users) }),
     // Pi's lessons changed somewhere: a Memory sheet or menu that shows them fetches them again (`sheets/memory.js`).
     memory: () => store.set((state) => ({ memoryRev: (state.memoryRev ?? 0) + 1 })),
-    missing: (data) => store.set({ missing: data.message }),
+    // Not this person's to see (any more), or gone: nothing of it stays in this tab, kept or shown.
+    missing: (data) => {
+        keptViews.delete(data.conversationId);
+        dropFromDevice(data.conversationId);
+        store.set((state) => ({
+            // Said of a session this tab has since left (`show`), it is not what the tab shows.
+            ...(state.conversationId === data.conversationId
+                ? { missing: data.message, holding: null }
+                : {}),
+            ...(state.view.conversation?.id === data.conversationId ? { view: emptyView() } : {}),
+        }));
+    },
+    // An event an extension module sent its browser module (`extension-ui.js`).
+    ext: (data) => {
+        for (const listener of extensionListeners) {
+            listener(data);
+        }
+    },
     // A notice may link to a conversation, such as a mention elsewhere: tapping it goes there.
-    notice: (data) =>
-        notify(
+    notice: (data) => {
+        const id = notify(
             data.level,
             data.message,
             data.link
@@ -504,16 +1971,33 @@ const handlers = {
                           sheet: data.link.sheet ? { type: data.link.sheet } : null,
                       })
                 : undefined,
-        ),
+        );
+
+        // A mention's: reading that chat takes it down.
+        if (data.link?.sheet === "chat") {
+            chatNotices.set(id, data.link.conversationId);
+        }
+    },
     auth: (data) => handleAuth(data),
+    // A notification for the embedder this page runs in, which shows it itself (`web/embedder.js`).
+    "embedder-notify": (data) => embedderListeners.forEach((listener) => listener(data)),
     closing: () => store.set({ connection: "closed" }),
     reload: () => {
-        // A web file changed on the server. Message drafts live in localStorage and survive the reload; an unsaved notes
-        // draft, attachments not yet sent, and an open provider sign-in do not.
+        // A web file changed on the server. Message, notes, and attachment drafts survive when browser storage works;
+        // an open provider sign-in does not.
         setTimeout(() => location.reload(), 150);
     },
 };
 
+/**
+ * What this code understands of the server's updates, sent with each connection. 2: it keeps the queue when an update
+ * leaves it out. 3: it takes the message being written as what changed (`mergeLive`). 4: a full view brings only the
+ * entries of the newest rows, and it loads earlier ones as it shows them (`loadEarlier`). 5: those entries come light
+ * (`partial`) at first, whole in the update after. 6: it names what it kept of the session it opens (`have`), and takes a
+ * view that leaves that out (`orderFrom`). The server sends a tab below 3 the whole message with each update, and one
+ * whose code names none (as a tab asleep through an update keeps) the queue too.
+ */
+const PROTOCOL = 6;
 const TRANSPORT_KEY = "pocket.transport";
 const local = /^(localhost|127\.\d+\.\d+\.\d+|\[::1\])$/.test(location.hostname);
 /** After an event stream stalls on this address, poll for a day, then try the stream again: one slow start is not forever. */
@@ -539,31 +2023,152 @@ const connected = () => store.state.connection !== "open" && store.set({ connect
 
 export function connect() {
     source?.close();
+    // A new connection names the session itself: a switch still on its way is no longer awaited.
+    switching = null;
+    switchSeq++;
     store.set({ connection: "connecting" });
-    const id = store.state.conversationId;
-    const query = `tab=${encodeURIComponent(TAB)}${id === null ? "" : `&c=${id}`}`;
-
-    source = pollHere() && !local ? pollEvents(query) : streamEvents(query);
+    source = pollHere() && !local ? pollEvents() : streamEvents(eventsQuery(true));
 }
 
-// A page kept for Back and Forward stays alive, frozen, and so would its stream: each holds one of the few connections a
-// browser makes to a server, and after a handful nothing else loads. It closes on leaving and reconnects on return.
-addEventListener("pagehide", () => {
+/**
+ * What a new connection asks for: this tab, what its code understands, the session it shows now (a switch changes it
+ * on the connection it has), and, with `kept`, what it kept of that session.
+ */
+function eventsQuery(kept) {
+    const id = store.state.conversationId;
+    const have = kept && id !== null ? haveOf(store.state.view) : null;
+    // An embedder that shows notifications itself gets them over this connection (`web/host.js`).
+    const embedder = hostCan("notify") ? "&embedder=notify" : "";
+    const session = id === null ? "" : `&c=${id}`;
+    const resume = have === null ? "" : `&have=${have}`;
+
+    return `tab=${encodeURIComponent(TAB)}&p=${PROTOCOL}${session}${resume}${embedder}`;
+}
+
+let accountCover = null;
+let accountRequest = null;
+let accountRetry;
+let accountFailures = 0;
+
+/** Cover a frozen page until the server confirms whose cookie the browser has now. */
+function coverAccount() {
+    if (accountCover !== null) {
+        return;
+    }
+
+    accountCover = document.createElement("dialog");
+    accountCover.className = "account-cover";
+    accountCover.setAttribute("aria-labelledby", "account-check-status");
+    accountCover.innerHTML = `<div class="plain">
+        <p id="account-check-status" role="status">Checking who is signed in…</p>
+        <button type="button">Retry</button>
+    </div>`;
+    accountCover.addEventListener("cancel", (event) => event.preventDefault());
+    accountCover.querySelector("button").addEventListener("click", () => void restoreAccount());
+    document.body.append(accountCover);
+    accountCover.showModal();
+}
+
+async function restoreAccount() {
+    // Kept as it left to change accounts (a sign-out goes to "/"), and back: its requests stay refused,
+    // and a refusal is no sign-out of the person, so it loads again.
+    if (changingAccount) {
+        location.reload();
+
+        return;
+    }
+
+    clearTimeout(accountRetry);
+    accountRequest?.abort();
+    coverAccount();
+    const request = new AbortController();
+    const generation = accountGeneration;
+    const timeout = setTimeout(() => request.abort(), 10_000);
+
+    accountRequest = request;
+
+    try {
+        const hello = await api("me", undefined, { signal: request.signal });
+
+        if (accountRequest !== request) {
+            return;
+        }
+
+        if (!hello.user || !acceptPerson(hello.user, generation)) {
+            reloadAccount();
+
+            return;
+        }
+
+        accountFailures = 0;
+        accountCover.close();
+        accountCover.remove();
+        accountCover = null;
+        connect();
+    } catch (error) {
+        if (accountRequest !== request) {
+            return;
+        }
+
+        if (generation !== accountGeneration) {
+            reloadAccount();
+
+            return;
+        }
+
+        if (error.status === 401) {
+            personStorage.clear();
+            reloadAccount();
+        } else {
+            accountFailures++;
+            accountCover.querySelector("p").textContent =
+                accountFailures >= 3
+                    ? "The server cannot be reached. Try again."
+                    : "Checking who is signed in…";
+            accountRetry = setTimeout(
+                restoreAccount,
+                Math.min(30_000, 1000 * 2 ** Math.min(accountFailures - 1, 5)),
+            );
+        }
+    } finally {
+        clearTimeout(timeout);
+
+        if (accountRequest === request) {
+            accountRequest = null;
+        }
+    }
+}
+
+// A frozen page must not hold an event stream or show its old account on return. Checking the cookie keeps a
+// same-person restore intact, including uploads still held only in memory.
+addEventListener("pagehide", (event) => {
     source?.close();
     source = null;
+    clearTimeout(accountRetry);
+    accountRequest?.abort();
+    accountRequest = null;
+
+    if (event.persisted) {
+        coverAccount();
+    }
 });
 addEventListener("pageshow", (event) => {
     if (event.persisted) {
-        connect();
+        void restoreAccount();
     }
 });
 
 /** Server-sent events: one long response the server writes to as things change. */
 function streamEvents(query) {
+    const generation = accountGeneration;
+
+    helloAsked = moment();
     const events = new EventSource(`/api/events?${query}`);
+    /** The session its address names: a retry by the browser asks for that one again. */
+    const named = store.state.conversationId;
     /** The first batch arrived whole: the session's view, or the session list when no session is open. */
     let settled = false;
-    const settles = query.includes("&c=") ? ["view", "missing"] : ["sessions"];
+    const settles = named !== null ? ["view", "missing"] : ["sessions"];
     const connection = {
         close() {
             clearTimeout(fallback);
@@ -594,7 +2199,7 @@ function streamEvents(query) {
                 settled = true;
             }
 
-            handler(JSON.parse(event.data));
+            heard(name, JSON.parse(event.data), handler, generation);
         });
     }
 
@@ -613,6 +2218,14 @@ function streamEvents(query) {
         }
 
         store.set({ connection: "closed" });
+
+        // Switched on this connection since it opened (`show`): the browser's retry would ask for the session its address
+        // names. A new connection names the one shown; it hears a 401 as this one does.
+        if (named !== store.state.conversationId) {
+            connect();
+
+            return;
+        }
 
         // EventSource retries by itself after a network error; a 401 needs a sign-in instead.
         try {
@@ -642,8 +2255,62 @@ function streamEvents(query) {
     return connection;
 }
 
+// ─── Switching sessions on the connection the tab has ─────────────────────────────────────────────────────────────
+
+/** Events about the session a tab shows: while a switch is on its way, those that come are the old session's. */
+const SESSION_EVENTS = new Set(["view", "chat", "notes", "presence", "browser", "missing"]);
+/** The number of the last switch asked, so the server drops one that arrives after a newer one. */
+let switchSeq = 0;
+/** The switch on its way: its number, until the server's `switched` says it went through. */
+let switching = null;
+
+/** Pass an event on to its handler, unless it is about the session the tab is leaving. */
+function heard(name, data, handler, generation) {
+    if (changingAccount || (switching !== null && SESSION_EVENTS.has(name))) {
+        return;
+    }
+
+    handler(data, generation);
+}
+
+/**
+ * Show the session the tab now shows (`conversationId`, null for the list) on the connection it has, rather than a new
+ * one: no hello, list, or PiP state comes again, and nobody sees this person leave and come back. A server that cannot
+ * (an older one, or no connection open) gets a new connection, as before.
+ */
+function show() {
+    const connection = store.state.streamId;
+
+    if (
+        store.state.server?.switches !== true ||
+        !connection ||
+        !source ||
+        store.state.connection !== "open"
+    ) {
+        connect();
+
+        return;
+    }
+
+    const id = store.state.conversationId;
+    const seq = ++switchSeq;
+
+    switching = seq;
+    api("switch", {
+        connection,
+        c: id,
+        have: id === null ? null : haveOf(store.state.view),
+        seq,
+    }).catch(() => {
+        // The connection closed, or the server started again: a new one, which names the session.
+        if (switchSeq === seq) {
+            connect();
+        }
+    });
+}
+
 /** Long polling: each request waits for events and returns them; the next one acknowledges what arrived. */
-function pollEvents(query) {
+function pollEvents() {
     let session = null;
     let ack = 0;
     let stopped = false;
@@ -664,10 +2331,16 @@ function pollEvents(query) {
 
         while (!stopped) {
             request = new AbortController();
+            const asked = moment();
+            const named = store.state.conversationId;
+            let fresh = false;
+            const generation = accountGeneration;
 
             try {
+                // A poll the server no longer knows (it started again, or this tab fell far behind) attaches afresh: it
+                // names the session shown now, which a switch may have changed (`show`).
                 const response = await fetch(
-                    `/api/poll?${query}${session ? `&session=${session}&ack=${ack}` : ""}`,
+                    `/api/poll?${eventsQuery(session === null)}${session ? `&session=${session}&ack=${ack}` : ""}`,
                     { signal: request.signal, cache: "no-store" },
                 );
 
@@ -689,9 +2362,15 @@ function pollEvents(query) {
                 }
 
                 if (data.session !== session) {
-                    // A new session (first poll, or the server restarted): it starts with hello and a full view.
+                    // A new session (first poll, or the server restarted): it starts with hello and a full view. The
+                    // server made that session, and read the hello's clock, after this request went out.
                     session = data.session;
                     ack = 0;
+                    helloAsked = asked;
+                    // It named the session shown when it was asked: a switch still on its way went to the old one.
+                    switching = null;
+                    switchSeq++;
+                    fresh = true;
                 }
 
                 failures = 0;
@@ -703,7 +2382,15 @@ function pollEvents(query) {
                     }
 
                     ack = item.seq;
-                    handlers[item.event]?.(item.data);
+
+                    if (handlers[item.event]) {
+                        heard(item.event, item.data, handlers[item.event], generation);
+                    }
+                }
+
+                // The tab switched while it was asked: the new session shows the old one, so switch it too.
+                if (fresh && named !== store.state.conversationId) {
+                    show();
                 }
             } catch {
                 if (stopped) {
@@ -796,22 +2483,40 @@ export function closeSignIn(flowId) {
     store.set((state) => (state.auth?.flowId === flowId ? { auth: null } : {}));
 }
 
-export function navigate(conversationId, { replace = false, sheet = null } = {}) {
+/**
+ * Go to a conversation (null: the home screen). With `over` (`{ id }`, the route under it), it opens over that route
+ * as a board does: the entry keeps it, and the list keeps that session marked open (`openId`) until another route.
+ * With `back`, it goes back to the route that one was opened over, keeping what stays open over both (a sheet).
+ */
+export function navigate(
+    conversationId,
+    { replace = false, sheet = null, over = null, back = false } = {},
+) {
     const path = conversationId === null ? "/" : `/s/${conversationId}`;
 
-    if (location.pathname !== path || store.state.conversationId !== conversationId) {
-        pushRoute(path, { replace });
+    // A new route says what it is over; the same route keeps what its entry already says.
+    const route = location.pathname !== path || store.state.conversationId !== conversationId;
+
+    if (route && back) {
+        popRoute(path);
+    } else if (route) {
+        pushRoute(path, { replace, state: over === null ? {} : { over } });
     }
 
-    // The subagents board shows in the conversation's place: going to one, even the one under it, closes it.
-    if (store.state.board || store.state.routersOpen) {
-        store.set({ board: false, boardAgents: null, routersOpen: false });
+    // The subagents board, the router editor and extensions' pages show in the conversation's place: going to one,
+    // even the one under it, closes them.
+    if (store.state.board || store.state.page || store.state.routersOpen) {
+        store.set({ board: false, boardAgents: null, page: null, routersOpen: false });
     }
 
     // Its row tapped again counts too.
     opened(conversationId);
 
     if (store.state.conversationId === conversationId && source) {
+        if (route && store.state.over?.id !== over?.id) {
+            store.set({ over });
+        }
+
         if (sheet) {
             openSheet(sheet);
         }
@@ -819,54 +2524,135 @@ export function navigate(conversationId, { replace = false, sheet = null } = {})
         return;
     }
 
+    keepView(store.state.view);
     store.set((state) => ({
+        ...(route ? { over } : {}),
         conversationId,
-        view: emptyView(),
+        ...keptView(conversationId),
         ...peopleFor(conversationId),
+        ...keptReply(state, conversationId, route ? over : state.over),
+        ...layoutPatch(layoutFor(conversationId)),
         browser: null,
         history: null,
-        transcriptFrom: null,
         missing: null,
         drawer: false,
         ...sheetChange(sheet, state),
     }));
-    connect();
+    showKept(conversationId);
+}
+
+/** The number of the last session gone to, so a read of the device that comes late does not show an older one. */
+let going = 0;
+
+/**
+ * Show the session gone to on the connection (`show`): kept in memory, it shows already; otherwise the device may have
+ * it, which a moment's read brings, and the server then sends only what came since.
+ */
+function showKept(id) {
+    const turn = ++going;
+
+    if (id === null || store.state.view.conversation != null || !onDevice()) {
+        show();
+
+        return;
+    }
+
+    void deviceView(id).then((found) => {
+        if (turn !== going) {
+            return;
+        }
+
+        if (found !== undefined) {
+            store.set(found);
+        }
+
+        show();
+    });
 }
 
 // Back or forward to another route. Back that only closes a layer (a sheet, a panel) is back.js's.
 onRoute(() => {
     const id = routeConversation();
+    // The entry says what its route is over: in the same change as the route, so the open mark never jumps between.
+    const over = store.state.over?.id === routeOver()?.id ? {} : { over: routeOver() };
 
-    if (id !== store.state.conversationId) {
+    if (id === store.state.conversationId) {
+        if ("over" in over) {
+            store.set(over);
+        }
+    } else {
         opened(id);
+        keepView(store.state.view);
         store.set({
+            ...over,
             conversationId: id,
-            view: emptyView(),
+            ...keptView(id),
             ...peopleFor(id),
+            ...keptReply(store.state, id, routeOver()),
+            ...layoutPatch(layoutFor(id)),
             browser: null,
             history: null,
-            transcriptFrom: null,
             missing: null,
             sheet: null,
             drawer: false,
         });
-        connect();
+        showKept(id);
     }
 });
 
 export async function start() {
+    const generation = accountGeneration;
+
     try {
+        const asked = moment();
+        // The session the page opens on, from the device, read while the server answers who this is: then checked.
+        const id = store.state.conversationId;
+        const onDisk = id === null ? undefined : readDevice(id);
         const hello = await api("me");
+
+        if (!acceptPerson(hello.user, generation)) {
+            return;
+        }
 
         store.set({
             me: hello.user,
             users: hello.users,
             models: hello.models,
+            gpu: hello.gpu ?? { waiting: [], loading: [] },
             guard: hello.guard,
-            server: hello.server,
+            server: keptServer(store.state.server, hello.server, asked),
+            themeList: Array.isArray(hello.themes) ? hello.themes : [],
         });
+        store.set(layoutPatch(firstLayout()));
+
+        if (onDisk !== undefined && store.state.view.conversation == null) {
+            const cached = await onDisk;
+
+            if (generation !== accountGeneration || changingAccount) {
+                reloadAccount();
+
+                return;
+            }
+
+            const found = adopt(id, cached);
+
+            if (found !== undefined) {
+                store.set(found);
+            }
+        }
+
         connect();
     } catch (error) {
+        if (generation !== accountGeneration || changingAccount) {
+            reloadAccount();
+
+            return;
+        }
+
+        if (error.status === 401) {
+            personStorage.clear();
+        }
+
         store.set({ me: error.status === 401 ? null : undefined });
 
         if (error.status !== 401) {
@@ -880,20 +2666,37 @@ export async function start() {
 
 const current = () => store.state.conversationId;
 
+/**
+ * A send's answer, which names what the send made (`key`). One that does not was not the server's, or was cut short:
+ * an error with no status, as for no answer, since what came of the send is not known.
+ */
+const answered = (key) => (answer) => {
+    if (answer?.[key] === undefined) {
+        throw new ApiError(undefined, "The answer could not be read. Send it again: it goes once.");
+    }
+
+    return answer;
+};
+
 export const actions = {
     /** `inlineFiles`: the files the message mentions with @ go along with it. */
-    submit: (text, attachments, mode, inlineFiles = false) =>
+    submit: (text, attachments, mode, inlineFiles = false, requestId = uid()) =>
         api(`c/${current()}/submit`, {
             text,
             attachments,
             mode,
-            requestId: uid(),
+            requestId,
             ...(inlineFiles ? { inlineFiles } : {}),
-        }),
+        }).then(answered("submissionId")),
     /** Run a command in the session's folder (`!`); `context: false` keeps it from Pi (`!!`). */
     shell: (command, context, requestId = uid()) =>
-        api(`c/${current()}/shell`, { command, context, requestId }),
+        api(`c/${current()}/shell`, { command, context, requestId }).then(answered("taskId")),
     stopShell: (taskId) => api(`c/${current()}/shell/${taskId}/stop`, {}),
+    /** Run an extension's command; sending the same request id again finds the first run. */
+    extensionCommand: (commandId, args, requestId = uid()) =>
+        api(`c/${current()}/extension-commands`, { commandId, args, requestId }).then(
+            answered("taskId"),
+        ),
     /** A file or folder for the viewer. */
     view: (path) => api(`c/${current()}/view?path=${encodeURIComponent(path)}`),
     /** What changed in the session's folder: git's uncommitted changes, and Pi's edits. */
@@ -903,6 +2706,8 @@ export const actions = {
     /** Undo the uncommitted changes to one file. */
     revert: (path) => api(`c/${current()}/changes/revert`, { path }),
     abort: () => api(`c/${current()}/abort`, {}),
+    /** Send the request of a run that waits for its provider's limit now, not at its time. */
+    retryLimit: (id = current()) => api(`c/${id}/limit/retry`, {}),
     chat: (text, quote) =>
         api(`c/${current()}/chat`, {
             text,
@@ -915,6 +2720,13 @@ export const actions = {
     turns: (action, to) => api(`c/${current()}/turns`, { action, ...(to ? { to } : {}) }),
     setAccess: (userId, patch) => api(`users/${encodeURIComponent(userId)}`, patch),
     withdraw: (submissionId) => api(`c/${current()}/withdraw`, { submissionId }),
+    /** Move one's own queued message to "steer" or "followUp", or send it now with "interrupt". */
+    move: (submissionId, mode) => api(`c/${current()}/move`, { submissionId, mode }),
+    editQueued: (submissionId, id = current()) => api(`c/${id}/edit-queued`, { submissionId }),
+    /** What a Stop held: send them all, or drop one or take it back into the box, by its key. */
+    sendHeld: () => api(`c/${current()}/held`, { action: "send" }),
+    dropHeld: (key) => api(`c/${current()}/held`, { action: "drop", key }),
+    editHeld: (key, id = current()) => api(`c/${id}/held`, { action: "edit", key }),
     configure: (change) => api(`c/${current()}/configure`, change),
     /** The owner's model and thinking level for new sessions, `{ provider, modelId, thinkingLevel }`; null clears it. */
     setDefaultModel: (choice) => api("settings", { defaultModel: choice }),
@@ -924,9 +2736,14 @@ export const actions = {
     /** A new session with this one's history through `entryId`. */
     fork: (entryId, { worktree = false } = {}) =>
         api(`c/${current()}/fork`, { entryId, ...(worktree ? { worktree } : {}) }),
+    forkSession: (id) => api(`c/${id}/fork`, {}),
     /** Send a message to Pi again in a fork that ends just before it: `{ text }` edits it, `{ model }` picks another model. */
     resend: (entryId, change = {}) => api(`c/${current()}/resend`, { entryId, ...change }),
     setPlan: (on) => api(`c/${current()}/plan`, { on }),
+    /** Let Pi use the browser in this session, or stop it (`commands.setBrowserUse`). */
+    setBrowserUse: (on) => api(`c/${current()}/browser-use`, { on }),
+    /** Someone started writing here: load the session's local model meanwhile (the server decides if it should). */
+    warm: (id) => api(`c/${id}/warm`, {}),
     /** `{ mode }`, or `{ mode: "custom", models }`: which models this session's subagents may run on. */
     setSubagents: (request) => api(`c/${current()}/subagents`, request),
     /** Run this session as a router by id, or as a plain session again (null). */
@@ -954,19 +2771,128 @@ export const actions = {
     /** Watch the session's pull request: its branch's, or `pr` (a number or address). */
     watchPr: (pr) => api(`c/${current()}/watch`, pr ? { pr } : {}),
     unwatchPr: () => api(`c/${current()}/watch`, { stop: true }),
-    approve: (id, allow) => api(`approvals/${encodeURIComponent(id)}`, { allow }),
+    /** Allow or deny a call; an ask (`host.ask`) is allowed with what was typed in its fields. */
+    approve: (id, allow, values) =>
+        api(`approvals/${encodeURIComponent(id)}`, { allow, ...(values ? { values } : {}) }),
     /** `worktree`: the session works in a git worktree of its own, made from the folder. */
     createSession: (cwd, { worktree = false } = {}) =>
         api("sessions", { cwd, ...(worktree ? { worktree } : {}) }),
     updateSession: (id, patch) => api(`sessions/${id}`, patch),
     upload: (file) => api(`c/${current()}/upload?name=${encodeURIComponent(file.name)}`, file),
     fullEntry: (entryId) => api(`c/${current()}/entry/${entryId}`),
+    /** Show a path in the server machine's file manager: the owner's only. */
+    reveal: (path) => api(`c/${current()}/reveal`, { path }),
     history: (before) => api(`c/${current()}/history?before=${before}`),
+    context: (before, query) => api(`c/${current()}/context?before=${before}&${query}`),
 };
 
+/**
+ * Where the entries this tab has begin in the session's order: a view brings only the newest (protocol 4), and earlier
+ * ones come as they are shown (`loadEarlier`). 0 when it has all of them.
+ */
+export function loadedFrom(view) {
+    let at = view.order.length;
+
+    while (at > 0 && view.entries.has(view.order[at - 1])) {
+        at--;
+    }
+
+    return at;
+}
+
+/**
+ * Whether the transcript can draw an entry: it is in the unbroken run of entries at the end of the order. An entry kept
+ * from before a gap (a reconnect after many new rows, or a compaction) is held but not drawn.
+ */
+export function isLoaded(view, entryId) {
+    const at = view.order.indexOf(entryId);
+
+    return at !== -1 && at >= loadedFrom(view);
+}
+
+/** One request for earlier entries at a time, per conversation: its promise, which later callers share. */
+let loading = null;
+
+/**
+ * Load entries of the active context before the ones this tab has: `rows` rows more (with their turn), back to the entry
+ * `from`, or all of them with neither. Resolves once they are in the view; a view of another conversation by then, or a
+ * new order without them (a compaction), takes nothing.
+ */
+export function loadEarlier({ rows, from } = {}) {
+    const { view } = store.state;
+    const conversationId = view.conversation?.id;
+    const start = loadedFrom(view);
+
+    if (conversationId === undefined || start === 0) {
+        return Promise.resolve();
+    }
+
+    if (from !== undefined && isLoaded(view, from)) {
+        return Promise.resolve();
+    }
+
+    if (loading?.conversationId === conversationId) {
+        // One under way may not reach far enough: then this one asks again for the rest.
+        return loading.promise.then(() => loadEarlier({ rows, from }));
+    }
+
+    const before = view.order[start];
+    const query = from !== undefined ? `from=${from}` : rows !== undefined ? `rows=${rows}` : "";
+    const promise = actions
+        .context(before, query)
+        .then((earlier) =>
+            store.set((state) => {
+                if (
+                    state.view.conversation?.id !== conversationId ||
+                    !state.view.order.includes(before)
+                ) {
+                    return {};
+                }
+
+                const keep = new Set(state.view.order);
+                const entries = new Map();
+
+                for (const entry of earlier) {
+                    if (keep.has(entry.id)) {
+                        entries.set(entry.id, entry);
+                    }
+                }
+
+                // What the tab has wins, except a light one (`partial`): the one loaded is whole.
+                for (const [id, entry] of state.view.entries) {
+                    if (!entry.partial || !entries.has(id)) {
+                        entries.set(id, entry);
+                    }
+                }
+
+                return { view: { ...state.view, entries } };
+            }),
+        )
+        .finally(() => {
+            if (loading?.promise === promise) {
+                loading = null;
+            }
+        });
+
+    loading = { conversationId, promise };
+
+    return promise;
+}
+
+/** The kinds of entries that show as transcript rows. */
+const ROW_KINDS = new Set([
+    "user",
+    "assistant",
+    "compaction",
+    "reset",
+    "shell",
+    "command",
+    "note",
+    "fromPi",
+]);
+
 /** Entries that show as transcript rows. Tool results show inside their call's card instead. */
-export const isRow = (entry) =>
-    ["user", "assistant", "compaction", "reset", "shell", "note", "fromPi"].includes(entry.kind);
+export const isRow = (entry) => ROW_KINDS.has(entry.kind);
 
 /**
  * Show the transcript from this entry down when it is above the rows shown now, as for a jump to a pinned or quoted
@@ -994,7 +2920,6 @@ export function revealEntry(entryId) {
 
 // ─── The People panel ──────────────────────────────────────────────────────────────
 
-const PEOPLE_KEY = "pocket.people";
 /** Wide enough for the session list, the conversation, and a panel beside it: where the Browser panel docks too. */
 const PEOPLE_DOCK = matchMedia("(min-width: 1100px)");
 
@@ -1020,19 +2945,21 @@ export function peopleDocked(state = store.state) {
  * takes the Browser panel's place: both beside the conversation leave it too narrow.
  */
 function sheetChange(sheet, state) {
+    // Running now was a sheet; it is a board in the conversation's place now, wherever an old caller asks for it.
+    if (sheet?.type === "running") {
+        return { sheet: null, board: "running", boardAgents: null, page: null };
+    }
+
     if (sheet?.type !== "chat" || !PEOPLE_DOCK.matches) {
         return { sheet };
     }
-
-    sessionStorage.setItem(PEOPLE_KEY, "1");
-    sessionStorage.removeItem("pocket.browser");
-    sessionStorage.removeItem("pocket.files");
 
     return {
         sheet: null,
         peopleOpen: true,
         browserOpen: false,
         filesOpen: false,
+        extPanel: null,
         peopleAsk: {
             tab: sheet.tab ?? null,
             highlight: sheet.highlight ?? null,
@@ -1061,10 +2988,8 @@ export function filesShown(state = store.state) {
 
 /** Hide the People panel. Showing it is `openSheet({ type: "chat" })`, which docks it on wide screens. */
 export function closePeople() {
-    sessionStorage.removeItem(PEOPLE_KEY);
-
     // Its active border goes to the conversation, not nowhere.
-    if (document.documentElement.dataset.focus === "people") {
+    if (document.documentElement.dataset.focus === "people-panel") {
         document.documentElement.dataset.focus = "pane";
     }
 
@@ -1098,15 +3023,106 @@ export function openSheet(sheet) {
 }
 
 /**
- * Put text into the message box to Pi (after what is there: on a new paragraph, or with `inline`, after a space), and
- * files to attach, and close any sheet so it shows.
+ * Put text into the message box in the session's place (after what is there: on a new paragraph, or with `inline`,
+ * after a space), and files to attach, and close any sheet so it shows. The box of the conversation in that place
+ * then takes it (`takeInsert`), also when it waits for a send.
  */
 export function insertIntoComposer(text, files = [], { inline = false } = {}) {
+    waitingInserts.push({ text, files, inline, for: store.state.conversationId });
     store.set((state) => ({
         sheet: null,
-        composerInsert: { text, files, inline, n: (state.composerInsert?.n ?? 0) + 1 },
+        composerInsert: { n: (state.composerInsert?.n ?? 0) + 1 },
     }));
 }
+
+/**
+ * What `insertIntoComposer` put that no box took yet, in order, each for the conversation it was put in (null: put with
+ * none open, for the next box that shows).
+ */
+let waitingInserts = [];
+
+/**
+ * Take, once, what `insertIntoComposer` put for `conversationId` that no box took yet: its files, and its text after
+ * `current` (the box's words), or null for none. Null when nothing waits for it.
+ */
+export function takeInsert(current, conversationId) {
+    const forThis = (insert) => insert.for === conversationId || insert.for === null;
+    const mine = waitingInserts.filter(forThis);
+
+    if (mine.length === 0) {
+        return null;
+    }
+
+    waitingInserts = waitingInserts.filter((insert) => !forThis(insert));
+    let text = current;
+
+    for (const insert of mine) {
+        if (insert.text !== "") {
+            const gap = insert.inline ? " " : "\n\n";
+
+            text =
+                text.trim() === ""
+                    ? insert.text
+                    : `${text.replace(/\s+$/, "")}${gap}${insert.text}`;
+        }
+    }
+
+    return {
+        files: mine.flatMap((insert) => insert.files ?? []),
+        text: mine.some((insert) => insert.text !== "") ? text : null,
+    };
+}
+
+/**
+ * Whether the conversation in the session's place is PiP's (as a board): as its view says, which comes before PiP's id
+ * may, after a reload, or as PiP's id says.
+ */
+export const showsPip = (state = store.state) =>
+    state.conversationId !== null &&
+    (state.conversationId === state.pip?.id || state.view.conversation?.pip === true);
+
+/** Reply to a passage of the conversation shown: on PiP's board, it is PiP's quote. */
+export function quoteReply(text) {
+    store.set(showsPip() ? { pipQuote: { text } } : { replyQuote: { text } });
+}
+
+/**
+ * Take away `quote` from the box that holds it, never another one put there meanwhile: dismissed, or as a send takes it.
+ * A send holds its quote while it goes, so no box shown again meanwhile offers it twice.
+ */
+export function dropQuote(quote) {
+    if (!quote) {
+        return;
+    }
+
+    if (quote === store.state.replyQuote) {
+        store.set({ replyQuote: null });
+    } else if (quote === store.state.pipQuote) {
+        store.set({ pipQuote: null });
+    }
+}
+
+/**
+ * A send that did not go gives its quote back, unless another took its place meanwhile: to PiP's box (`pip`), or to the
+ * box of session `id` while it is still open.
+ */
+export function giveBackQuote(quote, pip, id) {
+    const free = pip
+        ? store.state.pipQuote === null
+        : store.state.replyQuote === null && openId() === id;
+
+    if (quote && free) {
+        store.set(pip ? { pipQuote: quote } : { replyQuote: quote });
+    }
+}
+
+/**
+ * Whether `part` of a message box (a file, the quote) is in `going`, what a send on its way holds. The rule, the same
+ * in the session's box and PiP's: a send on its way locks what it sends (its words, files, and quote), which shows as
+ * on its way and cannot be changed or removed, by a key, dictation, or a ×. The rest stays free: a file added
+ * meanwhile, and in PiP's box, which empties as it sends, the next words.
+ */
+export const onItsWay = (going, part) => Boolean(part) && going?.includes(part) === true;
 
 /** Open the chat to discuss a transcript message: the next chat message quotes it. */
 export function discuss(entryId, text) {
@@ -1117,11 +3133,12 @@ export function discuss(entryId, text) {
     }));
 }
 
-// Tell the server when this tab is hidden or shown: others see "away", and push notifications only reach hidden tabs.
+// Tell the server when this tab is hidden or shown: others see "away", and push notifications only reach hidden tabs. A
+// embedder's window hidden in its tray, or minimized, counts as hidden (`pageVisible`).
 let lastVisible = null;
 
 function reportVisibility() {
-    const visible = document.visibilityState === "visible";
+    const visible = pageVisible();
 
     if (visible === lastVisible || !collab()) {
         return;
@@ -1131,12 +3148,12 @@ function reportVisibility() {
     api("visibility", { tab: TAB, visible }).catch(() => {});
 }
 
-document.addEventListener("visibilitychange", reportVisibility);
+onPageVisibility(reportVisibility);
 store.subscribe((state) => {
     // Report again after each (re)connect: the server starts every new connection as visible.
     if (state.connection !== "open") {
         lastVisible = null;
-    } else if (lastVisible === null && document.visibilityState !== "visible") {
+    } else if (lastVisible === null && !pageVisible()) {
         reportVisibility();
     }
 });
@@ -1145,14 +3162,13 @@ export function closeSheet() {
     store.set({ sheet: null });
 }
 
-// Per-conversation composer drafts survive reloads, including the automatic ones after a live edit.
+/** Show the Running now board in the conversation's place (`running-board.js`), over whatever sheet was open. */
+export function openRunning() {
+    store.set({ board: "running", boardAgents: null, drawer: false, page: null, sheet: null });
+}
+
+// Per-person, per-conversation drafts survive reloads, including the automatic ones after a live edit.
 export const drafts = {
-    get: (id) => localStorage.getItem(`pocket.draft.${id ?? "home"}`) ?? "",
-    set: (id, text) => {
-        if (text) {
-            localStorage.setItem(`pocket.draft.${id ?? "home"}`, text);
-        } else {
-            localStorage.removeItem(`pocket.draft.${id ?? "home"}`);
-        }
-    },
+    get: (id) => personStorage.get(`draft.${id ?? "home"}`) ?? "",
+    set: (id, text) => personStorage.set(`draft.${id ?? "home"}`, text || null),
 };

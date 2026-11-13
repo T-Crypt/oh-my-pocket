@@ -5,7 +5,7 @@
  * done part of its work, so its entry says it was cut off. The entry goes in as a write submission, which Pi Durable
  * queues while Pi works and places where a message can go.
  */
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Message } from "@earendil-works/pi-ai";
 import {
@@ -20,7 +20,7 @@ import type { PocketApp } from "./app.ts";
 import type { User } from "./config.ts";
 import { ShellRequestsDoc } from "./docs.ts";
 import { SHELL_ENTRY, type ShellData } from "./entry-format.ts";
-import { HttpError } from "./errors.ts";
+import { describe, HttpError } from "./errors.ts";
 import { ownRequest } from "./requests.ts";
 
 const TASK = "pocket.shell";
@@ -29,6 +29,8 @@ const TIMEOUT_SECONDS = 600;
 /** How much of what a command printed is kept: its end, where results and errors usually are. */
 const TAIL_CHARS = 30_000;
 const MAX_COMMAND = 4000;
+/** Terminal escape codes (colors, cursor moves): some tools print them even when nobody reads a terminal. */
+const ANSI = /\u001b\[[0-9;?]*[A-Za-z]/g;
 
 export type ShellInput = { command: string; by: string; name: string; context: boolean };
 
@@ -91,12 +93,16 @@ export class Shell {
                         data = { ...task.input, output: "", status: "interrupted", taskId };
                     } else {
                         await runtime.memo("started", Date.now(), context);
-                        data = await this.#run(
-                            task.input,
-                            taskId,
-                            await runtime.env(context),
-                            context,
+                        // A workspace URI whose provider is off has no environment: the command fails, as Pi's do.
+                        const env = await runtime.env(context).then(
+                            (found) => ({ found }),
+                            (error: unknown) => ({ error: describe(error) }),
                         );
+
+                        data =
+                            "error" in env
+                                ? { ...task.input, output: env.error, status: "failed", taskId }
+                                : await this.#run(task.input, taskId, env.found, context);
                     }
 
                     await this.#record(runtime.conversationId, data, context);
@@ -190,8 +196,9 @@ export class Shell {
     }
 
     /** Write a command's entry, once per command whatever runs it again. */
-    async #record(id: ConversationId, data: ShellData, context: Context): Promise<void> {
+    async #record(id: ConversationId, raw: ShellData, context: Context): Promise<void> {
         const app = this.#app;
+        const data = { ...raw, output: raw.output.replace(ANSI, "") };
         const entry: EntryDraft = {
             kind: SHELL_ENTRY,
             data,
@@ -246,6 +253,15 @@ export class Shell {
 
         if (command.length > MAX_COMMAND) {
             throw new HttpError(413, `Commands are limited to ${MAX_COMMAND} characters.`);
+        }
+
+        // A command is stored and shown as typed, and runs from what is stored: one that holds a value an extension hides
+        // (`host.hide`) would keep it in the transcript. The extension's variable carries the value instead.
+        if (app.hidden.replace(command, id) !== command) {
+            throw new HttpError(
+                400,
+                "This command holds a hidden value, which would be stored and shown. Use the variable that carries it instead, such as $NAME.",
+            );
         }
 
         if (user.role !== "owner" && app.guardOn()) {
@@ -341,7 +357,7 @@ export class Shell {
 
     /** What a running command has printed so far (its end), or undefined when it printed nothing or is not running. */
     printed(taskId: number): string | undefined {
-        return this.#tails.get(taskId)?.output;
+        return this.#tails.get(taskId)?.output.replace(ANSI, "");
     }
 
     /** The command a running task runs, for Running now. */

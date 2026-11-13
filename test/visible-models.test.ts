@@ -10,6 +10,7 @@ import {
     owner,
     root,
     say,
+    until,
     work,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
@@ -107,12 +108,14 @@ test("every tab is told what the pickers offer now", async () => {
     await app.attach(tab.client);
     app.providers.setVisible("faux", ["alpha", "beta"]);
 
-    const models = tab.last("models") as unknown as { provider: string; id: string }[];
+    const offered = () =>
+        ((tab.last("models") ?? []) as unknown as { provider: string; id: string }[])
+            .filter((model) => model.provider === "faux")
+            .map((model) => model.id)
+            .join(",");
 
-    assert.deepEqual(
-        models.filter((model) => model.provider === "faux").map((model) => model.id),
-        ["alpha", "beta"],
-    );
+    // The list goes out once the sign-in scope is read, a moment later.
+    await until(() => offered() === "alpha,beta", "the tab told the models offered now");
     app.detach(tab.client);
     app.providers.setVisible("faux", null);
 });

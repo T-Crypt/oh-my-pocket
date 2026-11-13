@@ -130,7 +130,10 @@ export function normalizeUrl(
     }
 }
 
-/** An address as the address bar shows it: without http:// and a lone trailing slash. Mirror of web/browser.js's displayUrl. Keep the two in step. */
+/** Why a file URL is refused in a session on a workspace URI: the browser runs on this machine, its files elsewhere. */
+export const REMOTE_FILES = "A remote session's files are not on this machine: open a web address.";
+
+/** An address as the address bar shows it: without `http://` and a lone trailing slash. */
 export function displayUrl(url: string): string {
     if (url === "" || url === "about:blank") {
         return "";

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 	<!--
-		Pi Pocket's icon. The PNGs beside it are drawn from it: test/icons.test.ts says how, and checks them.
+		Pi Pocket's icon. See docs/map.md#icons for PNG regeneration commands.
 		Apple's rounded mask reaches as far in at the corners as the frame starts, so the frame's corners are
 		rounded to follow the mask's and stay clear of it.
 	-->

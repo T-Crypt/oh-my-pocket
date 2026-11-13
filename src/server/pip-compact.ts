@@ -1,8 +1,8 @@
 /**
- * PiP's context, kept small. PiP is one conversation that lives for months, and every reply reads all of it again, so
- * it is compacted much sooner than a session: by itself once it is idle above `compactAt` tokens (the owner's choice
- * in Extensions, `PIP_COMPACT_DEFAULT` unless they chose), and by hand from its panel or with `/compact`. Sessions'
- * thresholds (Pi Durable's, from Pi's settings) stay as a backstop while a long run grows it.
+ * PiP's context. PiP is one conversation that lives for months, and every reply reads all of it again. By default it is
+ * compacted as a session is, at Pi Durable's thresholds (from Pi's settings). The owner can choose in Extensions to
+ * keep it smaller: then it compacts itself once idle above `compactAt` tokens. It can always be compacted by hand from
+ * its panel or with `/compact`. Sessions' thresholds stay as a backstop while a long run grows it.
  *
  * Every summary of PiP's is PiP's own: its extension's `beforeCompact` hook calls `summarize`, which writes it from
  * the conversation with everything that came from outside left out (what sessions said, webhooks' posts, GitHub's
@@ -10,7 +10,7 @@
  * its own notes. It keeps what PiP's person asked for, what is still open, and what PiP follows and watches (which
  * live on the server, and work on as they did). What it costs is added to `pi.usage`, once, as Pi Durable's are.
  */
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { AssistantMessage, Message, Usage } from "@earendil-works/pi-ai";
 import {
@@ -28,13 +28,18 @@ import {
 } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import { PipCompactionDoc } from "./docs.ts";
+import { CONTEXT_BLOCK } from "./entry-format.ts";
 import { describe } from "./errors.ts";
+import { noWait } from "./limit-gate.ts";
 import { clip, defang } from "./fence.ts";
 
 const context = BACKGROUND_CONTEXT;
 
-/** Tokens of context above which PiP compacts itself once idle, unless its owner chose otherwise. */
-export const PIP_COMPACT_DEFAULT = 60_000;
+/**
+ * Tokens of context above which PiP compacts itself once idle, unless its owner chose otherwise. 0 since 0.22.0: as
+ * sessions do. An owner who chose a limit keeps it (`pipCompactAt` in config.json).
+ */
+export const PIP_COMPACT_DEFAULT = 0;
 /** What the owner may choose from; 0 leaves PiP to the thresholds sessions have. */
 export const PIP_COMPACT_CHOICES: readonly number[] = [0, 40_000, 60_000, 100_000];
 
@@ -82,6 +87,8 @@ const OWN_TOOLS = new Set([
     "schedule",
     "memory",
     "artifact",
+    // Not a tool since 0.28.0: PiP's earlier notes still hold its results.
+    "artifact_inline",
 ]);
 
 /**
@@ -101,10 +108,20 @@ export function leaveOutside(text: string): string {
     return text.replace(OUTSIDE, (_whole, tag: string) => LEFT_OUT[tag] ?? "[left out]");
 }
 
+/**
+ * A message's text for the summary. What Pi Pocket added for PiP alone (`CONTEXT_BLOCK`: where a quoted passage came
+ * from) stays out: a session's title in it is anyone's words.
+ */
 const textOf = (content: string | readonly { type: string; text?: string }[]): string =>
     typeof content === "string"
         ? content
         : content
+              .filter(
+                  (block, index) =>
+                      index === 0 ||
+                      block.type !== "text" ||
+                      !block.text?.startsWith(CONTEXT_BLOCK),
+              )
               .map((block) =>
                   block.type === "text"
                       ? (block.text ?? "")
@@ -174,7 +191,7 @@ ${source}
 Write the notes for the conversation above. If it starts with earlier notes, keep what still holds and fold the newer messages into them. Use these headings, with a few short lines under each, and "(none)" when there is nothing:
 
 ## ${name}'s preferences
-What ${name} told PiP to do or not to do, and how they like things done, in their words where short.
+What ${name} told PiP to do or not to do, and how they like things done, in their words where short, and the language they write to PiP in.
 
 ## Open threads
 Requests not done yet, questions waiting for an answer, and what PiP said it would do later.
@@ -419,21 +436,22 @@ export class PipCompaction {
                         },
                     ],
                 },
-                {
+                // A summary is never worth a wait for a limit.
+                noWait({
                     // As Pi Durable's summaries: Pi's timeout and retries, the conversation's provider identity, and
                     // within what Pi's settings keep free for an answer.
                     ...this.#app.streamSettings(),
                     sessionId,
                     maxTokens: Math.min(
                         SUMMARY_TOKENS,
-                        Math.floor(0.8 * this.#reserveTokens()),
+                        Math.floor(0.8 * this.#policy(model).reserveTokens),
                         model.maxTokens > 0 ? model.maxTokens : SUMMARY_TOKENS,
                     ),
                     cacheRetention: "none",
                     ...(hookContext.abortSignal === undefined
                         ? {}
                         : { signal: hookContext.abortSignal }),
-                },
+                }),
             );
             const summary = summaryOf(message);
             const key = `${message.provider}/${message.model}`;
@@ -528,7 +546,10 @@ export class PipCompaction {
         const conversation = await app.conversation(id);
         const view = await conversation.context(context);
         const tokens = contextTokens(view);
-        const keep = this.#policy().keepRecentTokens;
+        const ref = (await app.agentState(id))?.model;
+        const keep = this.#policy(
+            ref === undefined ? undefined : { provider: ref.provider, id: ref.modelId },
+        ).keepRecentTokens;
         const compactions = (await app.harness.snapshot(LiveDoc, id, context))?.compactions ?? [];
         const failed = this.#failed.get(id);
 
@@ -564,12 +585,23 @@ export class PipCompaction {
         return true;
     }
 
-    /** Pi's compaction settings, over Pi Durable's defaults. */
-    #policy(): { keepRecentTokens: number; reserveTokens: number } {
-        return { ...DEFAULT_COMPACTION_POLICY, ...this.#app.settings.getCompactionSettings() };
-    }
+    /**
+     * Pi's compaction settings for PiP's model, over Pi Durable's defaults: its `compaction.modelOverrides` entry
+     * counts, and one that Pi refuses is passed over for the general values, as sessions do (`compaction.ts`).
+     */
+    #policy(model: { provider: string; id: string } | undefined): {
+        keepRecentTokens: number;
+        reserveTokens: number;
+    } {
+        const settings = this.#app.settings;
+        let own;
 
-    #reserveTokens(): number {
-        return this.#policy().reserveTokens;
+        try {
+            own = settings.getCompactionSettings(model);
+        } catch {
+            own = settings.getCompactionSettings();
+        }
+
+        return { ...DEFAULT_COMPACTION_POLICY, ...own };
     }
 }

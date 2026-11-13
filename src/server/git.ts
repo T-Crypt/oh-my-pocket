@@ -11,6 +11,8 @@ export type GitOptions = {
     allowExit?: number[];
     timeoutMs?: number;
     maxBuffer?: number;
+    /** Written to git's standard input, which is closed after it (for `--stdin` commands). */
+    input?: string;
 };
 
 /** A git command that failed, with what git said (or why it did not run) as its message. */
@@ -26,10 +28,10 @@ export class GitError extends Error {
 
 /** Run git in `cwd` and return what it printed. */
 export function git(cwd: string, args: string[], options: GitOptions = {}): Promise<string> {
-    const { allowExit = [], timeoutMs = 60_000, maxBuffer = 16 * 1024 * 1024 } = options;
+    const { allowExit = [], timeoutMs = 60_000, maxBuffer = 16 * 1024 * 1024, input } = options;
 
     return new Promise((resolve, reject) => {
-        execFile(
+        const child = execFile(
             "git",
             ["-c", "core.fsmonitor=false", ...args],
             {
@@ -53,5 +55,9 @@ export function git(cwd: string, args: string[], options: GitOptions = {}): Prom
                 }
             },
         );
+
+        if (input !== undefined) {
+            child.stdin?.end(input);
+        }
     });
 }

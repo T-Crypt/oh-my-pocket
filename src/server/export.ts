@@ -2,8 +2,9 @@
  * A session as one Markdown file: every message in order, who wrote it, and each tool call folded into a
  * `<details>` block, so it reads well on GitHub or in any Markdown viewer. Pi's thinking is left out.
  */
+import { presentationLine } from "./entry-presentation.ts";
+import { FROM_PREFIX, splitAttachments } from "./entry-format.ts";
 import type { ClientBlock, ClientEntry } from "./projection.ts";
-import { ATTACHMENTS_HEADING, FROM_PREFIX } from "./entry-format.ts";
 
 /** Tool output beyond this keeps its start and end. */
 const MAX_OUTPUT = 4000;
@@ -21,7 +22,12 @@ export type ExportInput = {
 
 /** A fenced code block that no backtick run inside `text` can close early. */
 export function fence(text: string, language = ""): string {
-    const longest = Math.max(2, ...[...text.matchAll(/`+/g)].map((run) => run[0].length));
+    let longest = 2;
+
+    for (const run of text.matchAll(/`+/g)) {
+        longest = Math.max(longest, run[0].length);
+    }
+
     const marks = "`".repeat(longest + 1);
 
     return `${marks}${language}\n${text.replace(/\n$/, "")}\n${marks}`;
@@ -36,6 +42,10 @@ function clipped(text: string): string {
 
     return `${text.slice(0, half)}\n… ${text.length - MAX_OUTPUT} characters left out …\n${text.slice(-half)}`;
 }
+
+/** Text for a `<summary>`, which is HTML. */
+const escapeSummary = (text: string) =>
+    text.replace(/[&<>]/g, (char) => `&#${char.charCodeAt(0)};`);
 
 /** One line naming a tool call, for its `<summary>`. HTML-escaped: summaries are HTML. */
 function summary(call: Extract<ClientBlock, { type: "toolCall" }>): string {
@@ -53,7 +63,7 @@ function summary(call: Extract<ClientBlock, { type: "toolCall" }>): string {
     const line = `${call.name}${subject === "" ? "" : `: ${subject.replace(/\s+/g, " ")}`}`;
     const short = line.length > 120 ? `${line.slice(0, 119)}…` : line;
 
-    return short.replace(/[&<>]/g, (char) => `&#${char.charCodeAt(0)};`);
+    return escapeSummary(short);
 }
 
 /** What a tool call did: its arguments as they matter to a reader, then its result. */
@@ -92,7 +102,7 @@ function userMarkdown(
     entry: Extract<ClientEntry, { kind: "user" }>,
     author: string | undefined,
 ): string {
-    const [written = "", files] = entry.text.split(ATTACHMENTS_HEADING);
+    const [written, files] = splitAttachments(entry.text);
     const body = written.replace(FROM_PREFIX, "").trim();
     const names = (files ?? "")
         .split("\n")
@@ -109,6 +119,20 @@ function userMarkdown(
     }
 
     return lines.join("\n");
+}
+
+/** A presented input: the label opens to the full message, which stays in the file. */
+function presentedMarkdown(
+    entry: Extract<ClientEntry, { kind: "user" }>,
+    author: string | undefined,
+): string {
+    const presentation = entry.presentation;
+    const summary =
+        presentation === undefined
+            ? "Input"
+            : presentationLine(presentation.label, presentation.summary);
+
+    return `<details><summary>${escapeSummary(summary)}</summary>\n\n${userMarkdown(entry, author)}\n\n</details>`;
 }
 
 export function transcriptMarkdown(input: ExportInput): string {
@@ -159,7 +183,11 @@ export function transcriptMarkdown(input: ExportInput): string {
         }
 
         if (entry.kind === "user") {
-            sections.push(userMarkdown(entry, input.authors[entry.id]));
+            sections.push(
+                entry.presentation === undefined
+                    ? userMarkdown(entry, input.authors[entry.id])
+                    : presentedMarkdown(entry, input.authors[entry.id]),
+            );
         } else if (entry.kind === "compaction") {
             sections.push(
                 `<details><summary>Context compacted</summary>\n\n${entry.summary}\n\n</details>`,
@@ -174,6 +202,10 @@ export function transcriptMarkdown(input: ExportInput): string {
             sections.push(`_${entry.name} ${entry.text}._`);
         } else if (entry.kind === "fromPi") {
             sections.push(`---\n\n_Continued from Pi in the terminal (${entry.file})._`);
+        } else if (entry.kind === "command") {
+            sections.push(
+                `**${entry.name}** ran \`/${entry.command}\` (not shown to Pi):\n\n${fence(entry.output)}`,
+            );
         } else if (entry.kind === "shell") {
             const fence = entry.output.includes("```") ? "````" : "```";
 

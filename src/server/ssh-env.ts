@@ -11,7 +11,7 @@ import { createWriteStream, type WriteStream } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { posix } from "node:path";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import {
     type BinaryReader,
     type DirReader,
@@ -32,7 +32,7 @@ import {
     StreamDecoder,
     type TextLine,
     type TextLineReader,
-    type WatchChange,
+    type FileChange,
     type WatchTarget,
 } from "@earendil-works/pi-durable/env";
 
@@ -1023,7 +1023,7 @@ export class SshExecutionEnv implements ExecutionEnv {
 
     async watch(
         _targets: readonly WatchTarget[],
-        _onChange: (change: WatchChange) => void,
+        _onChange: (change: FileChange) => void,
         _context: Context,
     ): Promise<Result<FileWatcher, FileError>> {
         return err(new FileError("not_supported", "A host over SSH cannot be watched."));

@@ -4,7 +4,7 @@
  * there, with each file's diff on request.
  */
 import { realpathSync } from "node:fs";
-import { lstat, rm } from "node:fs/promises";
+import { lstat, open, readlink, rm } from "node:fs/promises";
 import { devNull } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { type GitOptions, git as runGit } from "./git.ts";
@@ -17,7 +17,7 @@ export type ChangedFile = {
     /** Relative to the repository's top folder. */
     path: string;
     kind: ChangeKind;
-    /** Lines added and removed; absent for binary files and new ones. */
+    /** Lines added and removed; absent for binary files or when a count could not be read. */
     added?: number;
     removed?: number;
     /** Pi wrote or edited it in this session. */
@@ -44,6 +44,8 @@ export type Changes = {
 
 const MAX_FILES = 500;
 const MAX_DIFF = 300_000;
+/** Untracked files are counted again on every look, so a larger one keeps its count unknown. */
+const MAX_COUNTED_BYTES = 2_000_000;
 const GIT_TIMEOUT_MS = 15_000;
 
 /** Git for Changes: quick, with room for a long diff. */
@@ -51,11 +53,10 @@ const git = (cwd: string, args: string[], options: GitOptions = {}) =>
     runGit(cwd, args, { timeoutMs: GIT_TIMEOUT_MS, maxBuffer: MAX_DIFF * 4, ...options });
 /**
  * Diffs as the viewer reads them, whatever a person's git config says: no external diff program or text conversion, no
- * colors, git's usual `a/` and `b/` before the paths (`diff.mnemonicPrefix` and `diff.noprefix` change them), and
- * three unchanged lines around each change, so fewer after the last one say where the file ends (`web/diff.js`).
+ * colors, and git's usual `a/` and `b/` before the paths (`diff.mnemonicPrefix` and `diff.noprefix` change them).
+ * Patch requests also ask for three context lines (`web/diff.js`); counts must not request patch output.
  */
 const DIFF_FLAGS = [
-    "-U3",
     "--no-ext-diff",
     "--no-textconv",
     "--no-color",
@@ -106,8 +107,8 @@ function piEditPath(cwd: string, path: string, canonicalize: boolean): string {
 }
 
 /**
- * The files Pi wrote or edited, by absolute path, with the newest of its replies that did: its own calls, and the
- * ones its codemode scripts made, which their results list.
+ * The files Pi wrote or edited, by absolute path, with the newest of its replies that did: its own calls that did not
+ * fail, and the ones its codemode scripts made, which their results list.
  */
 function piEdits(
     entries: readonly ClientEntry[],
@@ -117,6 +118,12 @@ function piEdits(
     const edits = new Map<string, number>();
     /** The reply that made each tool call, by call id. */
     const callers = new Map<string, number>();
+    /** Calls whose results are errors: an edit that could not find its text changed nothing. */
+    const failed = new Set(
+        entries.flatMap((entry) =>
+            entry.kind === "toolResult" && entry.isError ? [entry.callId] : [],
+        ),
+    );
 
     for (const entry of entries) {
         if (entry.kind === "assistant") {
@@ -128,7 +135,12 @@ function piEdits(
                 callers.set(block.id, entry.id);
                 const path = block.args.path;
 
-                if (EDITORS.has(block.name) && typeof path === "string" && path !== "") {
+                if (
+                    EDITORS.has(block.name) &&
+                    !failed.has(block.id) &&
+                    typeof path === "string" &&
+                    path !== ""
+                ) {
                     edits.set(piEditPath(cwd, path, canonicalize), entry.id);
                 }
             }
@@ -159,6 +171,44 @@ function piEdits(
     }
 
     return edits;
+}
+
+/**
+ * The part of an entry that `piEdits` reads, or nothing when it reads none: what a session keeps of its history between
+ * looks (`workspace.ts`), so each look reads only the entries added since.
+ */
+export function editFacts(entry: ClientEntry): ClientEntry | undefined {
+    if (entry.kind === "assistant") {
+        const blocks = entry.blocks.flatMap((block) =>
+            block.type === "toolCall" && (EDITORS.has(block.name) || block.name === CODEMODE)
+                ? [{ ...block, args: { path: block.args.path } }]
+                : [],
+        );
+
+        return blocks.length === 0 ? undefined : { id: entry.id, kind: "assistant", blocks };
+    }
+
+    if (entry.kind === "toolResult" && (entry.isError || entry.name === CODEMODE)) {
+        const { id, kind, callId, name, isError } = entry;
+        const calls = (entry.details as { calls?: unknown } | undefined)?.calls;
+        const details = Array.isArray(calls)
+            ? {
+                  calls: (calls as unknown[]).flatMap((call) => {
+                      if (typeof call !== "object" || call === null) {
+                          return [];
+                      }
+
+                      const { name, status, path } = call as Record<string, unknown>;
+
+                      return [{ name, status, path }];
+                  }),
+              }
+            : undefined;
+
+        return { id, kind, callId, name, isError, text: "", details };
+    }
+
+    return undefined;
 }
 
 function kindOf(code: string): ChangeKind {
@@ -213,7 +263,8 @@ export function parseNumstat(output: string): Map<string, { added?: number; remo
     const counts = new Map<string, { added?: number; removed?: number }>();
 
     for (let at = 0; at < fields.length; at++) {
-        const [added = "", removed = "", path = ""] = fields[at]!.split("\t");
+        const [added = "", removed = "", ...parts] = fields[at]!.split("\t");
+        const path = parts.join("\t");
 
         if (added === "") {
             continue;
@@ -241,6 +292,171 @@ async function versionOf(file: string): Promise<string | undefined> {
     } catch {
         return undefined;
     }
+}
+
+/** Counts of new files already read, by repository and path, kept while the file's size and time stay the same. */
+const newCounts = new Map<
+    string,
+    { version: string; counts: { added: number; removed: number } | null }
+>();
+/** How many new files' counts are kept: the oldest go first. */
+const NEW_COUNTS_KEPT = 5000;
+/** Git reads this much of a file to tell text from binary: a NUL byte in it makes the file binary. */
+const BINARY_PROBE = 8000;
+
+/**
+ * Lines added by each new file, as `git diff --no-index --numstat /dev/null <file>` counts them, without starting git
+ * per file: every line, a last one without its newline included; none for an empty file; no counts for a binary file
+ * (a NUL byte in its first 8000 bytes, or the `binary` attribute, or `-diff`); a symlink is the one line of its target.
+ * Files larger than `MAX_COUNTED_BYTES`, and anything that is not a file or a symlink, keep their counts unknown. A
+ * file is read again only when its size or time changes; attributes are asked of git once per look, for the files
+ * read in it.
+ */
+async function newFileCounts(
+    root: string,
+    paths: readonly string[],
+): Promise<Map<string, { added: number; removed: number }>> {
+    const result = new Map<string, { added: number; removed: number }>();
+    const toRead: { path: string; key: string; version: string; size: number; link: boolean }[] =
+        [];
+
+    await Promise.all(
+        paths.map(async (path) => {
+            try {
+                const info = await lstat(join(root, path));
+                const link = info.isSymbolicLink();
+
+                if ((!info.isFile() && !link) || info.size > MAX_COUNTED_BYTES) {
+                    return;
+                }
+
+                const key = `${root}\0${path}`;
+                const version = `${info.size}:${info.mtimeMs}:${info.ino}`;
+                const known = newCounts.get(key);
+
+                if (known?.version === version) {
+                    if (known.counts !== null) {
+                        result.set(path, known.counts);
+                    }
+
+                    return;
+                }
+
+                toRead.push({ path, key, version, size: info.size, link });
+            } catch {
+                // Gone or unreadable since status: its count stays unknown.
+            }
+        }),
+    );
+
+    if (toRead.length === 0) {
+        return result;
+    }
+
+    const binaryByAttribute = await binaryAttributes(
+        root,
+        toRead.map(({ path }) => path),
+    );
+
+    await Promise.all(
+        toRead.map(async ({ path, key, version, link }) => {
+            let counts: { added: number; removed: number } | null;
+
+            try {
+                if (link) {
+                    counts =
+                        (await readlink(join(root, path))) === ""
+                            ? { added: 0, removed: 0 }
+                            : { added: 1, removed: 0 };
+                } else if (binaryByAttribute.get(path) === true) {
+                    counts = null;
+                } else {
+                    counts = await countLines(
+                        join(root, path),
+                        binaryByAttribute.get(path) === false,
+                    );
+                }
+            } catch {
+                return;
+            }
+
+            newCounts.delete(key);
+            newCounts.set(key, { version, counts });
+
+            if (newCounts.size > NEW_COUNTS_KEPT) {
+                newCounts.delete(newCounts.keys().next().value!);
+            }
+
+            if (counts !== null) {
+                result.set(path, counts);
+            }
+        }),
+    );
+
+    return result;
+}
+
+/** A file's lines, or null when it is binary (a NUL in its first 8000 bytes, unless `text` says it is text). */
+async function countLines(
+    file: string,
+    text: boolean,
+): Promise<{ added: number; removed: number } | null> {
+    const handle = await open(file, "r");
+
+    try {
+        const content = await handle.readFile();
+
+        if (!text && content.subarray(0, BINARY_PROBE).includes(0)) {
+            return null;
+        }
+
+        let lines = 0;
+
+        for (let at = content.indexOf(10); at !== -1; at = content.indexOf(10, at + 1)) {
+            lines++;
+        }
+
+        if (content.length > 0 && content[content.length - 1] !== 10) {
+            lines++;
+        }
+
+        return { added: lines, removed: 0 };
+    } finally {
+        await handle.close();
+    }
+}
+
+/**
+ * What a repository's attributes say about diffing each path: true when it is binary to diff (`binary`, or `-diff`),
+ * false when `diff` is set (text, whatever its bytes), absent when they leave it to the content. One git command for
+ * all of them; when it fails, the content decides.
+ */
+async function binaryAttributes(
+    root: string,
+    paths: readonly string[],
+): Promise<Map<string, boolean>> {
+    const said = new Map<string, boolean>();
+
+    try {
+        const out = await git(root, ["check-attr", "-z", "--stdin", "binary", "diff"], {
+            input: paths.join("\0") + "\0",
+        });
+        const fields = out.split("\0");
+
+        for (let at = 0; at + 2 < fields.length; at += 3) {
+            const [path, name, value] = [fields[at]!, fields[at + 1], fields[at + 2]];
+
+            if ((name === "binary" && value === "set") || (name === "diff" && value === "unset")) {
+                said.set(path, true);
+            } else if (name === "diff" && value === "set" && said.get(path) !== true) {
+                said.set(path, false);
+            }
+        }
+    } catch {
+        // No answer: the content decides.
+    }
+
+    return said;
 }
 
 /** Where a folder is in its repository, as git writes paths: `app/` for the folder app, empty at the top. */
@@ -287,9 +503,21 @@ export async function changesIn(
     const status = changed.slice(0, MAX_FILES);
     // Without a first commit there is nothing to compare with: every file is new.
     const counts =
-        branch === undefined
+        head === undefined
             ? new Map()
             : parseNumstat(await git(root, ["diff", "HEAD", "--numstat", "-z", ...DIFF_FLAGS]));
+
+    // HEAD diffs omit untracked files: they are counted here, in this process (`newFileCounts`), not with a git
+    // command per file. A refresh while Pi works used to start one git process for every untracked file, each a
+    // fork of this whole server on its main thread.
+    const uncounted = status
+        .filter(({ code }) => code === "??" || head === undefined)
+        .map(({ path }) => path);
+
+    for (const [path, added] of await newFileCounts(root, uncounted)) {
+        counts.set(path, added);
+    }
+
     const versions = await Promise.all(status.map(({ path }) => versionOf(join(root, path))));
     const files = status.map(({ code, path }, index): ChangedFile => {
         const version = versions[index];
@@ -343,10 +571,10 @@ export async function diffOf(cwd: string, path: string, onlyHere = false): Promi
     const paths = change.from === undefined ? [path] : [change.from, path];
     const diff =
         change.code === "??" || !hasHead
-            ? await git(root, ["diff", "--no-index", ...DIFF_FLAGS, "--", devNull, path], {
+            ? await git(root, ["diff", "--no-index", "-U3", ...DIFF_FLAGS, "--", devNull, path], {
                   allowExit: [1],
               })
-            : await git(root, ["diff", "HEAD", "-M", ...DIFF_FLAGS, "--", ...paths]);
+            : await git(root, ["diff", "HEAD", "-M", "-U3", ...DIFF_FLAGS, "--", ...paths]);
 
     return diff.length > MAX_DIFF
         ? `${diff.slice(0, MAX_DIFF)}\n… the rest of the diff is left out …\n`

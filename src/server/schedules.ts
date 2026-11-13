@@ -3,13 +3,15 @@
  * its message, and for a repeat goes back to sleep until the next time. A restart while it sleeps continues the
  * sleep, and one that comes after the time sends at once. Each sending has its own request id, so a restart in the
  * middle of one never sends twice. A schedule goes out only while its person may still steer the session and no
- * spend limit is reached; otherwise it is cancelled, with a line in the chat saying why. One in PiP's conversation
+ * spend limit is reached; otherwise it is cancelled, with a line in the chat saying why. A repeat whose last message
+ * still waits in the session's queue sends no other: that time is skipped, counted on the schedule, and said in the
+ * chat, so messages do not pile up behind a session that cannot answer. One in PiP's conversation
  * waits while PiP is turned off, and goes out once it is back. The schedules extension
  * (`extensions/schedules.ts`) installs the task and gives Pi a tool to schedule its own follow-ups; while it is off,
  * nothing goes out.
  */
 import { randomUUID } from "node:crypto";
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
     type ConversationId,
@@ -19,7 +21,7 @@ import {
 } from "@earendil-works/pi-durable";
 import type { PocketApp } from "./app.ts";
 import { addActivity } from "./collab.ts";
-import { ChatDoc, type Schedule, ScheduleDoc } from "./docs.ts";
+import { ChatDoc, type ChatMessage, type Schedule, ScheduleDoc } from "./docs.ts";
 import { describe, HttpError } from "./errors.ts";
 import { FROM_PREFIX } from "./entry-format.ts";
 import { snippet } from "./projection.ts";
@@ -32,8 +34,25 @@ const context = BACKGROUND_CONTEXT;
 export const SCHEDULED_PREFIX = "[scheduled] ";
 /** The extension that runs schedules; while it is off, none go out and none can be set up. */
 export const SCHEDULES_EXTENSION = "pocket-schedules";
-const MAX_SCHEDULES = 50;
-const MAX_TEXT = 4000;
+
+/** What bounds scheduled messages; the schedules extension sets them from the owner's settings. */
+export type ScheduleLimits = {
+    /** How many schedules a session can have. */
+    perSession: number;
+    /** The longest message, in characters. */
+    chars: number;
+    /** The shortest time between two sendings of a repeat, in minutes: a runaway loop of model calls costs money. */
+    repeatMinutes: number;
+    /** How far ahead a one-time message may go, in days. */
+    aheadDays: number;
+};
+
+export const DEFAULT_SCHEDULE_LIMITS: Readonly<ScheduleLimits> = {
+    perSession: 50,
+    chars: 4000,
+    repeatMinutes: 10,
+    aheadDays: 366,
+};
 
 type ScheduleInput = { scheduleId: string };
 type ScheduleState = { phase: "wait" } | { phase: "send" };
@@ -51,6 +70,51 @@ async function stored(
 }
 
 const finished = { status: "terminal", outcome: { status: "completed", result: null } } as const;
+
+/** Who the chat names for a skipped time: no person did it. */
+const SCHEDULER = { id: "pi", name: "Schedules" };
+
+/**
+ * Say in the chat that a schedule skipped a time. Times are 10 minutes apart at least, so a session that cannot take
+ * its messages for hours would get a line for each: while nothing else is said, the last line counts them instead.
+ */
+function sayWhatWasSkipped(chat: { messages: ChatMessage[] }, text: string, now: number): void {
+    const what = `skipped “${snippet(text, 60)}”`;
+    const why = "its last message still waits in the queue.";
+    const last = chat.messages.at(-1);
+    const times = /^skipped “.*” (\d+) times:/s.exec(last?.text ?? "");
+
+    if (
+        last?.kind === "event" &&
+        last.userId === SCHEDULER.id &&
+        last.name === SCHEDULER.name &&
+        last.text.startsWith(`${what}`) &&
+        last.text.endsWith(why)
+    ) {
+        const count = (times === null ? 1 : Number(times[1])) + 1;
+
+        last.text = `${what} ${count} times: ${why}`;
+        last.at = now;
+
+        return;
+    }
+
+    addActivity(chat, SCHEDULER, `${what}: ${why}`, now);
+}
+
+/**
+ * The request id of a schedule's sending number `run`. Sent as the person who set it up, so it shows as theirs. Pi's own
+ * are sent as Pi's, but as the work of whom Pi worked for when it set them up.
+ */
+function sendingRequest(schedule: Schedule, run: number): string {
+    const sending = `${String(schedule.taskId)}-${run}`;
+
+    return schedule.by !== undefined
+        ? ownRequest(schedule.by, `schedule-${sending}`)
+        : schedule.requestedBy !== undefined
+          ? requestFor(schedule.requestedBy, `schedule-${sending}`)
+          : `schedule:${sending}`;
+}
 
 export type ScheduleRequest = {
     /** When it goes out (`in 30m`, `every weekday 8:00`, …), followed by the message unless `text` is given. */
@@ -70,6 +134,8 @@ export class Schedules {
     readonly #app: PocketApp;
     /** How long a schedule of PiP's waits before it looks again whether PiP is back. */
     holdMs = 60_000;
+    /** The limits in force; the schedules extension changes them when the owner does. */
+    readonly limits: ScheduleLimits = { ...DEFAULT_SCHEDULE_LIMITS };
     /** The durable task behind each schedule; the schedules extension installs it. */
     readonly task: Task<ScheduleInput, ScheduleState, null, object>;
 
@@ -87,11 +153,7 @@ export class Schedules {
                         return runtime.commit(() => finished, context);
                     }
 
-                    await runtime.sleep(schedule.next, context);
-                    await runtime.commit(
-                        () => ({ status: "running", checkpoint: { phase: "send" } }),
-                        context,
-                    );
+                    return runtime.sleepUntil(schedule.next, { phase: "send" }, context);
                 },
                 send: (task, runtime, context) =>
                     this.#send(task.input.scheduleId, runtime, context),
@@ -133,16 +195,19 @@ export class Schedules {
             }, context);
         }
 
-        // Sent as the person who set it up, so it shows as theirs. Pi's own are sent as Pi's, but as the work of whom Pi
-        // worked for when it set them up.
-        const sending = `${String(schedule.taskId)}-${schedule.runs}`;
-        const requestId =
-            schedule.by !== undefined
-                ? ownRequest(schedule.by, `schedule-${sending}`)
-                : schedule.requestedBy !== undefined
-                  ? requestFor(schedule.requestedBy, `schedule-${sending}`)
-                  : `schedule:${sending}`;
+        const requestId = sendingRequest(schedule, schedule.runs);
         const stopped = this.#stopped(conversationId, schedule);
+        // Its last message, not yet in the transcript: the session has not taken it, so another would only wait too.
+        const waiting =
+            stopped === undefined &&
+            schedule.runs > 0 &&
+            (await this.#queued(runtime, sendingRequest(schedule, schedule.runs - 1), context)) &&
+            // Run again after a crash, this phase may find its own message sent already: that one counts as sent.
+            !(await this.#queued(runtime, requestId, context, true));
+
+        if (waiting) {
+            return this.#skip(id, runtime, context);
+        }
 
         if (stopped === undefined) {
             await conversation.submit(
@@ -187,6 +252,56 @@ export class Schedules {
 
             return { status: "running", checkpoint: { phase: "wait" } };
         }, context);
+    }
+
+    /**
+     * Whether the message sent with `requestId` waits in the conversation's queue, not yet taken into a run. `any`: whether
+     * it was sent at all, in any state.
+     */
+    async #queued(
+        runtime: Runtime,
+        requestId: string,
+        context: Context,
+        any = false,
+    ): Promise<boolean> {
+        const conversationId = runtime.conversationId;
+        const record = await this.#app.harness.commit(
+            (tx) => tx.submissionByRequest(conversationId, requestId),
+            context,
+        );
+
+        return record !== undefined && (any || record.status === "queued");
+    }
+
+    /**
+     * Skip this time of a repeat whose last message still waits in the queue: count it on the schedule, say so in the
+     * chat (one line, updated while the skips go on), and wait for the next time. `runs` stays, so the message that
+     * waits keeps its request id and the next check finds it.
+     */
+    async #skip(id: string, runtime: Runtime, context: Context): Promise<void> {
+        const conversationId = runtime.conversationId;
+
+        await runtime.commit(async (tx) => {
+            const doc = await tx.doc(ScheduleDoc, conversationId);
+            const item = doc.items[id];
+
+            if (item === undefined) {
+                return finished;
+            }
+
+            const now = runtime.now();
+
+            item.skipped = (item.skipped ?? 0) + 1;
+            item.skippedAt = now;
+            // A one-time message has no next time; it never has a message of its own waiting either.
+            item.next = item.every === undefined ? now : nextRepeat(item.every, now, item.zone);
+            sayWhatWasSkipped(await tx.doc(ChatDoc, conversationId), item.text, now);
+
+            return { status: "running", checkpoint: { phase: "wait" } };
+        }, context);
+        this.#app.log(
+            `Schedule ${id} in session ${String(conversationId)} skipped a time: its last message still waits in the queue.`,
+        );
     }
 
     /** Whether a conversation is a PiP whose person cannot have it now (its extension is off). */
@@ -245,6 +360,11 @@ export class Schedules {
         return why === undefined ? undefined : { who, why };
     }
 
+    /** Why a schedule would not go out now, were it its time: a spend limit, or nobody left to steer. */
+    held(conversationId: ConversationId, schedule: Schedule): string | undefined {
+        return this.#stopped(conversationId, schedule)?.why;
+    }
+
     /** Whether schedules run now: their extension is on. */
     get running(): boolean {
         return this.#app.loader.extensionNames().includes(SCHEDULES_EXTENSION);
@@ -263,11 +383,15 @@ export class Schedules {
             throw new HttpError(400, "Only sessions can have scheduled messages.");
         }
 
+        const limits = this.limits;
         const zone = request.zone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
         let parsed: ReturnType<typeof parseWhen>;
 
         try {
-            parsed = parseWhen(request.when, app.now(), zone);
+            parsed = parseWhen(request.when, app.now(), zone, {
+                repeatMinutes: limits.repeatMinutes,
+                aheadMs: limits.aheadDays * 24 * 60 * 60_000,
+            });
         } catch (error) {
             throw new HttpError(400, describe(error));
         }
@@ -285,8 +409,11 @@ export class Schedules {
             throw new HttpError(400, "Say what Pi should get, after when.");
         }
 
-        if (text.length > MAX_TEXT) {
-            throw new HttpError(413, `Scheduled messages are limited to ${MAX_TEXT} characters.`);
+        if (text.length > limits.chars) {
+            throw new HttpError(
+                413,
+                `Scheduled messages are limited to ${limits.chars} characters.`,
+            );
         }
 
         const by = request.by;
@@ -306,10 +433,10 @@ export class Schedules {
                 return JSON.parse(JSON.stringify(same)) as Schedule;
             }
 
-            if (Object.keys(doc.items).length >= MAX_SCHEDULES) {
+            if (Object.keys(doc.items).length >= limits.perSession) {
                 throw new HttpError(
                     409,
-                    `A session can have ${MAX_SCHEDULES} scheduled messages at most.`,
+                    `A session can have ${limits.perSession} scheduled messages at most.`,
                 );
             }
 

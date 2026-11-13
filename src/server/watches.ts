@@ -10,7 +10,7 @@
  * or closed, when there is more to tell than it may send, after two weeks with nothing new, after an hour of failed
  * looks, or when someone stops it. The triggers extension (`extensions/triggers.ts`) installs the task and Pi's tool.
  */
-import type { Context } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
     type ConversationId,
@@ -263,11 +263,7 @@ export class Watches {
                         return runtime.commit(() => finished, context);
                     }
 
-                    await runtime.sleep(watch.next, context);
-                    await runtime.commit(
-                        () => ({ status: "running", checkpoint: { phase: "look" } }),
-                        context,
-                    );
+                    return runtime.sleepUntil(watch.next, { phase: "look" }, context);
                 },
                 look: (_task, runtime, context) => this.#look(runtime, context),
                 send: (task, runtime, context) => {
@@ -330,6 +326,14 @@ export class Watches {
 
         if (meta === undefined || meta.pip !== undefined) {
             throw new HttpError(400, "Only sessions can watch a pull request.");
+        }
+
+        // gh finds the PR through the session's folder: a workspace URI is not a folder here.
+        if (app.workspaceScheme(app.cwdOf(asking)) !== undefined) {
+            throw new HttpError(
+                400,
+                "Pull request watches are not available for remote workspaces.",
+            );
         }
 
         const person = app.config.userById(personId ?? meta.createdBy ?? "");
@@ -415,6 +419,13 @@ export class Watches {
             ) as typeof found;
         } catch (error) {
             const said = describe(error);
+
+            if (/no git remotes? found/i.test(said)) {
+                throw new HttpError(
+                    404,
+                    "This folder has no git remote, so it has no pull request to watch. Add its GitHub repository with git remote add origin <address>, then try again.",
+                );
+            }
 
             throw new HttpError(
                 404,

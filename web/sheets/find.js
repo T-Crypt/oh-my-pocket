@@ -1,19 +1,26 @@
 // Find in session: messages, commands, and files, through the whole history.
 import { useEffect, useRef, useState } from "preact/hooks";
 import { jumpToEntry } from "../chat.js";
-import { actions, closeSheet, isRow, store } from "../store.js";
-import { html, Marked, plainText, Sheet, Spinner, writtenText } from "../ui.js";
+import { actions, closeSheet, isRow, loadEarlier, store } from "../store.js";
+import { html, Icon, Marked, plainText, Sheet, Spinner, writtenText } from "../ui.js";
+import { userSearchText } from "../user-search.js";
 
 /** How many entries a page of earlier history has (`app.history` on the server), and how many pages find reads. */
 const HISTORY_PAGE = 400;
 
 const FIND_PAGES = 25;
 
-/** What an entry says, to find text in: messages, Pi's calls' paths and commands, commands people ran, notes. */
-function searchText(entry) {
+/** Presented inputs a view clips, at most this many: Find reads their whole text once each. */
+const FULL_READS = 50;
+
+/**
+ * What an entry says, to find text in: messages, Pi's calls' paths and commands, commands people ran, notes. `whole`
+ * is the full text of a presented input the view clipped, once read.
+ */
+function searchText(entry, whole) {
     switch (entry.kind) {
         case "user":
-            return writtenText(entry);
+            return userSearchText(entry.presentation, whole ?? writtenText(entry));
         case "assistant":
             return entry.blocks
                 .map((block) =>
@@ -28,6 +35,7 @@ function searchText(entry) {
                 .filter(Boolean)
                 .join("\n");
         case "shell":
+        case "command":
             return `${entry.command}\n${entry.output}`;
         case "note":
             return `${entry.name} ${entry.text}`;
@@ -48,12 +56,17 @@ function speaker(entry) {
         return "Pi";
     }
 
-    if (entry.kind === "shell" || entry.kind === "note") {
+    if (entry.kind === "shell" || entry.kind === "command" || entry.kind === "note") {
         return entry.name;
     }
 
     if (entry.kind !== "user") {
         return "Context";
+    }
+
+    // An input an extension presents: nobody typed it, so its label says what it is.
+    if (entry.presentation !== undefined) {
+        return entry.presentation.label;
     }
 
     const userId = view.authors?.[entry.id];
@@ -76,18 +89,28 @@ export function FindSheet({ initial }) {
     // History before a compaction or a new context, page by page, oldest first; `done` once all of it (or as much as
     // is searched) is here.
     const [earlier, setEarlier] = useState({ entries: [], done: false, all: true });
+    // The whole text of presented inputs the view clipped, by entry id: the view has only their start and end.
+    const [wholes, setWholes] = useState(() => new Map());
     const box = useRef(null);
-    const first = view.order.length > 0 ? view.entries.get(view.order[0]) : undefined;
 
     useEffect(() => box.current?.focus(), []);
     useEffect(() => {
-        if (!first || (first.kind !== "compaction" && first.kind !== "reset")) {
-            return setEarlier({ entries: [], done: true, all: true });
-        }
-
         let live = true;
 
         (async () => {
+            // The rest of the active context first: a view brings only its newest entries.
+            await loadEarlier();
+            const { view: now } = store.state;
+            const first = now.order.length > 0 ? now.entries.get(now.order[0]) : undefined;
+
+            if (!live) {
+                return;
+            }
+
+            if (!first || (first.kind !== "compaction" && first.kind !== "reset")) {
+                return setEarlier({ entries: [], done: true, all: true });
+            }
+
             let entries = [];
             let before = first.id;
 
@@ -117,6 +140,35 @@ export function FindSheet({ initial }) {
             live = false;
         };
     }, []);
+
+    const allClipped = [...earlier.entries, ...view.order.map((id) => view.entries.get(id))]
+        .filter((entry) => entry?.kind === "user" && entry.presentation?.clipped !== undefined)
+        .map((entry) => entry.id);
+    const clipped = allClipped.slice(-FULL_READS);
+    const clippedKey = clipped.join(",");
+
+    useEffect(() => {
+        let live = true;
+        const missing = clipped.filter((id) => !wholes.has(id));
+
+        (async () => {
+            for (const id of missing) {
+                const full = await actions.fullEntry(id).catch(() => undefined);
+
+                if (!live) {
+                    return;
+                }
+
+                if (full?.kind === "user") {
+                    setWholes((current) => new Map(current).set(id, writtenText(full)));
+                }
+            }
+        })();
+
+        return () => {
+            live = false;
+        };
+    }, [clippedKey]);
 
     /**
      * Jump to a result. One in earlier history first shows that history from a little before it, and the transcript
@@ -149,16 +201,27 @@ export function FindSheet({ initial }) {
         ].filter((entry) => entry && isRow(entry));
 
         for (let index = entries.length - 1; index >= 0 && results.length < 100; index--) {
-            const text = searchText(entries[index]).replace(/\s+/g, " ");
+            const text = searchText(entries[index], wholes.get(entries[index].id)).replace(
+                /\s+/g,
+                " ",
+            );
             const at = text.toLowerCase().indexOf(needle);
 
             if (at === -1) {
                 continue;
             }
 
-            const start = Math.max(0, at - 50);
-            const snippet = `${start > 0 ? "…" : ""}${text.slice(start, at + needle.length + 90)}`;
-            const from = at - start + (start > 0 ? 1 : 0);
+            // A presented input's label is its speaker, and its summary is the line it shows: its words start after
+            // them, unless one of them is what matched.
+            const presentation = entries[index].presentation;
+            const head =
+                presentation === undefined
+                    ? ""
+                    : userSearchText(presentation, "").replace(/\s+/g, " ");
+            const first = head !== "" && at > head.length ? head.length + 1 : 0;
+            const start = Math.max(first, at - 50);
+            const snippet = `${start > first ? "…" : ""}${text.slice(start, at + needle.length + 90)}`;
+            const from = at - start + (start > first ? 1 : 0);
 
             results.push({
                 entry: entries[index],
@@ -183,18 +246,28 @@ export function FindSheet({ initial }) {
     };
 
     return html`<${Sheet} title="Find in session" onClose=${closeSheet}>
-        <input
-            class="find-input"
-            ref=${box}
-            type="search"
-            placeholder="Words in a message, a command, a file…"
-            value=${query}
-            onInput=${(event) => {
-                setQuery(event.currentTarget.value);
-                setPick(0);
-            }}
-            onKeyDown=${onKey}
-        />
+        <label class="search find-search">
+            <${Icon} name="search" size=${16} />
+            <input
+                class="find-input"
+                ref=${box}
+                type="search"
+                aria-label="Find in session"
+                placeholder="Words in a message, a command, a file…"
+                value=${query}
+                onInput=${(event) => {
+                    setQuery(event.currentTarget.value);
+                    setPick(0);
+                }}
+                onKeyDown=${onKey}
+            />
+            ${
+                needle &&
+                html`<span class="find-count mono" role="status">
+                    ${results.length}
+                </span>`
+            }
+        </label>
         ${
             needle !== "" &&
             results.length === 0 &&
@@ -210,6 +283,12 @@ export function FindSheet({ initial }) {
             !earlier.all &&
             html`<p class="muted small">
                 The oldest history was not searched: only the newest ${earlier.entries.length} earlier entries.
+            </p>`
+        }
+        ${
+            allClipped.length > FULL_READS &&
+            html`<p class="muted small">
+                Only the newest ${FULL_READS} long inputs were searched in full. Older ones were searched by their start and end.
             </p>`
         }
         ${results.length === 100 && html`<p class="muted small">The newest 100 are listed.</p>`}

@@ -3,7 +3,7 @@
  * one kept SSH connection, instead of Pi typing `ssh host '…'` into bash. With no hosts set up, the tools are as they
  * were. A host in `ask` mode waits for a person to allow each call, as Lancet Guard's questions do.
  */
-import { Type } from "@earendil-works/pi-ai";
+import { str } from "@earendil-works/pi-schema";
 import {
     defineExtension,
     hook,
@@ -155,15 +155,11 @@ export default function createHosts(host: PocketHost) {
                 return {
                     ...tool,
                     description: `${tool.description} Pass host to do it on another machine.`,
-                    parameters: Type.Object(
-                        {
-                            ...(parameters.properties as Record<string, never>),
-                            host: Type.Optional(Type.String({ description })),
-                        },
-                        parameters.additionalProperties === undefined
-                            ? {}
-                            : { additionalProperties: parameters.additionalProperties },
-                    ) as unknown as typeof tool.parameters,
+                    // pi-schema schemas are JSON Schema: the tool's own, with an optional `host` beside its properties.
+                    parameters: {
+                        ...parameters,
+                        properties: { ...parameters.properties, host: str({ description }) },
+                    } as unknown as typeof tool.parameters,
                     // The tools inside see their own arguments, repaired their own way; `host` goes around them.
                     prepareArguments: (args: unknown) => {
                         if (typeof args !== "object" || args === null || Array.isArray(args)) {

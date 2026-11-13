@@ -13,6 +13,7 @@ import {
     root,
     scriptedModel,
     until,
+    offerSubagents,
 } from "./helpers.ts";
 import assert from "node:assert/strict";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -70,6 +71,7 @@ before(async () => {
     // On another provider, as a local role is to a cloud session.
     writeFileSync(join(folder, "far.md"), "---\nmodel: elsewhere/big\n---\nYou are far.\n");
     app = await openApp(scriptedModel(route), dataDir);
+    offerSubagents(app);
 });
 
 after(async () => {

@@ -371,19 +371,26 @@ test(
             }
 
             // The words that go still name their figures for a screen reader, and the guard, down to its shield,
-            // still takes a thumb. The baseline button stands between the context and the cache.
+            // still takes a thumb.
             if (width === 390) {
                 assert.equal(
                     await inPage<string>(
                         `return JSON.stringify(document.querySelector(".status-line").innerText.replace(/\\s+/g, " ").trim())`,
                     ),
-                    "87 tok/s first token 1.2s context 77% baseline cache 83% $12.34 on",
+                    "87 tok/s first token 1.2s context 77% cache 83% $12.34 on",
                 );
                 const guard = await inPage<{ w: number; h: number; label: string }>(`
                     const guard = document.querySelector(".status-line .guard");
                     const box = guard.getBoundingClientRect();
+                    // The pill stays small; an invisible layer past it (::after, negative inset) takes the tap.
+                    const after = getComputedStyle(guard, "::after");
+                    const grow = (side) => Math.max(0, -parseFloat(after[side]) || 0);
 
-                    return JSON.stringify({ w: box.width, h: box.height, label: guard.getAttribute("aria-label") });
+                    return JSON.stringify({
+                        w: box.width + grow("left") + grow("right"),
+                        h: box.height + grow("top") + grow("bottom"),
+                        label: guard.getAttribute("aria-label"),
+                    });
                 `);
 
                 assert.ok(
@@ -408,7 +415,7 @@ test(
 
         assert.ok(crowded.shown.includes("here"), `three here shows: ${crowded.shown}`);
         assert.ok(
-            crowded.shown.some((each) => each.startsWith("$12.34/$50.00")),
+            crowded.shown.some((each) => each.replace(/\s+/g, "").startsWith("$12.34/$50.00")),
             `the limit shows: ${crowded.shown}`,
         );
 
@@ -431,7 +438,7 @@ test(
         assert.equal(wide.short, "", `wide, the line is whole: ${JSON.stringify(wide)}`);
         assert.match(
             await lineShown(),
-            /^1 here 87 tokens\/s first token 1\.2s context 77% baseline cache 83% \$12\.34 guard on$/,
+            /^1 here 87 tokens\/s first token 1\.2s context 77% cache 83% \$12\.34 guard on$/,
         );
 
         // Narrowed and widened again on the same page, without a reload: it shortens, then is whole again.
@@ -452,9 +459,8 @@ test(
         await everything();
         const before = await oneRow("one row with the speed off");
 
-        // Without the speed, an iPhone's width takes shorter forms for the baseline button's room: tighter gaps and
-        // no "1 here" while alone. The line stays on one row with everything else showing.
-        assert.equal(before.short, "words here", `shorter forms: ${JSON.stringify(before)}`);
+        // Without the speed, an iPhone's width holds the whole line: no shorter forms.
+        assert.equal(before.short, "", `whole forms: ${JSON.stringify(before)}`);
 
         await flipSwitch();
         await page.evaluate(`(await import("/store.js")).closeSheet()`);
@@ -466,8 +472,8 @@ test(
         await page.evaluate(`(await import("/store.js")).closeSheet()`);
         await settle();
         await until(async () => (await speedShown()) === null, "the speed gone");
-        // Back to the speed-off form: the baseline button's room, as above.
-        await until(async () => (await line()).short === "words here", "whole again");
+        // Back to the speed-off form, whole as above.
+        await until(async () => (await line()).short === "", "whole again");
     },
 );
 
