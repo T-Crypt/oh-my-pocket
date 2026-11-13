@@ -573,6 +573,7 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "prompt.ts",
             "artifacts.ts",
             "browser.ts",
+            "diagrams.ts",
             "subagents.ts",
             "routers.ts",
             "agent-teams.ts",
@@ -590,7 +591,6 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "loop-guard.ts",
             "pruner.ts",
             "tool-repair.ts",
-            "lean-prompt.ts",
             "bash-timeout.ts",
             "quiet-shell.ts",
             "read-first.ts",
@@ -599,9 +599,11 @@ test("the owner turns extensions off and on, the guard follows its switch, and t
             "today.ts",
             "gallery.ts",
             "session-tags.ts",
+            "ask.ts",
             "ask-someone.ts",
             "updates.ts",
             "design.ts",
+            "tool-search.ts",
         ],
     );
     assert.equal(module("browser.ts").title, "Browser");

@@ -359,7 +359,12 @@ test("a spawn's skills go into the subagent's prompt after its definition's word
         seen.s1!.prompt,
         /Build\.[\s\S]*read each of these skills in full[\s\S]*- checklist: .*checklist[\\/]+SKILL\.md/,
     );
-    assert.equal(seen.s1!.prompt.match(/- checklist: /g)?.length, 1, "named twice, read once");
+    // The system prompt's compact skills list names it too; the list to read in full gives its file, once.
+    assert.equal(
+        seen.s1!.prompt.match(/- checklist: .*checklist[\\/]+SKILL\.md/g)?.length,
+        1,
+        "named twice, read once",
+    );
 
     assert.match(
         await go(id, "subagent", { action: "spawn", name: "s2", message: "x", skills: ["nope"] }),

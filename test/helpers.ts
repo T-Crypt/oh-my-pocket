@@ -151,20 +151,10 @@ export async function loadTools(app: App, id: ConversationId, ...names: string[]
 }
 
 /**
- * Offer `subagent` in each session that `app` starts from now on, as if Pi had loaded it: it waits for tool search
- * (`tool-search.ts`), and the scripted Pi of these tests calls it at once.
+ * Upstream's tests call this to load `subagent` through tool search. Here `subagent` never waits (router sessions spawn
+ * their stages at once, `tool-search.ts`), so there is nothing to load; kept so those tests read as upstream wrote them.
  */
-export function offerSubagents(app: App): void {
-    const create = app.commands.createSession.bind(app.commands);
-
-    app.commands.createSession = async (...args: Parameters<typeof create>) => {
-        const created = await create(...args);
-
-        await loadTools(app, created.id, "subagent");
-
-        return created;
-    };
-}
+export function offerSubagents(_app: App): void {}
 
 /** Send a message as the owner and wait for Pi's answer. */
 export async function say(

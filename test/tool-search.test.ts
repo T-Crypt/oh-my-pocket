@@ -16,23 +16,14 @@ import { after, before, test } from "node:test";
 import type { FauxResponseStep } from "@earendil-works/pi-ai";
 import { fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
 import type { ConversationId } from "@earendil-works/pi-durable";
-import { findBrowser } from "../src/server/browser/discovery.ts";
 import { SubagentsDoc } from "../src/server/docs.ts";
 
 let app: App;
 /** The sections of the newest request, by name: every system message adds the ones that changed since the last. */
 let sections: Record<string, string> = {};
-let resultParts: string[] = [];
 
 const route: FauxResponseStep = (request) => {
     const { role, text } = lastText(request as never);
-    const last = (request.messages as { role: string; content?: { type: string }[] }[]).findLast(
-        (message) => message.role !== "system",
-    );
-
-    if (last?.role === "toolResult") {
-        resultParts = (last.content ?? []).map((part) => part.type);
-    }
 
     sections = Object.assign(
         {},
@@ -131,15 +122,12 @@ test("a new conversation is offered tool_search, not the tools that wait, and th
 
     assert.ok(offered.includes("tool_search"));
     assert.ok(offered.includes("artifact"), "tools in common use are offered");
+    assert.ok(
+        offered.includes("subagent"),
+        "subagent is offered at once: routers spawn their stages",
+    );
 
-    for (const name of [
-        "browser",
-        "subagent",
-        "background",
-        "schedule",
-        "design_preview",
-        "design_system",
-    ]) {
+    for (const name of ["browser", "background", "schedule", "design_preview", "design_system"]) {
         assert.ok(!offered.includes(name), `${name} waits`);
         assert.ok(waiting.includes(name), `${name} can be loaded`);
     }
@@ -149,9 +137,9 @@ test("a new conversation is offered tool_search, not the tools that wait, and th
     // "no section" matches none of the patterns below, so a missing section fails each of them.
     assert.match(sections.deferred_tools ?? "no section", /- browser: /);
     assert.match(sections.deferred_tools ?? "no section", /- background: /);
-    assert.match(sections.deferred_tools ?? "no section", /- subagent: /);
+    assert.doesNotMatch(sections.deferred_tools ?? "no section", /- subagent: /);
 
-    for (const key of ["browser", "subagents", "background_tasks", "design_mode"]) {
+    for (const key of ["browser", "background_tasks", "design_mode"]) {
         assert.equal(sections[key], undefined, `${key} is not shown while its tool waits`);
     }
 });
@@ -184,36 +172,6 @@ test("on a model with tool changes in the messages, a query of tool names loads 
     assert.match(sections.deferred_tools ?? "no section", /design_preview/);
     assert.doesNotMatch(sections.deferred_tools ?? "no section", /- browser:/);
     assert.equal(sections.design_mode, undefined);
-});
-
-test("subagent loads with its guide: a section with tool changes in the messages, the search result through codemode", async () => {
-    const native = await nativeSession();
-
-    await say(app, native, "need subagents");
-    await say(app, native, "and now?");
-    assert.ok((await agent(native)).offered.includes("subagent"));
-    assert.match(sections.subagents ?? "no section", /A subagent does not see this conversation/);
-
-    const id = await newSession(app);
-
-    await say(app, id, "need subagents");
-
-    const result = (await app.transcripts.allEntries(id, false)).find(
-        (entry) =>
-            entry.kind === "toolResult" && (entry as { name?: string }).name === "tool_search",
-    ) as { text?: string } | undefined;
-
-    assert.match(result?.text ?? "", /Call it from a codemode script: await tools\.subagent/);
-    assert.match(result?.text ?? "", /A subagent does not see this conversation/);
-    assert.match(result?.text ?? "", /Subagents run on your model/);
-
-    // Through codemode, as the result says: the subagent starts.
-    await say(app, id, "spawn from a script");
-    await until(
-        async () =>
-            (await app.harness.snapshot(SubagentsDoc, id, context))?.agents.scripted !== undefined,
-        "the subagent a script started",
-    );
 });
 
 test("any design tool shows the design guide's section once it is loaded", async () => {
@@ -257,20 +215,18 @@ test("on any other model, a search leaves the tool list alone and the tool is ca
     assert.ok(callable.includes("browser"), "a script can call it");
 });
 
-test("on that route, a screenshot taken by a script reaches the model", async (t) => {
-    if (findBrowser() === undefined) {
-        return t.skip("no Chromium-based browser on this machine");
-    }
-
+// Upstream checks here that a screenshot from a script reaches the model on the codemode route. In HADAL the browser
+// takes that route never: it is usable only where a person turned browser use on, and then it is offered at once.
+test("with browser use on, the browser is offered at once, not through a search", async () => {
     const id = await newSession(app);
 
-    await app.commands.configure(id, owner(app), {
-        model: { provider: "faux", modelId: "faux-vision" },
-    });
-    await say(app, id, "need the browser");
-    await say(app, id, "screenshot from a script");
+    await app.commands.setBrowserUse(id, owner(app), true);
+    await say(app, id, "hello");
 
-    assert.deepEqual(resultParts, ["text", "text", "image"]);
+    const { offered, waiting } = await agent(id);
+
+    assert.ok(offered.includes("browser"), "the browser is offered");
+    assert.ok(!waiting.includes("browser"), "it does not wait for a search");
 });
 
 test("a word that is no tool's name searches, and gives at most two matches", async () => {

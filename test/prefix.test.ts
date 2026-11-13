@@ -32,7 +32,6 @@ const route: FauxResponseStep = (request) => {
 };
 
 before(async () => {
-    process.env.PI_POCKET_LEAN_PROMPT = "1";
     app = await openApp(scriptedModel(route));
 });
 
@@ -75,7 +74,7 @@ test("every request starts with the one before it, whatever changed between them
     calls.push({ name: "bash", args: { command: "echo one" } });
     calls.push({ name: "read", args: { path: "." } });
     await step("two tool calls", () => say(app, id, "look around"), true);
-    calls.push({ name: "load_tools", args: { names: ["schedule"] } });
+    calls.push({ name: "tool_search", args: { query: "schedule" } });
     await step("a tool loaded on request", () => say(app, id, "I need schedules"));
     await step("the browser switched on", async () => {
         await app.commands.setBrowserUse(id, owner(app), true);
